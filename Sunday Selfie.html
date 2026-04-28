@@ -1,0 +1,1191 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Sunday Selfie</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=Dancing+Script:wght@600;700&family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet"/>
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #F0EBE3; font-family: 'DM Sans', sans-serif; overflow: hidden; }
+    body { display: flex; align-items: center; justify-content: center; }
+    #root { display: flex; align-items: center; justify-content: center; height: 100vh; }
+    .device-scale-wrapper {
+      transform-origin: center center;
+    }
+    :root {
+      --orange: #F4A261;
+      --orange-d: #E8884A;
+      --orange-light: #FEF3E8;
+      --orange-mid: #FAD9B8;
+      --bg: #FFFDF9;
+      --surface: #FFFFFF;
+      --text: #1C1C1E;
+      --text-2: #6B6B70;
+      --text-3: #AEAEB2;
+      --border: #F0EBE3;
+      --separator: #F5F0EB;
+      --radius: 16px;
+      --radius-sm: 10px;
+    }
+  </style>
+</head>
+<body>
+<script type="text/babel" src="ios-frame.jsx"></script>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+// ── DATA ──────────────────────────────────────────────────────────────────────
+const SAMPLE_MEMBERS = [
+  { uid: 'u1', name: 'Lucía M.', color: '#F4A261', initials: 'LM', role: 'admin', posted: true },
+  { uid: 'u2', name: 'Carlos R.', color: '#6BB5F4', initials: 'CR', role: 'admin', posted: true },
+  { uid: 'u3', name: 'Sara G.', color: '#A8D8A8', initials: 'SG', role: 'member', posted: false },
+  { uid: 'u4', name: 'Tomás V.', color: '#C3A6F7', initials: 'TV', role: 'member', posted: true },
+  { uid: 'u5', name: 'Ana P.', color: '#F7C3D0', initials: 'AP', role: 'member', posted: false },
+  { uid: 'u6', name: 'Miguel F.', color: '#FFD166', initials: 'MF', role: 'member', posted: true },
+];
+
+const SAMPLE_GROUPS = [
+  {
+    id: 'g1', name: 'La Pandilla 🌞', color: '#F4A261', initials: 'LP',
+    memberCount: 6, adminsCount: 2,
+    lastWeek: '2026-W17',
+    weeks: [
+      { key: '2026-W17', label: 'Semana 17 / 2026', posts: [
+        { uid: 'u1', member: SAMPLE_MEMBERS[0], reactions: [{uid:'u2',emoji:'🔥'},{uid:'u4',emoji:'😍'},{uid:'u6',emoji:'❤️'}], selfReaction: '😄' },
+        { uid: 'u2', member: SAMPLE_MEMBERS[1], reactions: [{uid:'u1',emoji:'❤️'},{uid:'u3',emoji:'😂'}], selfReaction: null },
+        { uid: 'u4', member: SAMPLE_MEMBERS[3], reactions: [{uid:'u1',emoji:'🌞'},{uid:'u2',emoji:'👏'}], selfReaction: '😎' },
+        { uid: 'u6', member: SAMPLE_MEMBERS[5], reactions: [{uid:'u1',emoji:'🥰'}], selfReaction: null },
+      ]},
+      { key: '2026-W16', label: 'Semana 16 / 2026', posts: [
+        { uid: 'u1', member: SAMPLE_MEMBERS[0], reactions: [{uid:'u2',emoji:'❤️'}], selfReaction: null },
+        { uid: 'u2', member: SAMPLE_MEMBERS[1], reactions: [{uid:'u1',emoji:'😍'},{uid:'u4',emoji:'🔥'}], selfReaction: '😂' },
+        { uid: 'u3', member: SAMPLE_MEMBERS[2], reactions: [], selfReaction: null },
+        { uid: 'u4', member: SAMPLE_MEMBERS[3], reactions: [{uid:'u1',emoji:'👏'},{uid:'u2',emoji:'🌞'},{uid:'u3',emoji:'❤️'}], selfReaction: null },
+        { uid: 'u5', member: SAMPLE_MEMBERS[4], reactions: [{uid:'u1',emoji:'🥰'}], selfReaction: '😊' },
+        { uid: 'u6', member: SAMPLE_MEMBERS[5], reactions: [{uid:'u2',emoji:'🔥'},{uid:'u4',emoji:'😎'}], selfReaction: null },
+      ]},
+    ],
+    members: SAMPLE_MEMBERS,
+  },
+  {
+    id: 'g2', name: 'Familia 🏠', color: '#6BB5F4', initials: 'FA',
+    memberCount: 4, adminsCount: 1,
+    lastWeek: '2026-W17',
+    weeks: [
+      { key: '2026-W17', label: 'Semana 17 / 2026', posts: [
+        { uid: 'u1', member: {...SAMPLE_MEMBERS[0], name: 'Tú', initials: 'TÚ'}, reactions: [{uid:'u7',emoji:'❤️'},{uid:'u8',emoji:'😍'}], selfReaction: '🥰' },
+        { uid: 'u7', member: { uid:'u7', name:'Mamá', color:'#F7C3D0', initials:'MA', role:'admin', posted:true }, reactions: [{uid:'u1',emoji:'❤️'}], selfReaction: null },
+        { uid: 'u8', member: { uid:'u8', name:'Papá', color:'#A8D8A8', initials:'PA', role:'member', posted:true }, reactions: [], selfReaction: null },
+      ]},
+    ],
+    members: [
+      SAMPLE_MEMBERS[0],
+      { uid:'u7', name:'Mamá', color:'#F7C3D0', initials:'MA', role:'admin', posted:true },
+      { uid:'u8', name:'Papá', color:'#A8D8A8', initials:'PA', role:'member', posted:true },
+      { uid:'u9', name:'Hermano', color:'#C3A6F7', initials:'HE', role:'member', posted:false },
+    ],
+  },
+];
+
+const ME = { uid: 'u1', name: 'Lucía Martínez', initials: 'LM', color: '#F4A261' };
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+const Avatar = ({ member, size = 40, style }) => (
+  <div style={{
+    width: size, height: size, borderRadius: '50%',
+    background: member?.color || '#F4A261',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    color: 'white', fontWeight: 700, fontSize: size * 0.35,
+    fontFamily: "'DM Sans', sans-serif", flexShrink: 0,
+    ...style
+  }}>
+    {member?.initials || '?'}
+  </div>
+);
+
+const SelfieCard = ({ post, size = 80, onClick, style }) => (
+  <div onClick={onClick} style={{
+    width: size, height: size, borderRadius: 14,
+    background: `linear-gradient(135deg, ${post.member.color}CC 0%, ${post.member.color}66 100%)`,
+    display: 'flex', flexDirection: 'column',
+    alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+    position: 'relative', overflow: 'hidden', flexShrink: 0,
+    ...style
+  }}>
+    <div style={{
+      width: size * 0.55, height: size * 0.55, borderRadius: '50%',
+      background: 'rgba(255,255,255,0.35)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      color: 'white', fontWeight: 700, fontSize: size * 0.22,
+    }}>{post.member.initials}</div>
+    {post.selfReaction && (
+      <div style={{
+        position: 'absolute', top: 5, right: 5,
+        background: 'rgba(255,255,255,0.9)',
+        borderRadius: 20, padding: '1px 5px', fontSize: size * 0.18,
+      }}>{post.selfReaction}</div>
+    )}
+    {post.reactions.length > 0 && (
+      <div style={{
+        position: 'absolute', bottom: 4, left: 0, right: 0,
+        display: 'flex', justifyContent: 'center', gap: 1,
+      }}>
+        {post.reactions.slice(0, 3).map((r, i) => (
+          <span key={i} style={{
+            background: 'rgba(255,255,255,0.9)', borderRadius: 20,
+            padding: '1px 3px', fontSize: size * 0.16,
+          }}>{r.emoji}</span>
+        ))}
+      </div>
+    )}
+  </div>
+);
+
+const Logo = ({ size = 28, style }) => (
+  <span style={{
+    fontFamily: "'Dancing Script', cursive",
+    fontWeight: 700, color: 'var(--orange)',
+    fontSize: size, letterSpacing: '-0.3px',
+    whiteSpace: 'nowrap', display: 'inline-block',
+    ...style
+  }}>Sunday Selfie</span>
+);
+
+const Btn = ({ children, onPress, variant = 'primary', style, disabled }) => {
+  const base = {
+    width: '100%', padding: '14px 20px', borderRadius: 14, border: 'none',
+    fontFamily: "'DM Sans', sans-serif", fontWeight: 600, fontSize: 16,
+    cursor: disabled ? 'default' : 'pointer', transition: 'opacity .15s',
+    opacity: disabled ? 0.4 : 1, ...style
+  };
+  const variants = {
+    primary: { background: 'var(--orange)', color: 'white' },
+    secondary: { background: 'var(--orange-light)', color: 'var(--orange)' },
+    ghost: { background: 'transparent', color: 'var(--text-2)' },
+    outline: { background: 'white', color: 'var(--text)', border: '1.5px solid var(--border)' },
+  };
+  return <button onClick={disabled ? undefined : onPress} style={{...base, ...variants[variant]}}>{children}</button>;
+};
+
+const Input = ({ placeholder, value, onChange, type = 'text', style }) => (
+  <input
+    type={type} placeholder={placeholder} value={value} onChange={onChange}
+    style={{
+      width: '100%', padding: '13px 16px', borderRadius: 12,
+      border: '1.5px solid var(--border)', background: 'var(--bg)',
+      fontFamily: "'DM Sans', sans-serif", fontSize: 16, color: 'var(--text)',
+      outline: 'none', ...style
+    }}
+  />
+);
+
+const BackBtn = ({ onPress }) => (
+  <button onClick={onPress} style={{
+    background: 'none', border: 'none', cursor: 'pointer',
+    display: 'flex', alignItems: 'center', gap: 4,
+    color: 'var(--orange)', fontFamily: "'DM Sans'", fontWeight: 600, fontSize: 15,
+    padding: '0 4px',
+  }}>
+    <svg width="10" height="17" viewBox="0 0 10 17" fill="none">
+      <path d="M8.5 1.5L1.5 8.5L8.5 15.5" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+    Atrás
+  </button>
+);
+
+// ── TAB BAR ────────────────────────────────────────────────────────────────────
+const TabBar = ({ tab, onTab }) => {
+  const tabs = [
+    { id: 'groups', label: 'Grupos', icon: (active) => (
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+        <circle cx="9" cy="7" r="3.5" stroke={active?'#F4A261':'#AEAEB2'} strokeWidth="1.8"/>
+        <path d="M2 19c0-3.314 3.134-6 7-6s7 2.686 7 6" stroke={active?'#F4A261':'#AEAEB2'} strokeWidth="1.8" strokeLinecap="round"/>
+        <circle cx="18" cy="8" r="2.5" stroke={active?'#F4A261':'#AEAEB2'} strokeWidth="1.6"/>
+        <path d="M16 19c0-2.21 2.239-4 5-4" stroke={active?'#F4A261':'#AEAEB2'} strokeWidth="1.6" strokeLinecap="round"/>
+      </svg>
+    )},
+    { id: 'camera', label: 'Cámara', icon: (active) => (
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+        <rect x="2" y="7" width="20" height="14" rx="3.5" stroke={active?'#F4A261':'#AEAEB2'} strokeWidth="1.8"/>
+        <circle cx="12" cy="14" r="3.5" stroke={active?'#F4A261':'#AEAEB2'} strokeWidth="1.8"/>
+        <path d="M8 7V5.5a2 2 0 012-2h4a2 2 0 012 2V7" stroke={active?'#F4A261':'#AEAEB2'} strokeWidth="1.8"/>
+      </svg>
+    )},
+    { id: 'profile', label: 'Perfil', icon: (active) => (
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="8" r="4" stroke={active?'#F4A261':'#AEAEB2'} strokeWidth="1.8"/>
+        <path d="M4 20c0-3.314 3.582-6 8-6s8 2.686 8 6" stroke={active?'#F4A261':'#AEAEB2'} strokeWidth="1.8" strokeLinecap="round"/>
+      </svg>
+    )},
+  ];
+  return (
+    <div style={{
+      display: 'flex', borderTop: '1px solid var(--border)',
+      background: 'rgba(255,253,249,0.95)',
+      backdropFilter: 'blur(10px)',
+    }}>
+      {tabs.map(t => (
+        <button key={t.id} onClick={() => onTab(t.id)} style={{
+          flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center',
+          gap: 3, padding: '10px 0 6px', background: 'none', border: 'none',
+          cursor: t.id === 'camera' ? 'default' : 'pointer',
+        }}>
+          {t.icon(tab === t.id)}
+          <span style={{
+            fontSize: 10, fontFamily: "'DM Sans'", fontWeight: 500,
+            color: tab === t.id ? 'var(--orange)' : 'var(--text-3)',
+          }}>{t.label}</span>
+          {t.id === 'camera' && (
+            <div style={{
+              position: 'absolute', marginTop: -2,
+              background: 'var(--orange-light)',
+              borderRadius: 6, padding: '2px 6px',
+              fontSize: 9, color: 'var(--orange)', fontWeight: 600,
+              transform: 'translateY(28px)',
+            }}>Solo domingos</div>
+          )}
+        </button>
+      ))}
+    </div>
+  );
+};
+
+// ── SCREEN: LOGIN ─────────────────────────────────────────────────────────────
+const LoginScreen = ({ navigate }) => (
+  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', overflow: 'hidden' }}>
+    {/* Hero */}
+    <div style={{
+      flex: 1, display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center', padding: '40px 32px 20px',
+    }}>
+      {/* Sun illustration */}
+      <div style={{ marginBottom: 32 }}>
+        <svg width="100" height="100" viewBox="0 0 100 100">
+          {[0,45,90,135,180,225,270,315].map((deg,i) => (
+            <line key={i}
+              x1="50" y1="50"
+              x2={50 + 42 * Math.cos(deg * Math.PI / 180)}
+              y2={50 + 42 * Math.sin(deg * Math.PI / 180)}
+              stroke="#FAD9B8" strokeWidth="3" strokeLinecap="round"
+            />
+          ))}
+          <circle cx="50" cy="50" r="22" fill="#F4A261"/>
+          <circle cx="50" cy="50" r="17" fill="#FAC590"/>
+        </svg>
+      </div>
+      <Logo size={36} style={{ marginBottom: 12 }}/>
+      <p style={{
+        color: 'var(--text-2)', fontSize: 16, textAlign: 'center',
+        lineHeight: 1.5, maxWidth: 220,
+      }}>
+        Comparte tu domingo con quienes importan
+      </p>
+    </div>
+
+    {/* Buttons */}
+    <div style={{ padding: '0 24px 32px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <Btn onPress={() => navigate('onboarding-name')} variant="primary">
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+            <circle cx="10" cy="10" r="10" fill="white"/>
+            <path d="M10 4.5C7 4.5 4.5 7 4.5 10C4.5 13 7 15.5 10 15.5C13 15.5 15.5 13 15.5 10H10V8.5H15.2C15.4 9 15.5 9.5 15.5 10C15.5 13 13 15.5 10 15.5Z" fill="#4285F4"/>
+          </svg>
+          Continuar con Google
+        </div>
+      </Btn>
+      <Btn variant="outline" disabled style={{ opacity: 0.35 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
+          <svg width="18" height="22" viewBox="0 0 18 22" fill="none">
+            <path d="M14.5 0C14.5 2.5 12.5 4.5 10 4.5C10 2 12 0 14.5 0ZM17.5 16C18.5 14.5 18.5 13.5 18.5 12C18.5 8 16 5.5 12.5 5.5C11 5.5 10 6 9 6C8 6 6.5 5.5 5 5.5C2 5.5 0 8 0 11.5C0 15.5 3 22 6 22C7.5 22 8 21.5 9 21.5C10 21.5 10.5 22 12 22C14.5 22 16.5 18 17.5 16Z" fill="#1C1C1E"/>
+          </svg>
+          Continuar con Apple
+        </div>
+      </Btn>
+      <p style={{ textAlign: 'center', fontSize: 12, color: 'var(--text-3)', lineHeight: 1.5 }}>
+        Apple Sign-In estará disponible pronto
+      </p>
+    </div>
+  </div>
+);
+
+// ── SCREEN: ONBOARDING ────────────────────────────────────────────────────────
+const OnboardingName = ({ navigate }) => {
+  const [name, setName] = useState('');
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: 24 }}>
+      <div style={{ paddingTop: 16, marginBottom: 40 }}>
+        <Logo size={22}/>
+        <div style={{ marginTop: 20, display: 'flex', gap: 6 }}>
+          {[1,2].map(i => <div key={i} style={{ height: 3, flex: 1, borderRadius: 4, background: i===1 ? 'var(--orange)' : 'var(--border)' }}/>)}
+        </div>
+      </div>
+      <div style={{ flex: 1 }}>
+        <h2 style={{ fontSize: 26, fontWeight: 700, color: 'var(--text)', marginBottom: 8 }}>¿Cómo te llaman?</h2>
+        <p style={{ color: 'var(--text-2)', fontSize: 15, marginBottom: 28 }}>Este es tu nombre en Sunday Selfie</p>
+        <Input
+          placeholder="Tu nombre"
+          value={name}
+          onChange={e => setName(e.target.value)}
+        />
+      </div>
+      <Btn onPress={() => name.trim() && navigate('onboarding-photo')} disabled={!name.trim()}>
+        Siguiente
+      </Btn>
+    </div>
+  );
+};
+
+const OnboardingPhoto = ({ navigate }) => {
+  const [selected, setSelected] = useState(null);
+  const colors = ['#F4A261','#6BB5F4','#A8D8A8','#C3A6F7','#F7C3D0','#FFD166'];
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: 24 }}>
+      <div style={{ paddingTop: 16, marginBottom: 40 }}>
+        <Logo size={22}/>
+        <div style={{ marginTop: 20, display: 'flex', gap: 6 }}>
+          {[1,2].map(i => <div key={i} style={{ height: 3, flex: 1, borderRadius: 4, background: 'var(--orange)' }}/>)}
+        </div>
+      </div>
+      <div style={{ flex: 1 }}>
+        <h2 style={{ fontSize: 26, fontWeight: 700, color: 'var(--text)', marginBottom: 8 }}>Pon una foto</h2>
+        <p style={{ color: 'var(--text-2)', fontSize: 15, marginBottom: 32 }}>Elige un color para tu avatar</p>
+        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 32 }}>
+          <div style={{
+            width: 100, height: 100, borderRadius: '50%',
+            background: selected || '#F0EBE3',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            border: '3px solid white', boxShadow: '0 4px 16px rgba(0,0,0,0.1)',
+          }}>
+            {selected ? (
+              <span style={{ color: 'white', fontWeight: 700, fontSize: 36 }}>LM</span>
+            ) : (
+              <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
+                <path d="M20 20C22.76 20 25 17.76 25 15C25 12.24 22.76 10 20 10C17.24 10 15 12.24 15 15C15 17.76 17.24 20 20 20Z" fill="#AEAEB2"/>
+                <path d="M8 30C8 25.58 13.37 22 20 22C26.63 22 32 25.58 32 30" stroke="#AEAEB2" strokeWidth="2" strokeLinecap="round"/>
+              </svg>
+            )}
+          </div>
+        </div>
+        <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
+          {colors.map(c => (
+            <button key={c} onClick={() => setSelected(c)} style={{
+              width: 44, height: 44, borderRadius: '50%', background: c,
+              border: selected === c ? '3px solid var(--orange)' : '3px solid white',
+              boxShadow: selected === c ? '0 0 0 2px var(--orange)' : '0 2px 8px rgba(0,0,0,0.1)',
+              cursor: 'pointer',
+            }}/>
+          ))}
+        </div>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <Btn onPress={() => navigate('home')} disabled={!selected}>
+          ¡Empezar!
+        </Btn>
+        <Btn onPress={() => navigate('home')} variant="ghost">
+          Ahora no
+        </Btn>
+      </div>
+    </div>
+  );
+};
+
+// ── SCREEN: HOME ──────────────────────────────────────────────────────────────
+const HomeScreen = ({ navigate }) => {
+  const [showMenu, setShowMenu] = useState(false);
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', overflow: 'hidden' }}>
+      {/* Header */}
+      <div style={{ padding: '16px 20px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Logo size={26}/>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button onClick={() => navigate('notifications')} style={{ background: 'none', border: 'none', cursor: 'pointer', padding: 4 }}>
+            <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+              <path d="M11 2C8 2 5.5 4.5 5.5 7.5V13L3.5 15V16H18.5V15L16.5 13V7.5C16.5 4.5 14 2 11 2Z" stroke="var(--text)" strokeWidth="1.6" strokeLinejoin="round"/>
+              <path d="M9 16.5C9 17.6 9.9 18.5 11 18.5C12.1 18.5 13 17.6 13 16.5" stroke="var(--text)" strokeWidth="1.6"/>
+              <circle cx="16.5" cy="5" r="3" fill="var(--orange)"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '0 16px 16px' }}>
+        {/* Esta semana banner */}
+        <div style={{
+          background: 'linear-gradient(135deg, var(--orange) 0%, #F7B733 100%)',
+          borderRadius: 18, padding: '16px 20px', marginBottom: 20,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        }}>
+          <div>
+            <p style={{ color: 'rgba(255,255,255,0.8)', fontSize: 12, fontWeight: 500 }}>HOY ES</p>
+            <p style={{ color: 'white', fontSize: 20, fontWeight: 700 }}>Martes</p>
+            <p style={{ color: 'rgba(255,255,255,0.9)', fontSize: 13 }}>El domingo sube tu selfie ☀️</p>
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <p style={{ color: 'white', fontSize: 28, fontWeight: 700 }}>5</p>
+            <p style={{ color: 'rgba(255,255,255,0.8)', fontSize: 11 }}>días hasta el domingo</p>
+          </div>
+        </div>
+
+        {/* Groups */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+          <h2 style={{ fontSize: 18, fontWeight: 700, color: 'var(--text)' }}>Mis grupos</h2>
+          <button onClick={() => setShowMenu(true)} style={{
+            background: 'var(--orange)', color: 'white', border: 'none',
+            borderRadius: 20, padding: '6px 14px', fontFamily: "'DM Sans'",
+            fontWeight: 600, fontSize: 13, cursor: 'pointer',
+          }}>+ Nuevo</button>
+        </div>
+
+        {SAMPLE_GROUPS.map(g => (
+          <div key={g.id} onClick={() => navigate('group', g)} style={{
+            background: 'white', borderRadius: 18, padding: '16px',
+            marginBottom: 12, cursor: 'pointer', border: '1px solid var(--border)',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.04)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+              {/* Group avatar */}
+              <div style={{
+                width: 52, height: 52, borderRadius: 16,
+                background: `${g.color}22`, border: `2px solid ${g.color}44`,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 22, flexShrink: 0,
+              }}>{g.name.split(' ').slice(-1)[0]}</div>
+
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <p style={{ fontWeight: 700, fontSize: 16, color: 'var(--text)' }}>{g.name.split(' ')[0]} {g.name.split(' ')[1]}</p>
+                  <span style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 500 }}>Semana 17</span>
+                </div>
+                <p style={{ fontSize: 13, color: 'var(--text-2)', marginTop: 2 }}>
+                  {g.memberCount} miembros · {g.weeks[0].posts.length}/{g.memberCount} han publicado
+                </p>
+                {/* Selfie previews */}
+                <div style={{ display: 'flex', gap: 5, marginTop: 8 }}>
+                  {g.weeks[0].posts.slice(0,4).map((p, i) => (
+                    <div key={i} style={{
+                      width: 32, height: 32, borderRadius: 8,
+                      background: `linear-gradient(135deg, ${p.member.color}BB, ${p.member.color}66)`,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      color: 'white', fontSize: 10, fontWeight: 700,
+                    }}>{p.member.initials}</div>
+                  ))}
+                  {g.memberCount - g.weeks[0].posts.length > 0 && (
+                    <div style={{
+                      width: 32, height: 32, borderRadius: 8,
+                      background: 'var(--separator)', display: 'flex',
+                      alignItems: 'center', justifyContent: 'center',
+                      color: 'var(--text-3)', fontSize: 11, fontWeight: 700,
+                    }}>+{g.memberCount - g.weeks[0].posts.length}</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        ))}
+
+        {/* Empty state hint */}
+        <div style={{
+          background: 'var(--orange-light)', borderRadius: 16, padding: 20,
+          textAlign: 'center', border: '1.5px dashed var(--orange-mid)',
+        }}>
+          <p style={{ fontSize: 28, marginBottom: 6 }}>🌟</p>
+          <p style={{ fontWeight: 600, color: 'var(--orange-d)', fontSize: 15 }}>¿Tienes un grupo en mente?</p>
+          <p style={{ color: 'var(--text-2)', fontSize: 13, marginTop: 4 }}>Crea uno o únete con un enlace de invitación</p>
+        </div>
+      </div>
+
+      {/* Bottom sheet menu */}
+      {showMenu && (
+        <div style={{
+          position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)',
+          display: 'flex', alignItems: 'flex-end', zIndex: 100,
+        }} onClick={() => setShowMenu(false)}>
+          <div onClick={e => e.stopPropagation()} style={{
+            background: 'white', borderRadius: '24px 24px 0 0',
+            padding: '20px 24px 32px', width: '100%',
+          }}>
+            <div style={{ width: 36, height: 4, background: 'var(--border)', borderRadius: 4, margin: '0 auto 24px' }}/>
+            <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 20 }}>¿Qué quieres hacer?</h3>
+            <Btn onPress={() => { setShowMenu(false); navigate('create-group'); }} style={{ marginBottom: 10 }}>
+              ✨ Crear un grupo nuevo
+            </Btn>
+            <Btn onPress={() => { setShowMenu(false); navigate('join-group'); }} variant="outline">
+              🔗 Unirme con enlace
+            </Btn>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── SCREEN: GROUP DETAIL ──────────────────────────────────────────────────────
+const GroupScreen = ({ group, navigate, goBack }) => {
+  const [weekIdx, setWeekIdx] = useState(0);
+  const week = group.weeks[weekIdx];
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', overflow: 'hidden' }}>
+      {/* Header */}
+      <div style={{ padding: '12px 20px 10px', display: 'flex', alignItems: 'center', gap: 12 }}>
+        <BackBtn onPress={goBack}/>
+        <div style={{ flex: 1 }}>
+          <p style={{ fontWeight: 700, fontSize: 17, color: 'var(--text)' }}>{group.name.split(' ').slice(0,2).join(' ')}</p>
+          <p style={{ fontSize: 12, color: 'var(--text-3)' }}>{group.memberCount} miembros</p>
+        </div>
+        <button onClick={() => navigate('members', group)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: -6 }}>
+            {group.members.slice(0,3).map((m, i) => (
+              <div key={i} style={{
+                width: 28, height: 28, borderRadius: '50%',
+                background: m.color, border: '2px solid white',
+                marginLeft: i > 0 ? -8 : 0, zIndex: 3-i,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                color: 'white', fontSize: 10, fontWeight: 700,
+              }}>{m.initials}</div>
+            ))}
+          </div>
+        </button>
+      </div>
+
+      {/* Week selector */}
+      <div style={{ overflowX: 'auto', paddingLeft: 20, display: 'flex', gap: 8, paddingBottom: 12, flexShrink: 0 }}>
+        {group.weeks.map((w, i) => (
+          <button key={w.key} onClick={() => setWeekIdx(i)} style={{
+            flexShrink: 0, padding: '8px 16px', borderRadius: 20,
+            background: weekIdx === i ? 'var(--orange)' : 'white',
+            color: weekIdx === i ? 'white' : 'var(--text-2)',
+            border: weekIdx === i ? 'none' : '1.5px solid var(--border)',
+            fontFamily: "'DM Sans'", fontWeight: 600, fontSize: 13, cursor: 'pointer',
+          }}>{i === 0 ? 'Esta semana' : w.label}</button>
+        ))}
+      </div>
+
+      {/* Posts grid */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '0 16px 16px' }}>
+        {/* Counter */}
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          marginBottom: 16, padding: '10px 14px',
+          background: 'white', borderRadius: 12, border: '1px solid var(--border)',
+        }}>
+          <span style={{ fontSize: 14, color: 'var(--text-2)' }}>Han publicado</span>
+          <span style={{ fontWeight: 700, fontSize: 15, color: 'var(--orange)' }}>
+            {week.posts.length}/{group.memberCount}
+          </span>
+        </div>
+
+        {/* Grid */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          {week.posts.map((post, i) => (
+            <div key={post.uid} onClick={() => navigate('selfie', { post, group, weekIdx, postIdx: i })}
+              style={{
+                borderRadius: 18, overflow: 'hidden', cursor: 'pointer',
+                background: `linear-gradient(145deg, ${post.member.color}DD 0%, ${post.member.color}88 100%)`,
+                aspectRatio: '1/1.1', position: 'relative',
+              }}>
+              {/* Photo placeholder */}
+              <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{
+                  width: 64, height: 64, borderRadius: '50%',
+                  background: 'rgba(255,255,255,0.3)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  color: 'white', fontWeight: 700, fontSize: 22,
+                }}>{post.member.initials}</div>
+              </div>
+              {/* Self reaction */}
+              {post.selfReaction && (
+                <div style={{
+                  position: 'absolute', top: 8, right: 8,
+                  background: 'rgba(255,255,255,0.92)', borderRadius: 20,
+                  padding: '2px 8px', fontSize: 14,
+                }}>{post.selfReaction}</div>
+              )}
+              {/* Name & reactions */}
+              <div style={{
+                position: 'absolute', bottom: 0, left: 0, right: 0,
+                padding: '24px 10px 10px',
+                background: 'linear-gradient(transparent, rgba(0,0,0,0.35))',
+              }}>
+                <p style={{ color: 'white', fontWeight: 600, fontSize: 13 }}>{post.member.name.split(' ')[0]}</p>
+                {post.reactions.length > 0 && (
+                  <div style={{ display: 'flex', gap: 3, marginTop: 3, flexWrap: 'wrap' }}>
+                    {post.reactions.map((r, ri) => (
+                      <span key={ri} style={{
+                        background: 'rgba(255,255,255,0.85)', borderRadius: 20,
+                        padding: '1px 5px', fontSize: 11,
+                      }}>{r.emoji}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+
+          {/* Not posted slots */}
+          {group.members.filter(m => !week.posts.find(p => p.uid === m.uid)).map(m => (
+            <div key={m.uid} style={{
+              borderRadius: 18, border: '2px dashed var(--border)',
+              aspectRatio: '1/1.1', display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', gap: 6,
+              background: 'white',
+            }}>
+              <Avatar member={m} size={44} style={{ opacity: 0.4 }}/>
+              <p style={{ fontSize: 12, color: 'var(--text-3)', fontWeight: 500 }}>{m.name.split(' ')[0]}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ── SCREEN: SELFIE FULLSCREEN ─────────────────────────────────────────────────
+const SelfieScreen = ({ data, navigate, goBack }) => {
+  const { post, group, weekIdx } = data;
+  const [showReactions, setShowReactions] = useState(false);
+  const emojis = ['❤️','🔥','😍','😂','👏','🌞','🥰','😎','🙌','😄','💫','✨'];
+  const [myReaction, setMyReaction] = useState(post.reactions.find(r => r.uid === ME.uid)?.emoji || null);
+
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: post.member.color, overflow: 'hidden', position: 'relative' }}>
+      {/* Photo area */}
+      <div style={{
+        position: 'absolute', inset: 0,
+        background: `linear-gradient(160deg, ${post.member.color} 0%, ${post.member.color}AA 50%, #1C1C1E 100%)`,
+      }}/>
+
+      {/* Portrait placeholder */}
+      <div style={{
+        position: 'absolute', inset: '60px 0 160px',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        <div style={{
+          width: 160, height: 160, borderRadius: '50%',
+          background: 'rgba(255,255,255,0.2)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          color: 'white', fontWeight: 700, fontSize: 56,
+          boxShadow: '0 8px 32px rgba(0,0,0,0.2)',
+        }}>{post.member.initials}</div>
+      </div>
+
+      {/* Top controls */}
+      <div style={{ position: 'relative', zIndex: 10, display: 'flex', alignItems: 'center', padding: '12px 20px', gap: 12 }}>
+        <button onClick={goBack} style={{ background: 'rgba(0,0,0,0.25)', border: 'none', borderRadius: '50%', width: 36, height: 36, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <svg width="10" height="17" viewBox="0 0 10 17" fill="none">
+            <path d="M8.5 1.5L1.5 8.5L8.5 15.5" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        </button>
+        <div style={{ flex: 1 }}>
+          <p style={{ color: 'white', fontWeight: 700, fontSize: 16 }}>{post.member.name}</p>
+          <p style={{ color: 'rgba(255,255,255,0.7)', fontSize: 12 }}>{group.name.split(' ').slice(0,2).join(' ')}</p>
+        </div>
+        {post.selfReaction && (
+          <span style={{ background: 'rgba(255,255,255,0.9)', borderRadius: 20, padding: '4px 10px', fontSize: 18 }}>
+            {post.selfReaction}
+          </span>
+        )}
+      </div>
+
+      {/* Bottom reactions */}
+      <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, zIndex: 10, padding: '0 20px 20px' }}>
+        {/* Existing reactions */}
+        {post.reactions.length > 0 && (
+          <div style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>
+            {post.reactions.map((r, i) => {
+              const member = group.members.find(m => m.uid === r.uid);
+              return (
+                <div key={i} style={{
+                  background: 'rgba(255,255,255,0.15)',
+                  backdropFilter: 'blur(10px)',
+                  borderRadius: 20, padding: '6px 12px',
+                  display: 'flex', alignItems: 'center', gap: 6,
+                }}>
+                  <span style={{ fontSize: 16 }}>{r.emoji}</span>
+                  <span style={{ color: 'rgba(255,255,255,0.9)', fontSize: 12, fontWeight: 500 }}>
+                    {member?.name.split(' ')[0]}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* React button */}
+        <button onClick={() => setShowReactions(!showReactions)} style={{
+          width: '100%', padding: '13px', borderRadius: 14,
+          background: myReaction ? 'rgba(244,162,97,0.9)' : 'rgba(255,255,255,0.15)',
+          backdropFilter: 'blur(10px)',
+          border: '1.5px solid rgba(255,255,255,0.3)',
+          color: 'white', fontFamily: "'DM Sans'", fontWeight: 600, fontSize: 15,
+          cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+        }}>
+          {myReaction ? <>{myReaction} Mi reacción</> : <>😊 Reaccionar</>}
+        </button>
+
+        {/* Emoji picker */}
+        {showReactions && (
+          <div style={{
+            background: 'rgba(30,30,30,0.85)', backdropFilter: 'blur(20px)',
+            borderRadius: 20, padding: 16, marginTop: 10,
+            display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center',
+          }}>
+            {emojis.map(e => (
+              <button key={e} onClick={() => { setMyReaction(e); setShowReactions(false); }} style={{
+                width: 44, height: 44, borderRadius: 12,
+                background: myReaction === e ? 'rgba(244,162,97,0.4)' : 'rgba(255,255,255,0.1)',
+                border: 'none', fontSize: 22, cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}>{e}</button>
+            ))}
+            {myReaction && (
+              <button onClick={() => { setMyReaction(null); setShowReactions(false); }} style={{
+                width: '100%', padding: '8px', borderRadius: 10,
+                background: 'rgba(255,255,255,0.1)', border: 'none',
+                color: 'rgba(255,255,255,0.7)', fontFamily: "'DM Sans'",
+                fontSize: 13, cursor: 'pointer',
+              }}>Quitar reacción</button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ── SCREEN: CREATE GROUP ──────────────────────────────────────────────────────
+const CreateGroupScreen = ({ navigate, goBack }) => {
+  const [name, setName] = useState('');
+  const [step, setStep] = useState(1);
+  const colors = ['#F4A261','#6BB5F4','#A8D8A8','#C3A6F7','#F7C3D0','#FFD166','#80CED7','#F08080'];
+  const [selColor, setSelColor] = useState('#F4A261');
+
+  if (step === 2) return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: 24 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 32, paddingTop: 8 }}>
+        <BackBtn onPress={() => setStep(1)}/>
+      </div>
+      <div style={{ flex: 1 }}>
+        <h2 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>¡Comparte el enlace!</h2>
+        <p style={{ color: 'var(--text-2)', fontSize: 15, marginBottom: 32 }}>Invita a tu gente a "{name}"</p>
+
+        <div style={{
+          background: 'white', borderRadius: 18, padding: 20,
+          border: '1px solid var(--border)', marginBottom: 20, textAlign: 'center',
+        }}>
+          <div style={{
+            width: 120, height: 120, margin: '0 auto 16px',
+            background: 'var(--border)', borderRadius: 12,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <svg width="80" height="80" viewBox="0 0 80 80">
+              {/* Fake QR */}
+              {[...Array(36)].map((_,i) => {
+                const x = (i%6)*12+4, y = Math.floor(i/6)*12+4;
+                const show = Math.random() > 0.4;
+                return show ? <rect key={i} x={x} y={y} width={9} height={9} fill="var(--text)" rx="1.5"/> : null;
+              })}
+            </svg>
+          </div>
+          <p style={{ fontFamily: 'monospace', fontSize: 18, fontWeight: 700, color: 'var(--text)', letterSpacing: 2 }}>SUN-4X72</p>
+          <p style={{ color: 'var(--text-3)', fontSize: 12, marginTop: 4 }}>Código de invitación</p>
+        </div>
+
+        <Btn onPress={() => {}} style={{ marginBottom: 10 }}>
+          📤 Compartir enlace
+        </Btn>
+        <Btn onPress={() => navigate('group', SAMPLE_GROUPS[0])} variant="secondary">
+          Ir al grupo →
+        </Btn>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: 24 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 32, paddingTop: 8 }}>
+        <BackBtn onPress={goBack}/>
+        <h2 style={{ fontSize: 18, fontWeight: 700 }}>Nuevo grupo</h2>
+      </div>
+      <div style={{ flex: 1 }}>
+        {/* Preview */}
+        <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 28 }}>
+          <div style={{
+            width: 80, height: 80, borderRadius: 24,
+            background: `${selColor}22`, border: `2px solid ${selColor}44`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 32,
+          }}>
+            {name ? name[0].toUpperCase() : '👥'}
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-2)', marginBottom: 8, display: 'block' }}>NOMBRE DEL GRUPO</label>
+          <Input placeholder="Ej: Los de siempre" value={name} onChange={e => setName(e.target.value)}/>
+        </div>
+
+        <div style={{ marginBottom: 24 }}>
+          <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-2)', marginBottom: 10, display: 'block' }}>COLOR</label>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            {colors.map(c => (
+              <button key={c} onClick={() => setSelColor(c)} style={{
+                width: 38, height: 38, borderRadius: '50%', background: c,
+                border: selColor === c ? '3px solid var(--text)' : '2px solid white',
+                boxShadow: '0 2px 6px rgba(0,0,0,0.15)', cursor: 'pointer',
+              }}/>
+            ))}
+          </div>
+        </div>
+
+        <div style={{
+          background: 'var(--orange-light)', borderRadius: 12, padding: '12px 16px',
+          display: 'flex', alignItems: 'flex-start', gap: 10,
+        }}>
+          <span style={{ fontSize: 16 }}>🌍</span>
+          <div>
+            <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--orange-d)' }}>Zona horaria automática</p>
+            <p style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 2 }}>Europe/Madrid — el domingo va de 00:00 a 23:59</p>
+          </div>
+        </div>
+      </div>
+
+      <Btn onPress={() => name.trim() && setStep(2)} disabled={!name.trim()}>
+        Crear grupo
+      </Btn>
+    </div>
+  );
+};
+
+// ── SCREEN: JOIN GROUP ────────────────────────────────────────────────────────
+const JoinGroupScreen = ({ navigate, goBack }) => {
+  const [code, setCode] = useState('');
+  const [found, setFound] = useState(false);
+
+  const handleCode = (val) => {
+    setCode(val.toUpperCase());
+    setFound(val.length >= 6);
+  };
+
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', padding: 24 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 32, paddingTop: 8 }}>
+        <BackBtn onPress={goBack}/>
+        <h2 style={{ fontSize: 18, fontWeight: 700 }}>Unirse a un grupo</h2>
+      </div>
+
+      <div style={{ flex: 1 }}>
+        <div style={{ textAlign: 'center', marginBottom: 32 }}>
+          <div style={{
+            width: 80, height: 80, borderRadius: '50%',
+            background: 'var(--orange-light)', margin: '0 auto 16px',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 36,
+          }}>🔗</div>
+          <p style={{ color: 'var(--text-2)', fontSize: 15 }}>Introduce el código de invitación o pide que te pasen el enlace</p>
+        </div>
+
+        <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-2)', marginBottom: 8, display: 'block' }}>CÓDIGO DE INVITACIÓN</label>
+        <Input
+          placeholder="Ej: SUN-4X72"
+          value={code}
+          onChange={e => handleCode(e.target.value)}
+          style={{ textAlign: 'center', fontFamily: 'monospace', fontSize: 20, letterSpacing: 3, fontWeight: 700 }}
+        />
+
+        {found && (
+          <div style={{
+            marginTop: 20, background: 'white', borderRadius: 16,
+            padding: '16px', border: '1px solid var(--border)',
+            display: 'flex', alignItems: 'center', gap: 14,
+          }}>
+            <div style={{
+              width: 52, height: 52, borderRadius: 16,
+              background: '#F4A26122', border: '2px solid #F4A26144',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22,
+            }}>🌞</div>
+            <div>
+              <p style={{ fontWeight: 700, fontSize: 16 }}>La Pandilla</p>
+              <p style={{ fontSize: 13, color: 'var(--text-2)' }}>6 miembros · Grupo privado</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <Btn onPress={() => found && navigate('group', SAMPLE_GROUPS[0])} disabled={!found}>
+        {found ? 'Unirme al grupo' : 'Buscar grupo'}
+      </Btn>
+    </div>
+  );
+};
+
+// ── SCREEN: MEMBERS ───────────────────────────────────────────────────────────
+const MembersScreen = ({ group, goBack }) => {
+  const admins = group.members.filter(m => m.role === 'admin');
+  const members = group.members.filter(m => m.role === 'member');
+  const [showActions, setShowActions] = useState(null);
+
+  const MemberRow = ({ member }) => (
+    <div onClick={() => setShowActions(showActions === member.uid ? null : member.uid)} style={{
+      display: 'flex', alignItems: 'center', gap: 14, padding: '12px 0',
+      borderBottom: '1px solid var(--separator)', cursor: 'pointer',
+    }}>
+      <Avatar member={member} size={44}/>
+      <div style={{ flex: 1 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <p style={{ fontWeight: 600, fontSize: 15 }}>{member.name}</p>
+          {member.role === 'admin' && (
+            <span style={{ background: 'var(--orange-light)', color: 'var(--orange-d)', fontSize: 11, fontWeight: 700, padding: '2px 7px', borderRadius: 20 }}>Admin</span>
+          )}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 2 }}>
+          <div style={{ width: 7, height: 7, borderRadius: '50%', background: member.posted ? '#A8D8A8' : 'var(--border)' }}/>
+          <p style={{ fontSize: 12, color: member.posted ? '#4CAF50' : 'var(--text-3)' }}>
+            {member.posted ? 'Publicó esta semana' : 'Aún no ha publicado'}
+          </p>
+        </div>
+      </div>
+      {member.uid === ME.uid && <span style={{ fontSize: 11, color: 'var(--text-3)' }}>Tú</span>}
+      {member.uid !== ME.uid && (
+        <svg width="6" height="11" viewBox="0 0 6 11" fill="none">
+          <path d="M1 1L5 5.5L1 10" stroke="var(--text-3)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+        </svg>
+      )}
+    </div>
+  );
+
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', overflow: 'hidden' }}>
+      <div style={{ padding: '12px 20px', display: 'flex', alignItems: 'center', gap: 12, borderBottom: '1px solid var(--border)' }}>
+        <BackBtn onPress={goBack}/>
+        <div>
+          <p style={{ fontWeight: 700, fontSize: 16 }}>Miembros</p>
+          <p style={{ fontSize: 12, color: 'var(--text-3)' }}>{group.name.split(' ').slice(0,2).join(' ')}</p>
+        </div>
+      </div>
+
+      <div style={{ flex: 1, overflowY: 'auto', padding: '0 20px' }}>
+        <p style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-3)', marginTop: 20, marginBottom: 4, letterSpacing: 0.5 }}>
+          ADMINISTRADORES — {admins.length}
+        </p>
+        {admins.map(m => <MemberRow key={m.uid} member={m}/>)}
+
+        <p style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-3)', marginTop: 20, marginBottom: 4, letterSpacing: 0.5 }}>
+          MIEMBROS — {members.length}
+        </p>
+        {members.map(m => <MemberRow key={m.uid} member={m}/>)}
+
+        {/* Invite button */}
+        <div style={{ marginTop: 24, marginBottom: 20 }}>
+          <Btn variant="secondary">
+            🔗 Copiar enlace de invitación
+          </Btn>
+        </div>
+      </div>
+
+      {/* Action sheet */}
+      {showActions && showActions !== ME.uid && (
+        <div style={{
+          position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.4)',
+          display: 'flex', alignItems: 'flex-end', zIndex: 100,
+        }} onClick={() => setShowActions(null)}>
+          <div onClick={e => e.stopPropagation()} style={{
+            background: 'white', borderRadius: '24px 24px 0 0',
+            padding: '20px 24px 32px', width: '100%',
+          }}>
+            <div style={{ width: 36, height: 4, background: 'var(--border)', borderRadius: 4, margin: '0 auto 20px' }}/>
+            {(() => {
+              const m = group.members.find(mem => mem.uid === showActions);
+              return <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20, paddingBottom: 16, borderBottom: '1px solid var(--border)' }}>
+                  <Avatar member={m} size={44}/>
+                  <div>
+                    <p style={{ fontWeight: 700, fontSize: 16 }}>{m?.name}</p>
+                    <p style={{ fontSize: 13, color: 'var(--text-3)' }}>{m?.role === 'admin' ? 'Administrador' : 'Miembro'}</p>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {m?.role === 'member' && (
+                    <button onClick={() => setShowActions(null)} style={{
+                      background: 'var(--orange-light)', color: 'var(--orange-d)',
+                      border: 'none', borderRadius: 14, padding: '13px', width: '100%',
+                      fontFamily: "'DM Sans'", fontWeight: 600, fontSize: 15, cursor: 'pointer',
+                    }}>⬆️ Hacer administrador</button>
+                  )}
+                  <button onClick={() => setShowActions(null)} style={{
+                    background: '#FEECEC', color: '#E74C3C',
+                    border: 'none', borderRadius: 14, padding: '13px', width: '100%',
+                    fontFamily: "'DM Sans'", fontWeight: 600, fontSize: 15, cursor: 'pointer',
+                  }}>🚫 Expulsar del grupo</button>
+                </div>
+              </>;
+            })()}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ── SCREEN: PROFILE ───────────────────────────────────────────────────────────
+const ProfileScreen = ({ navigate }) => {
+  const stats = [
+    { label: 'Grupos', value: 2 },
+    { label: 'Semanas activo', value: 17 },
+    { label: 'Selfies', value: 14 },
+  ];
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', background: 'var(--bg)', overflow: 'hidden' }}>
+      <div style={{ padding: '16px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <h2 style={{ fontSize: 18, fontWeight: 700 }}>Perfil</h2>
+        <button style={{ background: 'none', border: 'none', cursor: 'pointer' }}>
+          <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
+            <circle cx="11" cy="11" r="9" stroke="var(--text-2)" strokeWidth="1.6"/>
+            <path d="M11 7.5V11.5" stroke="var(--text-2)" strokeWidth="1.6" strokeLinecap="round"/>
+            <circle cx="11" cy="14" r="0.8" fill="var(--text-2)"/>
+          </svg>
+        </button>
+      </div>
+
+      <div style={{ flex: 1, overflowY: 'auto', padding: '0 20px 20px' }}>
+        {/* Avatar + name */}
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '16px 0 24px' }}>
+          <Avatar member={ME} size={90} style={{ marginBottom: 16, boxShadow: '0 4px 16px rgba(244,162,97,0.3)' }}/>
+          <h3 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>{ME.name}</h3>
+          <p style={{ color: 'var(--text-3)', fontSize: 14 }}>Miembro desde enero 2026</p>
+        </div>
+
+        {/* Stats */}
+        <div style={{ display: 'flex', background: 'white', borderRadius: 18, border: '1px solid var(--border)', marginBottom: 20, overflow: 'hidden' }}>
+          {stats.map((s, i) => (
+            <div key={i} style={{
+              flex: 1, padding: '16px 0', textAlign: 'center',
+              borderRight: i < stats.length - 1 ? '1px solid var(--border)' : 'none',
+            }}>
+              <p style={{ fontSize: 22, fontWeight: 700, color: 'var(--orange)' }}>{s.value}</p>
+              <p style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 500 }}>{s.label}</p>
+            </div>
+          ))}
+        </div>
+
+        {/* Settings */}
+        {[
+          { icon: '🔔', label: 'Notificaciones' },
+          { icon: '👤', label: 'Editar perfil' },
+          { icon: '🌍', label: 'Zona horaria' },
+          { icon: '🗑', label: 'Borrar caché' },
+        ].map((item, i) => (
+          <div key={i} style={{
+            background: 'white', borderRadius: 14, padding: '14px 16px',
+            display: 'flex', alignItems: 'center', gap: 14,
+            marginBottom: 8, border: '1px solid var(--border)', cursor: 'pointer',
+          }}>
+            <span style={{ fontSize: 20 }}>{item.icon}</span>
+            <p style={{ flex: 1, fontWeight: 500, fontSize: 15 }}>{item.label}</p>
+            <svg width="6" height="11" viewBox="0 0 6 11" fill="none">
+              <path d="M1 1L5 5.5L1 10" stroke="var(--text-3)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+          </div>
+        ))}
+
+        <div style={{ marginTop: 16 }}>
+          <Btn variant="ghost" style={{ color: '#E74C3C', fontSize: 14 }}>
+            Cerrar sesión
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ── CAMERA SCREEN ─────────────────────────────────────────────────────────────
+const CameraScreen = () => (
+  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)', padding: 32, textAlign: 'center' }}>
+    <div style={{ fontSize: 64, marginBottom: 24 }}>📅</div>
+    <h3 style={{ fontSize: 22, fontWeight: 700, color: 'var(--text)', marginBottom: 12 }}>La cámara abre el domingo</h3>
+    <p style={{ color: 'var(--text-2)', fontSize: 15, lineHeight: 1.6, maxWidth: 260 }}>
+      Solo puedes subir tu selfie los domingos de 00:00 a 23:59 (hora de tu grupo)
+    </p>
+    <div style={{
+      marginTop: 28, background: 'var(--orange-light)', borderRadius: 16,
+      padding: '14px 20px', border: '1.5px solid var(--orange-mid)',
+    }}>
+      <p style={{ color: 'var(--orange-d)', fontWeight: 600, fontSize: 14 }}>⏰ Próximo domingo en 5 días</p>
+    </div>
+  </div>
+);
+
+// ── MAIN APP ──────────────────────────────────────────────────────────────────
+function App() {
+  const [screenStack, setScreenStack] = useState([{ id: 'login', data: null }]);
+  const [tab, setTab] = useState('groups');
+  const current = screenStack[screenStack.length - 1];
+
+  const navigate = useCallback((id, data = null) => {
+    setScreenStack(prev => [...prev, { id, data }]);
+    if (id === 'home') setTab('groups');
+  }, []);
+
+  const goBack = useCallback(() => {
+    setScreenStack(prev => prev.length > 1 ? prev.slice(0, -1) : prev);
+  }, []);
+
+  const handleTab = useCallback((t) => {
+    setTab(t);
+    setScreenStack([{ id: t === 'groups' ? 'home' : t, data: null }]);
+  }, []);
+
+  const isLoggedIn = !['login', 'onboarding-name', 'onboarding-photo'].includes(current.id);
+  const isFullscreen = current.id === 'selfie';
+
+  const renderScreen = () => {
+    switch (current.id) {
+      case 'login':           return <LoginScreen navigate={navigate}/>;
+      case 'onboarding-name': return <OnboardingName navigate={navigate}/>;
+      case 'onboarding-photo':return <OnboardingPhoto navigate={navigate}/>;
+      case 'home':            return <HomeScreen navigate={navigate}/>;
+      case 'group':           return <GroupScreen group={current.data} navigate={navigate} goBack={goBack}/>;
+      case 'selfie':          return <SelfieScreen data={current.data} navigate={navigate} goBack={goBack}/>;
+      case 'members':         return <MembersScreen group={current.data} goBack={goBack}/>;
+      case 'create-group':    return <CreateGroupScreen navigate={navigate} goBack={goBack}/>;
+      case 'join-group':      return <JoinGroupScreen navigate={navigate} goBack={goBack}/>;
+      case 'camera':          return <CameraScreen/>;
+      case 'profile':         return <ProfileScreen navigate={navigate}/>;
+      default:                return <HomeScreen navigate={navigate}/>;
+    }
+  };
+
+  const [scale, setScale] = React.useState(1);
+  React.useEffect(() => {
+    const update = () => {
+      const s = Math.min(window.innerWidth / 420, window.innerHeight / 890, 1);
+      setScale(s);
+    };
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
+
+  return (
+    <div className="device-scale-wrapper" style={{ transform: `scale(${scale})` }}>
+      <IOSDevice dark={isFullscreen}>
+        <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--bg)', overflow: 'hidden' }}>
+          {renderScreen()}
+          {isLoggedIn && !isFullscreen && (
+            <TabBar tab={tab} onTab={handleTab}/>
+          )}
+        </div>
+      </IOSDevice>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+<div id="root"></div>
+</body>
+</html>
