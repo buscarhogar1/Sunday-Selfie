@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "1034344193488",
+    "project_id": "sundayselfie-8cd4a",
+    "storage_bucket": "sundayselfie-8cd4a.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1034344193488:android:88a2f23670e552f1fa6dd5",
+        "android_client_info": {
+          "package_name": "com.example.sunday_selfie"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1034344193488-b1ahotfvo55t8br81e03m6fp1a9i4hq6.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBwHk4Xlou0Uld5yYYahWxAIDNR12ElEyg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1034344193488-b1ahotfvo55t8br81e03m6fp1a9i4hq6.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
