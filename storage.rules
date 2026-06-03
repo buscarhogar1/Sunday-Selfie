@@ -1,0 +1,88 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isMember(groupId) {
+      return isSignedIn()
+        && firestore.exists(
+          /databases/(default)/documents/groups/$(groupId)/members/$(request.auth.uid)
+        );
+    }
+
+    function isAdmin(groupId) {
+      return isSignedIn()
+        && firestore.exists(
+          /databases/(default)/documents/groups/$(groupId)/members/$(request.auth.uid)
+        )
+        && firestore.get(
+          /databases/(default)/documents/groups/$(groupId)/members/$(request.auth.uid)
+        ).data.role == "admin";
+    }
+
+    function isSundayUploadWindowOpen() {
+      return request.time.dayOfWeek() == 7
+        && request.time.time() >= duration.time(0, 0, 0, 0)
+        && request.time.time() <= duration.time(23, 59, 59, 999000000);
+    }
+
+    function isValidSelfieUpload(groupId, weekKey, fileName) {
+      return isMember(groupId)
+        && isSundayUploadWindowOpen()
+        && request.resource != null
+        && fileName == request.auth.uid + ".jpg"
+        && request.resource.size < 10 * 1024 * 1024
+        && request.resource.contentType.matches("image/.*")
+        && request.resource.metadata.groupId == groupId
+        && request.resource.metadata.weekKey == weekKey
+        && request.resource.metadata.uid == request.auth.uid;
+    }
+
+    function isValidProfilePhotoUpload(userId) {
+      return isSignedIn()
+        && request.auth.uid == userId
+        && request.resource != null
+        && request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType.matches("image/.*");
+    }
+
+    function isValidGroupPhotoUpload(groupId) {
+      return isAdmin(groupId)
+        && request.resource != null
+        && request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType.matches("image/.*")
+        && request.resource.metadata.groupId == groupId
+        && request.resource.metadata.uid == request.auth.uid
+        && request.resource.metadata.kind == "groupPhoto";
+    }
+
+    match /groups/{groupId}/weeks/{weekKey}/{fileName} {
+      allow read: if isMember(groupId);
+
+      allow write: if isValidSelfieUpload(groupId, weekKey, fileName);
+    }
+
+    match /groups/{groupId}/profile/{fileName} {
+      allow read: if isMember(groupId);
+
+      allow create, update: if isValidGroupPhotoUpload(groupId);
+
+      allow delete: if isAdmin(groupId);
+    }
+
+    match /users/{userId}/profile/{fileName} {
+      allow read: if isSignedIn();
+
+      allow create: if isValidProfilePhotoUpload(userId);
+
+      allow update: if isValidProfilePhotoUpload(userId);
+
+      allow delete: if isSignedIn()
+        && request.auth.uid == userId;
+    }
+  }
+}

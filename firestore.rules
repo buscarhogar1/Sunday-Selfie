@@ -1,0 +1,597 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && uid() == userId;
+    }
+
+    function isMember(groupId, userId) {
+      return exists(
+        /databases/$(database)/documents/groups/$(groupId)/members/$(userId)
+      );
+    }
+
+    function memberRole(groupId, userId) {
+      return get(
+        /databases/$(database)/documents/groups/$(groupId)/members/$(userId)
+      ).data.role;
+    }
+
+    function isAdmin(groupId, userId) {
+      return isMember(groupId, userId)
+        && memberRole(groupId, userId) == "admin";
+    }
+
+    function isSundayUploadWindowOpen() {
+      return request.time.dayOfWeek() == 7
+        && request.time.time() >= duration.time(0, 0, 0, 0)
+        && request.time.time() <= duration.time(23, 59, 59, 999000000);
+    }
+
+    function validWeekDocument(groupId, weekKey) {
+      return request.resource.data.keys().hasOnly([
+          "weekKey",
+          "isoYear",
+          "isoWeek",
+          "createdAt",
+          "postCount"
+        ])
+        && request.resource.data.weekKey == weekKey
+        && request.resource.data.isoYear is int
+        && request.resource.data.isoWeek is int
+        && request.resource.data.postCount is int
+        && request.resource.data.createdAt == request.time;
+    }
+
+    function validPostCreate(groupId, weekKey, postUid) {
+      return request.resource.data.keys().hasOnly([
+          "uid",
+          "authorName",
+          "authorPhotoUrl",
+          "createdAt",
+          "updatedAt",
+          "imageUrl",
+          "thumbUrl",
+          "storagePathFull",
+          "storagePathThumb",
+          "hasAnyReactions",
+          "selfReactionEmoji"
+        ])
+        && postUid == uid()
+        && request.resource.data.uid == uid()
+        && request.resource.data.authorName is string
+        && (
+          request.resource.data.authorPhotoUrl == null
+          || request.resource.data.authorPhotoUrl is string
+        )
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.imageUrl is string
+        && request.resource.data.thumbUrl is string
+        && request.resource.data.storagePathFull == "groups/" + groupId + "/weeks/" + weekKey + "/" + uid() + ".jpg"
+        && request.resource.data.storagePathThumb == "groups/" + groupId + "/weeks/" + weekKey + "/" + uid() + ".jpg"
+        && request.resource.data.hasAnyReactions is bool
+        && (
+          request.resource.data.selfReactionEmoji == null
+          || request.resource.data.selfReactionEmoji is string
+        );
+    }
+
+    function validPostUpdate(groupId, weekKey, postUid) {
+      return request.resource.data.keys().hasOnly([
+          "uid",
+          "authorName",
+          "authorPhotoUrl",
+          "createdAt",
+          "updatedAt",
+          "imageUrl",
+          "thumbUrl",
+          "storagePathFull",
+          "storagePathThumb",
+          "hasAnyReactions",
+          "selfReactionEmoji"
+        ])
+        && postUid == uid()
+        && resource.data.uid == uid()
+        && request.resource.data.uid == uid()
+        && request.resource.data.createdAt == resource.data.createdAt
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.authorName is string
+        && (
+          request.resource.data.authorPhotoUrl == null
+          || request.resource.data.authorPhotoUrl is string
+        )
+        && request.resource.data.imageUrl is string
+        && request.resource.data.thumbUrl is string
+        && request.resource.data.storagePathFull == "groups/" + groupId + "/weeks/" + weekKey + "/" + uid() + ".jpg"
+        && request.resource.data.storagePathThumb == "groups/" + groupId + "/weeks/" + weekKey + "/" + uid() + ".jpg"
+        && request.resource.data.hasAnyReactions is bool
+        && (
+          request.resource.data.selfReactionEmoji == null
+          || request.resource.data.selfReactionEmoji is string
+        );
+    }
+
+    function validReactionWrite(reactionUid, postUid) {
+      return reactionUid == uid()
+        && reactionUid != postUid
+        && request.resource.data.keys().hasOnly([
+          "uid",
+          "emoji",
+          "authorName",
+          "authorPhotoUrl",
+          "createdAt",
+          "updatedAt"
+        ])
+        && request.resource.data.uid == uid()
+        && request.resource.data.emoji is string
+        && request.resource.data.emoji.size() > 0
+        && request.resource.data.emoji.size() <= 32
+        && request.resource.data.authorName is string
+        && (
+          request.resource.data.authorPhotoUrl == null
+          || request.resource.data.authorPhotoUrl is string
+        )
+        && request.resource.data.updatedAt == request.time;
+    }
+
+    function validReminderCreate(groupId, weekKey, reminderId) {
+      return isSundayUploadWindowOpen()
+        && request.resource.data.keys().hasOnly([
+          "type",
+          "groupId",
+          "groupName",
+          "weekKey",
+          "senderUid",
+          "senderName",
+          "senderPhotoUrl",
+          "targetUid",
+          "targetName",
+          "targetPhotoUrl",
+          "createdAt",
+          "updatedAt",
+          "notificationStatus",
+          "notificationSentAt",
+          "readAt"
+        ])
+        && request.resource.data.type == "friend_reminder"
+        && request.resource.data.groupId == groupId
+        && request.resource.data.weekKey == weekKey
+        && request.resource.data.senderUid == uid()
+        && request.resource.data.targetUid is string
+        && request.resource.data.targetUid != uid()
+        && reminderId == uid() + "_" + request.resource.data.targetUid
+        && isMember(groupId, uid())
+        && isMember(groupId, request.resource.data.targetUid)
+        && request.resource.data.groupName is string
+        && request.resource.data.senderName is string
+        && request.resource.data.targetName is string
+        && (
+          request.resource.data.senderPhotoUrl == null
+          || request.resource.data.senderPhotoUrl is string
+        )
+        && (
+          request.resource.data.targetPhotoUrl == null
+          || request.resource.data.targetPhotoUrl is string
+        )
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.notificationStatus == "pending"
+        && request.resource.data.notificationSentAt == null
+        && request.resource.data.readAt == null;
+    }
+
+    function validChatMessageCreate(groupId, weekKey) {
+      return isSundayUploadWindowOpen()
+        && request.resource.data.keys().hasOnly([
+          "uid",
+          "authorName",
+          "authorPhotoUrl",
+          "text",
+          "weekKey",
+          "createdAt"
+        ])
+        && request.resource.data.uid == uid()
+        && request.resource.data.weekKey == weekKey
+        && request.resource.data.authorName is string
+        && request.resource.data.authorName.size() > 0
+        && request.resource.data.authorName.size() <= 80
+        && (
+          request.resource.data.authorPhotoUrl == null
+          || request.resource.data.authorPhotoUrl is string
+        )
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 500
+        && request.resource.data.createdAt == request.time;
+    }
+
+    function validGroupActivityUpdate(groupId) {
+      return isSignedIn()
+        && isMember(groupId, uid())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "lastActivityAt"
+        ])
+        && request.resource.data.lastActivityAt == request.time;
+    }
+
+    function validAdminGroupNameUpdate(groupId) {
+      return isSignedIn()
+        && isAdmin(groupId, uid())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "name",
+          "updatedAt",
+          "lastActivityAt"
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.lastActivityAt == request.time;
+    }
+
+    function validAdminGroupPhotoUpdate(groupId) {
+      return isSignedIn()
+        && isAdmin(groupId, uid())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "photoUrl",
+          "photoStoragePath",
+          "updatedAt",
+          "lastActivityAt"
+        ])
+        && request.resource.data.photoUrl is string
+        && request.resource.data.photoUrl.size() > 0
+        && request.resource.data.photoStoragePath is string
+        && request.resource.data.photoStoragePath.size() > 0
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.lastActivityAt == request.time;
+    }
+
+    function validGroupMemberCountIncrement(groupId) {
+      return isSignedIn()
+        && isAdmin(groupId, uid())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "memberCount",
+          "lastActivityAt"
+        ])
+        && resource.data.memberCount is int
+        && request.resource.data.memberCount is int
+        && request.resource.data.memberCount == resource.data.memberCount + 1
+        && request.resource.data.memberCount <= 30
+        && request.resource.data.lastActivityAt == request.time;
+    }
+
+    function validGroupMemberCountDecrement(groupId) {
+      return isSignedIn()
+        && isAdmin(groupId, uid())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "memberCount",
+          "lastActivityAt"
+        ])
+        && resource.data.memberCount is int
+        && request.resource.data.memberCount is int
+        && request.resource.data.memberCount == resource.data.memberCount - 1
+        && request.resource.data.memberCount >= 1
+        && request.resource.data.lastActivityAt == request.time;
+    }
+
+    function validGroupAdminsCountIncrement(groupId) {
+      return isSignedIn()
+        && isAdmin(groupId, uid())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "adminsCount",
+          "lastActivityAt"
+        ])
+        && resource.data.adminsCount is int
+        && request.resource.data.adminsCount is int
+        && request.resource.data.adminsCount == resource.data.adminsCount + 1
+        && request.resource.data.lastActivityAt == request.time;
+    }
+
+    function validOwnLeaveGroupCounts(groupId) {
+      return isSignedIn()
+        && isMember(groupId, uid())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "memberCount",
+          "adminsCount",
+          "lastActivityAt",
+          "deleted",
+          "deletedAt",
+          "deletedReason"
+        ])
+        && resource.data.memberCount is int
+        && resource.data.adminsCount is int
+        && request.resource.data.memberCount is int
+        && request.resource.data.adminsCount is int
+        && request.resource.data.memberCount == resource.data.memberCount - 1
+        && request.resource.data.memberCount >= 0
+        && request.resource.data.lastActivityAt == request.time
+        && (
+          (
+            memberRole(groupId, uid()) == "admin"
+            && request.resource.data.adminsCount == resource.data.adminsCount - 1
+            && request.resource.data.adminsCount >= 0
+          )
+          ||
+          (
+            memberRole(groupId, uid()) != "admin"
+            && request.resource.data.adminsCount == resource.data.adminsCount
+          )
+        )
+        && (
+          request.resource.data.memberCount == 0
+          || request.resource.data.adminsCount >= 1
+        );
+    }
+
+    function validUserGroupActivityMirrorCreate(groupId) {
+      return isSignedIn()
+        && isMember(groupId, uid())
+        && request.resource.data.keys().hasOnly([
+          "groupId",
+          "lastActivityAt"
+        ])
+        && request.resource.data.groupId == groupId
+        && request.resource.data.lastActivityAt == request.time;
+    }
+
+    function validUserGroupActivityMirrorUpdate(groupId) {
+      return isSignedIn()
+        && isMember(groupId, uid())
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "groupId",
+          "lastActivityAt"
+        ])
+        && request.resource.data.groupId == groupId
+        && request.resource.data.lastActivityAt == request.time;
+    }
+
+    function validOwnMemberProfileUpdate(memberUid) {
+      return isSignedIn()
+        && memberUid == uid()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "effectiveName",
+          "effectivePhotoUrl",
+          "profileSyncedAt"
+        ])
+        && (
+          request.resource.data.effectiveName == null
+          || request.resource.data.effectiveName is string
+        )
+        && (
+          request.resource.data.effectivePhotoUrl == null
+          || request.resource.data.effectivePhotoUrl is string
+        )
+        && request.resource.data.profileSyncedAt == request.time;
+    }
+
+    function validAdminPromoteMemberUpdate(groupId, memberUid) {
+      return isSignedIn()
+        && isAdmin(groupId, uid())
+        && memberUid != uid()
+        && resource.data.role != "admin"
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "role",
+          "promotedAt",
+          "promotedByUid"
+        ])
+        && request.resource.data.role == "admin"
+        && request.resource.data.promotedByUid == uid()
+        && request.resource.data.promotedAt == request.time;
+    }
+
+    function validAdminMemberDelete(groupId, memberUid) {
+      return isSignedIn()
+        && isAdmin(groupId, uid())
+        && memberUid != uid()
+        && resource.data.role != "admin";
+    }
+
+    function validOwnMemberLeave(groupId, memberUid) {
+      return isSignedIn()
+        && memberUid == uid()
+        && isMember(groupId, uid())
+        && (
+          memberRole(groupId, uid()) != "admin"
+          || get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount <= 1
+          || get(/databases/$(database)/documents/groups/$(groupId)).data.adminsCount > 1
+        );
+    }
+
+    match /users/{userId} {
+      allow read, create, update: if isSelf(userId);
+
+      match /groups/{groupId} {
+        allow read: if isSelf(userId)
+          || (
+            isSignedIn()
+            && isAdmin(groupId, uid())
+          );
+
+        allow create: if isSelf(userId)
+          || (
+            isSignedIn()
+            && isAdmin(groupId, uid())
+          )
+          || validUserGroupActivityMirrorCreate(groupId);
+
+        allow update: if isSelf(userId)
+          || (
+            isSignedIn()
+            && isAdmin(groupId, uid())
+          )
+          || validUserGroupActivityMirrorUpdate(groupId);
+
+        allow delete: if isSelf(userId)
+          || (
+            isSignedIn()
+            && isAdmin(groupId, uid())
+          );
+      }
+
+      match /notificationTokens/{tokenId} {
+        allow read, create, update, delete: if isSelf(userId);
+      }
+    }
+
+    match /groups/{groupId} {
+
+      allow get: if isSignedIn()
+        && (
+          isMember(groupId, uid())
+          || resource.data.deleted != true
+        );
+
+      allow list: if false;
+
+      allow create: if isSignedIn()
+        && request.resource.data.createdByUid == uid()
+        && request.resource.data.memberCount == 1
+        && request.resource.data.adminsCount == 1
+        && request.resource.data.memberLimit == 30;
+
+      allow update: if validGroupActivityUpdate(groupId)
+        || validAdminGroupNameUpdate(groupId)
+        || validAdminGroupPhotoUpdate(groupId)
+        || validGroupMemberCountIncrement(groupId)
+        || validGroupMemberCountDecrement(groupId)
+        || validGroupAdminsCountIncrement(groupId)
+        || validOwnLeaveGroupCounts(groupId);
+
+      allow delete: if false;
+
+      match /members/{memberUid} {
+
+        allow get: if isSignedIn()
+          && (
+            isMember(groupId, uid())
+            || memberUid == uid()
+          );
+
+        allow list: if isSignedIn()
+          && isMember(groupId, uid());
+
+        allow create: if isSignedIn()
+          && (
+            memberUid == uid()
+            || (
+              isAdmin(groupId, uid())
+              && get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount < 30
+            )
+          );
+
+        allow update: if validOwnMemberProfileUpdate(memberUid)
+          || validAdminPromoteMemberUpdate(groupId, memberUid);
+
+        allow delete: if validAdminMemberDelete(groupId, memberUid)
+          || validOwnMemberLeave(groupId, memberUid);
+      }
+
+      match /joinRequests/{requestUid} {
+
+        allow create: if isSignedIn()
+          && requestUid == uid()
+          && !isMember(groupId, uid())
+          && get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount < 30;
+
+        allow read: if isSignedIn()
+          && (
+            isMember(groupId, uid())
+            || requestUid == uid()
+          );
+
+        allow delete: if isSignedIn()
+          && isAdmin(groupId, uid());
+
+        allow update: if false;
+      }
+
+      match /weeks/{weekKey} {
+
+        allow read: if isSignedIn()
+          && isMember(groupId, uid());
+
+        allow create: if isSignedIn()
+          && isMember(groupId, uid())
+          && isSundayUploadWindowOpen()
+          && validWeekDocument(groupId, weekKey);
+
+        allow update: if isSignedIn()
+          && isMember(groupId, uid())
+          && isSundayUploadWindowOpen()
+          && validWeekDocument(groupId, weekKey);
+
+        allow delete: if false;
+
+        match /chatMessages/{messageId} {
+
+          allow read: if isSignedIn()
+            && isMember(groupId, uid());
+
+          allow create: if isSignedIn()
+            && isMember(groupId, uid())
+            && validChatMessageCreate(groupId, weekKey);
+
+          allow update, delete: if false;
+        }
+
+        match /reminders/{reminderId} {
+
+          allow read: if isSignedIn()
+            && isMember(groupId, uid());
+
+          allow create: if isSignedIn()
+            && validReminderCreate(groupId, weekKey, reminderId);
+
+          allow update, delete: if false;
+        }
+
+        match /posts/{postUid} {
+
+          allow read: if isSignedIn()
+            && isMember(groupId, uid());
+
+          allow create: if isSignedIn()
+            && isMember(groupId, uid())
+            && isSundayUploadWindowOpen()
+            && validPostCreate(groupId, weekKey, postUid);
+
+          allow update: if isSignedIn()
+            && isMember(groupId, uid())
+            && isSundayUploadWindowOpen()
+            && validPostUpdate(groupId, weekKey, postUid);
+
+          allow delete: if false;
+
+          match /reactions/{reactionUid} {
+
+            allow read: if isSignedIn()
+              && isMember(groupId, uid());
+
+            allow create: if isSignedIn()
+              && isMember(groupId, uid())
+              && validReactionWrite(reactionUid, postUid)
+              && request.resource.data.createdAt == request.time;
+
+            allow update: if isSignedIn()
+              && isMember(groupId, uid())
+              && validReactionWrite(reactionUid, postUid)
+              && request.resource.data.createdAt == resource.data.createdAt;
+
+            allow delete: if false;
+          }
+        }
+      }
+    }
+  }
+}
