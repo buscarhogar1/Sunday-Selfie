@@ -32,6 +32,12 @@ service cloud.firestore {
         && memberRole(groupId, userId) == "admin";
     }
 
+    function isBlockedFromGroup(groupId, userId) {
+      return exists(
+        /databases/$(database)/documents/groups/$(groupId)/blockedUsers/$(userId)
+      );
+    }
+
     function isSundayUploadWindowOpen() {
       return request.time.dayOfWeek() == 7
         && request.time.time() >= duration.time(0, 0, 0, 0)
@@ -49,146 +55,8 @@ service cloud.firestore {
         && request.resource.data.weekKey == weekKey
         && request.resource.data.isoYear is int
         && request.resource.data.isoWeek is int
-        && request.resource.data.postCount is int
+        && request.resource.data.postCount == 0
         && request.resource.data.createdAt == request.time;
-    }
-
-    function validPostCreate(groupId, weekKey, postUid) {
-      return request.resource.data.keys().hasOnly([
-          "uid",
-          "authorName",
-          "authorPhotoUrl",
-          "createdAt",
-          "updatedAt",
-          "imageUrl",
-          "thumbUrl",
-          "storagePathFull",
-          "storagePathThumb",
-          "hasAnyReactions",
-          "selfReactionEmoji"
-        ])
-        && postUid == uid()
-        && request.resource.data.uid == uid()
-        && request.resource.data.authorName is string
-        && (
-          request.resource.data.authorPhotoUrl == null
-          || request.resource.data.authorPhotoUrl is string
-        )
-        && request.resource.data.createdAt == request.time
-        && request.resource.data.updatedAt == request.time
-        && request.resource.data.imageUrl is string
-        && request.resource.data.thumbUrl is string
-        && request.resource.data.storagePathFull == "groups/" + groupId + "/weeks/" + weekKey + "/" + uid() + ".jpg"
-        && request.resource.data.storagePathThumb == "groups/" + groupId + "/weeks/" + weekKey + "/" + uid() + ".jpg"
-        && request.resource.data.hasAnyReactions is bool
-        && (
-          request.resource.data.selfReactionEmoji == null
-          || request.resource.data.selfReactionEmoji is string
-        );
-    }
-
-    function validPostUpdate(groupId, weekKey, postUid) {
-      return request.resource.data.keys().hasOnly([
-          "uid",
-          "authorName",
-          "authorPhotoUrl",
-          "createdAt",
-          "updatedAt",
-          "imageUrl",
-          "thumbUrl",
-          "storagePathFull",
-          "storagePathThumb",
-          "hasAnyReactions",
-          "selfReactionEmoji"
-        ])
-        && postUid == uid()
-        && resource.data.uid == uid()
-        && request.resource.data.uid == uid()
-        && request.resource.data.createdAt == resource.data.createdAt
-        && request.resource.data.updatedAt == request.time
-        && request.resource.data.authorName is string
-        && (
-          request.resource.data.authorPhotoUrl == null
-          || request.resource.data.authorPhotoUrl is string
-        )
-        && request.resource.data.imageUrl is string
-        && request.resource.data.thumbUrl is string
-        && request.resource.data.storagePathFull == "groups/" + groupId + "/weeks/" + weekKey + "/" + uid() + ".jpg"
-        && request.resource.data.storagePathThumb == "groups/" + groupId + "/weeks/" + weekKey + "/" + uid() + ".jpg"
-        && request.resource.data.hasAnyReactions is bool
-        && (
-          request.resource.data.selfReactionEmoji == null
-          || request.resource.data.selfReactionEmoji is string
-        );
-    }
-
-    function validReactionWrite(reactionUid, postUid) {
-      return reactionUid == uid()
-        && reactionUid != postUid
-        && request.resource.data.keys().hasOnly([
-          "uid",
-          "emoji",
-          "authorName",
-          "authorPhotoUrl",
-          "createdAt",
-          "updatedAt"
-        ])
-        && request.resource.data.uid == uid()
-        && request.resource.data.emoji is string
-        && request.resource.data.emoji.size() > 0
-        && request.resource.data.emoji.size() <= 32
-        && request.resource.data.authorName is string
-        && (
-          request.resource.data.authorPhotoUrl == null
-          || request.resource.data.authorPhotoUrl is string
-        )
-        && request.resource.data.updatedAt == request.time;
-    }
-
-    function validReminderCreate(groupId, weekKey, reminderId) {
-      return isSundayUploadWindowOpen()
-        && request.resource.data.keys().hasOnly([
-          "type",
-          "groupId",
-          "groupName",
-          "weekKey",
-          "senderUid",
-          "senderName",
-          "senderPhotoUrl",
-          "targetUid",
-          "targetName",
-          "targetPhotoUrl",
-          "createdAt",
-          "updatedAt",
-          "notificationStatus",
-          "notificationSentAt",
-          "readAt"
-        ])
-        && request.resource.data.type == "friend_reminder"
-        && request.resource.data.groupId == groupId
-        && request.resource.data.weekKey == weekKey
-        && request.resource.data.senderUid == uid()
-        && request.resource.data.targetUid is string
-        && request.resource.data.targetUid != uid()
-        && reminderId == uid() + "_" + request.resource.data.targetUid
-        && isMember(groupId, uid())
-        && isMember(groupId, request.resource.data.targetUid)
-        && request.resource.data.groupName is string
-        && request.resource.data.senderName is string
-        && request.resource.data.targetName is string
-        && (
-          request.resource.data.senderPhotoUrl == null
-          || request.resource.data.senderPhotoUrl is string
-        )
-        && (
-          request.resource.data.targetPhotoUrl == null
-          || request.resource.data.targetPhotoUrl is string
-        )
-        && request.resource.data.createdAt == request.time
-        && request.resource.data.updatedAt == request.time
-        && request.resource.data.notificationStatus == "pending"
-        && request.resource.data.notificationSentAt == null
-        && request.resource.data.readAt == null;
     }
 
     function validChatMessageCreate(groupId, weekKey) {
@@ -257,83 +125,6 @@ service cloud.firestore {
         && request.resource.data.lastActivityAt == request.time;
     }
 
-    function validGroupMemberCountIncrement(groupId) {
-      return isSignedIn()
-        && isAdmin(groupId, uid())
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          "memberCount",
-          "lastActivityAt"
-        ])
-        && resource.data.memberCount is int
-        && request.resource.data.memberCount is int
-        && request.resource.data.memberCount == resource.data.memberCount + 1
-        && request.resource.data.memberCount <= 30
-        && request.resource.data.lastActivityAt == request.time;
-    }
-
-    function validGroupMemberCountDecrement(groupId) {
-      return isSignedIn()
-        && isAdmin(groupId, uid())
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          "memberCount",
-          "lastActivityAt"
-        ])
-        && resource.data.memberCount is int
-        && request.resource.data.memberCount is int
-        && request.resource.data.memberCount == resource.data.memberCount - 1
-        && request.resource.data.memberCount >= 1
-        && request.resource.data.lastActivityAt == request.time;
-    }
-
-    function validGroupAdminsCountIncrement(groupId) {
-      return isSignedIn()
-        && isAdmin(groupId, uid())
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          "adminsCount",
-          "lastActivityAt"
-        ])
-        && resource.data.adminsCount is int
-        && request.resource.data.adminsCount is int
-        && request.resource.data.adminsCount == resource.data.adminsCount + 1
-        && request.resource.data.lastActivityAt == request.time;
-    }
-
-    function validOwnLeaveGroupCounts(groupId) {
-      return isSignedIn()
-        && isMember(groupId, uid())
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          "memberCount",
-          "adminsCount",
-          "lastActivityAt",
-          "deleted",
-          "deletedAt",
-          "deletedReason"
-        ])
-        && resource.data.memberCount is int
-        && resource.data.adminsCount is int
-        && request.resource.data.memberCount is int
-        && request.resource.data.adminsCount is int
-        && request.resource.data.memberCount == resource.data.memberCount - 1
-        && request.resource.data.memberCount >= 0
-        && request.resource.data.lastActivityAt == request.time
-        && (
-          (
-            memberRole(groupId, uid()) == "admin"
-            && request.resource.data.adminsCount == resource.data.adminsCount - 1
-            && request.resource.data.adminsCount >= 0
-          )
-          ||
-          (
-            memberRole(groupId, uid()) != "admin"
-            && request.resource.data.adminsCount == resource.data.adminsCount
-          )
-        )
-        && (
-          request.resource.data.memberCount == 0
-          || request.resource.data.adminsCount >= 1
-        );
-    }
-
     function validUserGroupActivityMirrorCreate(groupId) {
       return isSignedIn()
         && isMember(groupId, uid())
@@ -375,37 +166,55 @@ service cloud.firestore {
         && request.resource.data.profileSyncedAt == request.time;
     }
 
-    function validAdminPromoteMemberUpdate(groupId, memberUid) {
+    function validActiveInviteCodeForGroup(groupId, inviteCode) {
+      return inviteCode is string
+        && inviteCode.matches("[A-Z2-9]{10}")
+        && exists(/databases/$(database)/documents/inviteCodes/$(inviteCode))
+        && get(/databases/$(database)/documents/inviteCodes/$(inviteCode)).data.active == true
+        && get(/databases/$(database)/documents/inviteCodes/$(inviteCode)).data.groupId == groupId;
+    }
+
+    function validLegacyInviteCodeForGroup(groupId, inviteCode) {
+      return inviteCode is string
+        && inviteCode == "TEMP-" + groupId
+        && get(/databases/$(database)/documents/groups/$(groupId)).data.inviteCode == inviteCode;
+    }
+
+    function validInviteCodeForJoinRequest(groupId) {
+      let inviteCode = request.resource.data.inviteCodeUsed;
+      return validActiveInviteCodeForGroup(groupId, inviteCode)
+        || validLegacyInviteCodeForGroup(groupId, inviteCode);
+    }
+
+    function validJoinRequestCreate(groupId, requestUid) {
       return isSignedIn()
-        && isAdmin(groupId, uid())
-        && memberUid != uid()
-        && resource.data.role != "admin"
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          "role",
-          "promotedAt",
-          "promotedByUid"
+        && requestUid == uid()
+        && exists(/databases/$(database)/documents/groups/$(groupId))
+        && get(/databases/$(database)/documents/groups/$(groupId)).data.deleted != true
+        && !isMember(groupId, uid())
+        && !isBlockedFromGroup(groupId, uid())
+        && get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount < 30
+        && request.resource.data.keys().hasOnly([
+          "uid",
+          "baseName",
+          "basePhotoUrl",
+          "status",
+          "inviteCodeUsed",
+          "requestedAt",
+          "updatedAt"
         ])
-        && request.resource.data.role == "admin"
-        && request.resource.data.promotedByUid == uid()
-        && request.resource.data.promotedAt == request.time;
-    }
-
-    function validAdminMemberDelete(groupId, memberUid) {
-      return isSignedIn()
-        && isAdmin(groupId, uid())
-        && memberUid != uid()
-        && resource.data.role != "admin";
-    }
-
-    function validOwnMemberLeave(groupId, memberUid) {
-      return isSignedIn()
-        && memberUid == uid()
-        && isMember(groupId, uid())
+        && request.resource.data.uid == uid()
+        && request.resource.data.baseName is string
+        && request.resource.data.baseName.size() > 0
+        && request.resource.data.baseName.size() <= 80
         && (
-          memberRole(groupId, uid()) != "admin"
-          || get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount <= 1
-          || get(/databases/$(database)/documents/groups/$(groupId)).data.adminsCount > 1
-        );
+          request.resource.data.basePhotoUrl == null
+          || request.resource.data.basePhotoUrl is string
+        )
+        && request.resource.data.status == "pending"
+        && request.resource.data.requestedAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && validInviteCodeForJoinRequest(groupId);
     }
 
     match /users/{userId} {
@@ -444,6 +253,21 @@ service cloud.firestore {
       }
     }
 
+    match /reports/{reportId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /inviteCodes/{inviteCode} {
+      allow get: if isSignedIn()
+        && resource.data.active == true
+        && exists(/databases/$(database)/documents/groups/$(resource.data.groupId))
+        && get(/databases/$(database)/documents/groups/$(resource.data.groupId)).data.deleted != true;
+
+      allow list: if false;
+
+      allow create, update, delete: if false;
+    }
+
     match /groups/{groupId} {
 
       allow get: if isSignedIn()
@@ -454,19 +278,11 @@ service cloud.firestore {
 
       allow list: if false;
 
-      allow create: if isSignedIn()
-        && request.resource.data.createdByUid == uid()
-        && request.resource.data.memberCount == 1
-        && request.resource.data.adminsCount == 1
-        && request.resource.data.memberLimit == 30;
+      allow create: if false;
 
       allow update: if validGroupActivityUpdate(groupId)
         || validAdminGroupNameUpdate(groupId)
-        || validAdminGroupPhotoUpdate(groupId)
-        || validGroupMemberCountIncrement(groupId)
-        || validGroupMemberCountDecrement(groupId)
-        || validGroupAdminsCountIncrement(groupId)
-        || validOwnLeaveGroupCounts(groupId);
+        || validAdminGroupPhotoUpdate(groupId);
 
       allow delete: if false;
 
@@ -481,28 +297,16 @@ service cloud.firestore {
         allow list: if isSignedIn()
           && isMember(groupId, uid());
 
-        allow create: if isSignedIn()
-          && (
-            memberUid == uid()
-            || (
-              isAdmin(groupId, uid())
-              && get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount < 30
-            )
-          );
+        allow create: if false;
 
-        allow update: if validOwnMemberProfileUpdate(memberUid)
-          || validAdminPromoteMemberUpdate(groupId, memberUid);
+        allow update: if validOwnMemberProfileUpdate(memberUid);
 
-        allow delete: if validAdminMemberDelete(groupId, memberUid)
-          || validOwnMemberLeave(groupId, memberUid);
+        allow delete: if false;
       }
 
       match /joinRequests/{requestUid} {
 
-        allow create: if isSignedIn()
-          && requestUid == uid()
-          && !isMember(groupId, uid())
-          && get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount < 30;
+        allow create: if validJoinRequestCreate(groupId, requestUid);
 
         allow read: if isSignedIn()
           && (
@@ -510,10 +314,21 @@ service cloud.firestore {
             || requestUid == uid()
           );
 
-        allow delete: if isSignedIn()
+        allow update, delete: if false;
+      }
+
+      match /blockedUsers/{blockedUid} {
+
+        allow get: if isSignedIn()
+          && (
+            blockedUid == uid()
+            || isAdmin(groupId, uid())
+          );
+
+        allow list: if isSignedIn()
           && isAdmin(groupId, uid());
 
-        allow update: if false;
+        allow create, update, delete: if false;
       }
 
       match /weeks/{weekKey} {
@@ -526,10 +341,7 @@ service cloud.firestore {
           && isSundayUploadWindowOpen()
           && validWeekDocument(groupId, weekKey);
 
-        allow update: if isSignedIn()
-          && isMember(groupId, uid())
-          && isSundayUploadWindowOpen()
-          && validWeekDocument(groupId, weekKey);
+        allow update: if false;
 
         allow delete: if false;
 
@@ -550,10 +362,7 @@ service cloud.firestore {
           allow read: if isSignedIn()
             && isMember(groupId, uid());
 
-          allow create: if isSignedIn()
-            && validReminderCreate(groupId, weekKey, reminderId);
-
-          allow update, delete: if false;
+          allow create, update, delete: if false;
         }
 
         match /posts/{postUid} {
@@ -561,34 +370,14 @@ service cloud.firestore {
           allow read: if isSignedIn()
             && isMember(groupId, uid());
 
-          allow create: if isSignedIn()
-            && isMember(groupId, uid())
-            && isSundayUploadWindowOpen()
-            && validPostCreate(groupId, weekKey, postUid);
-
-          allow update: if isSignedIn()
-            && isMember(groupId, uid())
-            && isSundayUploadWindowOpen()
-            && validPostUpdate(groupId, weekKey, postUid);
-
-          allow delete: if false;
+          allow create, update, delete: if false;
 
           match /reactions/{reactionUid} {
 
             allow read: if isSignedIn()
               && isMember(groupId, uid());
 
-            allow create: if isSignedIn()
-              && isMember(groupId, uid())
-              && validReactionWrite(reactionUid, postUid)
-              && request.resource.data.createdAt == request.time;
-
-            allow update: if isSignedIn()
-              && isMember(groupId, uid())
-              && validReactionWrite(reactionUid, postUid)
-              && request.resource.data.createdAt == resource.data.createdAt;
-
-            allow delete: if false;
+            allow create, update, delete: if false;
           }
         }
       }

@@ -1,17 +1,43 @@
-# sunday_selfie
+# Sunday Selfie
 
-A new Flutter project.
+Aplicacion Flutter conectada a Firebase.
 
-## Getting Started
+## Comprobaciones locales
 
-This project is a starting point for a Flutter application.
+Estas comprobaciones no escriben nada en Firebase produccion.
 
-A few resources to get you started if this is your first Flutter project:
+Primera preparacion, solo una vez:
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+```bash
+npm install
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Comprobaciones rapidas del codigo y de los contratos de seguridad:
+
+```bash
+npm run check:local
+```
+
+Pruebas reales de Firestore Rules y Storage Rules con emuladores:
+
+```bash
+npm run test:rules
+```
+
+Las pruebas de reglas usan siempre el proyecto local ficticio
+`demo-sunday-selfie`. El script detecta automaticamente el Java incluido con
+Android Studio.
+
+Analisis de Flutter:
+
+```bash
+~/development/flutter_clean/bin/flutter analyze
+```
+
+Pruebas de Flutter:
+
+```bash
+~/development/flutter_clean/bin/flutter test
+```
+
+No es necesario ejecutar un deploy para ninguna de estas comprobaciones.

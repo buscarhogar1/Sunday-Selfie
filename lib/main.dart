@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui';
 import 'dart:convert';
 
@@ -11,6 +10,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/foundation.dart';
@@ -407,7 +407,7 @@ Future<void> crearUsuarioSiNoExiste(User user) async {
         'notificationSettingsDefaultsVersion': 2,
       });
     } else {
-      final data = userDoc.data() as Map<String, dynamic>?;
+      final data = userDoc.data();
 
       final updates = <String, dynamic>{
         'lastActiveAt': FieldValue.serverTimestamp(),
@@ -434,7 +434,7 @@ Future<void> crearUsuarioSiNoExiste(User user) async {
 
   try {
     final syncedUserDoc = await userRef.get();
-    final syncedData = syncedUserDoc.data() as Map<String, dynamic>?;
+    final syncedData = syncedUserDoc.data();
     final rawName = syncedData?['baseName'];
     final rawPhotoUrl = syncedData?['basePhotoUrl'];
     final effectiveName = rawName is String && rawName.trim().isNotEmpty
@@ -899,91 +899,72 @@ Future<void> registrarTokenNotificaciones(User user) async {
   }
 }
 
-Future<String> crearGrupoMinimo({
-  required User user,
+class CreatedGroupInfo {
+  final String groupId;
+  final String inviteCode;
+
+  const CreatedGroupInfo({
+    required this.groupId,
+    required this.inviteCode,
+  });
+}
+
+Future<CreatedGroupInfo> crearGrupoMinimo({
   required String nombreGrupo,
-  required String baseName,
   XFile? groupPhoto,
   String? groupEmoji,
   int? groupColorValue,
 }) async {
+  final currentUser = FirebaseAuth.instance.currentUser;
+  if (currentUser == null) {
+    throw Exception('No hay usuario autenticado');
+  }
+
   final firestore = FirebaseFirestore.instance;
-
-  final groupRef = firestore.collection('groups').doc();
-  final memberRef = groupRef.collection('members').doc(user.uid);
-  final userGroupRef = firestore
-      .collection('users')
-      .doc(user.uid)
-      .collection('groups')
-      .doc(groupRef.id);
-
-  final userDoc = await firestore.collection('users').doc(user.uid).get();
-  final rawBasePhotoUrl = userDoc.data()?['basePhotoUrl'];
-  final basePhotoUrl = rawBasePhotoUrl is String && rawBasePhotoUrl.trim().isNotEmpty
-      ? rawBasePhotoUrl.trim()
-      : null;
-
   final cleanEmoji = groupEmoji?.trim();
   final resolvedEmoji = cleanEmoji == null || cleanEmoji.isEmpty ? null : cleanEmoji;
-  final resolvedColorValue = groupColorValue ?? kGroupColorOptions.first.value;
+  final resolvedColorValue =
+      groupColorValue ?? kGroupColorOptions.first.toARGB32();
 
-  final batch = firestore.batch();
-  final inviteCode = generarCodigoInvitacionDesdeGroupId(groupRef.id);
-  final inviteLink = crearEnlaceInvitacion(inviteCode);
+  late String groupId;
+  late String inviteCode;
 
-  batch.set(groupRef, {
-    'name': nombreGrupo,
-    'photoUrl': null,
-    'photoStoragePath': null,
-    'emoji': resolvedEmoji,
-    'colorValue': resolvedColorValue,
-    'createdAt': FieldValue.serverTimestamp(),
-    'lastActivityAt': FieldValue.serverTimestamp(),
-    'createdByUid': user.uid,
-    'timezone': 'Europe/Madrid',
-    'inviteCode': inviteCode,
-    'inviteLink': inviteLink,
-    'inviteCodeVersion': 1,
-    'memberCount': 1,
-    'adminsCount': 1,
-    'memberLimit': kMaxGroupMembers,
-    'deleted': false,
-    'deletedAt': null,
-    'deletedReason': null,
-  });
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('crearGrupo');
+    final result = await callable.call<dynamic>({
+      'name': nombreGrupo,
+      'emoji': resolvedEmoji,
+      'colorValue': resolvedColorValue,
+    });
+    final resultData = result.data;
 
-  batch.set(memberRef, {
-    'role': 'admin',
-    'joinedAt': FieldValue.serverTimestamp(),
-    'statusThisSunday': false,
-    'effectiveName': baseName,
-    'effectivePhotoUrl': basePhotoUrl,
-    'inviteCodeVersionAtJoin': 1,
-  });
+    if (resultData is! Map) {
+      throw Exception('Firebase no devolvió los datos del grupo');
+    }
 
-  batch.set(userGroupRef, {
-    'groupId': groupRef.id,
-    'role': 'admin',
-    'joinedAt': FieldValue.serverTimestamp(),
-    'lastViewedAt': null,
-    'lastActivityAt': FieldValue.serverTimestamp(),
-    'notificationsOverride': 'on',
-    'autoDownloadEnabled': false,
-    'displayNameSnapshot': nombreGrupo,
-    'groupPhotoUrlSnapshot': null,
-    'groupEmojiSnapshot': resolvedEmoji,
-    'groupColorValueSnapshot': resolvedColorValue,
-  });
+    groupId = (resultData['groupId'] ?? '').toString().trim();
+    inviteCode = (resultData['inviteCode'] ?? '').toString().trim();
 
-  await batch.commit();
+    if (groupId.isEmpty || inviteCode.isEmpty) {
+      throw Exception('Firebase no devolvió una invitación válida');
+    }
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo crear el grupo');
+  }
 
   if (groupPhoto != null) {
     try {
       final photoUrl = await actualizarFotoGrupo(
-        groupId: groupRef.id,
+        groupId: groupId,
         foto: groupPhoto,
         markActivity: false,
       );
+
+      final userGroupRef = firestore
+          .collection('users')
+          .doc(currentUser.uid)
+          .collection('groups')
+          .doc(groupId);
 
       await userGroupRef.set({
         'groupPhotoUrlSnapshot': photoUrl,
@@ -994,16 +975,20 @@ Future<String> crearGrupoMinimo({
     }
   }
 
-  return groupRef.id;
-}
-
-String generarCodigoInvitacionDesdeGroupId(String groupId) {
-  return 'TEMP-$groupId';
+  return CreatedGroupInfo(groupId: groupId, inviteCode: inviteCode);
 }
 
 String crearEnlaceInvitacion(String inviteCode) {
   final code = inviteCode.trim();
-  return code.isEmpty ? 'sundayselfie.app' : 'sundayselfie.app/j/$code';
+  return code.isEmpty ? 'https://sundayselfie.app' : 'https://sundayselfie.app/j/$code';
+}
+
+String normalizarCodigoInvitacion(String value) {
+  final clean = value.trim();
+  if (clean.toUpperCase().startsWith('TEMP-')) {
+    return 'TEMP-${clean.substring(5)}';
+  }
+  return clean.toUpperCase();
 }
 
 String normalizarEntradaInvitacion(String entrada) {
@@ -1016,7 +1001,7 @@ String normalizarEntradaInvitacion(String entrada) {
   final uri = Uri.tryParse(value);
   final queryCode = uri?.queryParameters['code'] ?? uri?.queryParameters['invite'];
   if (queryCode != null && queryCode.trim().isNotEmpty) {
-    return queryCode.trim();
+    return normalizarCodigoInvitacion(queryCode);
   }
 
   final joinMatch = RegExp(
@@ -1024,7 +1009,7 @@ String normalizarEntradaInvitacion(String entrada) {
     caseSensitive: false,
   ).firstMatch(value);
   if (joinMatch != null) {
-    return Uri.decodeComponent(joinMatch.group(2) ?? '').trim();
+    return normalizarCodigoInvitacion(Uri.decodeComponent(joinMatch.group(2) ?? ''));
   }
 
   final tempMatch = RegExp(
@@ -1032,10 +1017,10 @@ String normalizarEntradaInvitacion(String entrada) {
     caseSensitive: false,
   ).firstMatch(value);
   if (tempMatch != null) {
-    return tempMatch.group(0)!.trim();
+    return normalizarCodigoInvitacion(tempMatch.group(0)!);
   }
 
-  return value.trim();
+  return normalizarCodigoInvitacion(value);
 }
 
 String? obtenerGroupIdDesdeCodigo(String codigo) {
@@ -1053,6 +1038,33 @@ String? obtenerGroupIdDesdeCodigo(String codigo) {
   }
 
   return groupId;
+}
+
+Future<String?> resolverGroupIdDesdeInvitacion(String codigo) async {
+  final legacyGroupId = obtenerGroupIdDesdeCodigo(codigo);
+  if (legacyGroupId != null) return legacyGroupId;
+
+  final inviteCode = normalizarEntradaInvitacion(codigo);
+  if (inviteCode.isEmpty || inviteCode.contains('/')) return null;
+
+  try {
+    final inviteDoc = await FirebaseFirestore.instance
+        .collection('inviteCodes')
+        .doc(inviteCode)
+        .get();
+    final inviteData = inviteDoc.data();
+
+    if (!inviteDoc.exists || inviteData?['active'] != true) return null;
+
+    final groupId = inviteData?['groupId'];
+    if (groupId is String && groupId.trim().isNotEmpty) {
+      return groupId.trim();
+    }
+  } catch (error) {
+    debugPrint('No se pudo resolver la invitación: $error');
+  }
+
+  return null;
 }
 
 int calcularNumeroSemanaISO(DateTime fecha) {
@@ -1373,6 +1385,12 @@ Future<void> solicitarEntradaAGrupo({
     throw Exception('Ya perteneces a este grupo');
   }
 
+  final blockedUserDoc = await groupRef.collection('blockedUsers').doc(user.uid).get();
+
+  if (blockedUserDoc.exists) {
+    throw Exception('Fuiste expulsado de este grupo y no puedes volver a solicitar entrada');
+  }
+
   final userGroupRef = firestore
       .collection('users')
       .doc(user.uid)
@@ -1400,12 +1418,16 @@ Future<void> solicitarEntradaAGrupo({
   final basePhotoUrl = userData?['basePhotoUrl'];
   final inviteCodeUsed = normalizarEntradaInvitacion(inviteInput ?? '');
 
+  if (inviteCodeUsed.isEmpty) {
+    throw Exception('Invitación no válida');
+  }
+
   await joinRequestRef.set({
     'uid': user.uid,
     'baseName': baseName,
     'basePhotoUrl': basePhotoUrl,
     'status': 'pending',
-    'inviteCodeUsed': inviteCodeUsed.isEmpty ? null : inviteCodeUsed,
+    'inviteCodeUsed': inviteCodeUsed,
     'requestedAt': FieldValue.serverTimestamp(),
     'updatedAt': FieldValue.serverTimestamp(),
   });
@@ -1414,221 +1436,82 @@ Future<void> solicitarEntradaAGrupo({
 Future<void> aceptarSolicitudEntrada({
   required String groupId,
   required String requestUid,
-  required String requestBaseName,
-  required String? requestBasePhotoUrl,
-  required String groupName,
-  required String? groupPhotoUrl,
-  required int inviteCodeVersion,
 }) async {
-  final firestore = FirebaseFirestore.instance;
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('aceptarSolicitud');
 
-  final groupRef = firestore.collection('groups').doc(groupId);
-  final memberRef = groupRef.collection('members').doc(requestUid);
-  final userGroupRef = firestore
-      .collection('users')
-      .doc(requestUid)
-      .collection('groups')
-      .doc(groupId);
-  final joinRequestRef = groupRef.collection('joinRequests').doc(requestUid);
-
-  await firestore.runTransaction((transaction) async {
-    final groupDoc = await transaction.get(groupRef);
-    final joinRequestDoc = await transaction.get(joinRequestRef);
-    final memberDoc = await transaction.get(memberRef);
-
-    if (!groupDoc.exists) {
-      throw Exception('El grupo ya no existe');
-    }
-
-    if (!joinRequestDoc.exists) {
-      throw Exception('La solicitud ya no está disponible');
-    }
-
-    if (memberDoc.exists) {
-      throw Exception('Este usuario ya pertenece al grupo');
-    }
-
-    final groupData = groupDoc.data() as Map<String, dynamic>? ?? {};
-    final rawMemberCount = groupData['memberCount'] ?? 0;
-    final memberCount = rawMemberCount is int
-        ? rawMemberCount
-        : int.tryParse('$rawMemberCount') ?? 0;
-
-    if (memberCount >= kMaxGroupMembers) {
-      throw Exception('Este grupo ya tiene el límite de $kMaxGroupMembers miembros');
-    }
-
-    transaction.set(memberRef, {
-      'role': 'member',
-      'joinedAt': FieldValue.serverTimestamp(),
-      'statusThisSunday': false,
-      'effectiveName': requestBaseName,
-      'effectivePhotoUrl': requestBasePhotoUrl,
-      'inviteCodeVersionAtJoin': inviteCodeVersion,
-    });
-
-    transaction.set(userGroupRef, {
+    await callable.call<void>({
       'groupId': groupId,
-      'role': 'member',
-      'joinedAt': FieldValue.serverTimestamp(),
-      'lastViewedAt': null,
-      'lastActivityAt': FieldValue.serverTimestamp(),
-      'notificationsOverride': 'on',
-      'autoDownloadEnabled': false,
-      'displayNameSnapshot': groupName,
-      'groupPhotoUrlSnapshot': groupPhotoUrl,
-      'groupEmojiSnapshot': groupData['emoji'],
-      'groupColorValueSnapshot': groupData['colorValue'],
+      'requestUid': requestUid,
     });
-
-    transaction.update(groupRef, {
-      'memberCount': FieldValue.increment(1),
-      'lastActivityAt': FieldValue.serverTimestamp(),
-    });
-
-    transaction.delete(joinRequestRef);
-  });
-
-  await marcarActividadGrupo(groupId: groupId);
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo aceptar la solicitud');
+  }
 }
 
 Future<void> rechazarSolicitudEntrada({
   required String groupId,
   required String requestUid,
 }) async {
-  final currentUser = FirebaseAuth.instance.currentUser;
-  if (currentUser == null) {
-    throw Exception('No hay usuario autenticado');
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('rechazarSolicitud');
+
+    await callable.call<void>({
+      'groupId': groupId,
+      'requestUid': requestUid,
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo rechazar la solicitud');
   }
-
-  final firestore = FirebaseFirestore.instance;
-  final currentMemberDoc = await firestore
-      .collection('groups')
-      .doc(groupId)
-      .collection('members')
-      .doc(currentUser.uid)
-      .get();
-
-  if (currentMemberDoc.data()?['role'] != 'admin') {
-    throw Exception('Solo un administrador puede rechazar solicitudes');
-  }
-
-  await firestore
-      .collection('groups')
-      .doc(groupId)
-      .collection('joinRequests')
-      .doc(requestUid)
-      .delete();
 }
 
 Future<void> hacerAdministradorMiembro({
   required String groupId,
   required String targetUid,
 }) async {
-  final currentUser = FirebaseAuth.instance.currentUser;
-  if (currentUser == null) {
-    throw Exception('No hay usuario autenticado');
-  }
+  try {
+    final callable =
+        FirebaseFunctions.instance.httpsCallable('promoverAdministrador');
 
-  if (targetUid == currentUser.uid) {
-    throw Exception('Ya eres administrador');
-  }
-
-  final firestore = FirebaseFirestore.instance;
-  final groupRef = firestore.collection('groups').doc(groupId);
-  final currentMemberRef = groupRef.collection('members').doc(currentUser.uid);
-  final targetMemberRef = groupRef.collection('members').doc(targetUid);
-  final targetUserGroupRef = firestore
-      .collection('users')
-      .doc(targetUid)
-      .collection('groups')
-      .doc(groupId);
-
-  await firestore.runTransaction((transaction) async {
-    final currentMemberDoc = await transaction.get(currentMemberRef);
-    final targetMemberDoc = await transaction.get(targetMemberRef);
-
-    if (currentMemberDoc.data()?['role'] != 'admin') {
-      throw Exception('Solo un administrador puede hacer administrador a otro usuario');
-    }
-
-    if (!targetMemberDoc.exists) {
-      throw Exception('Este usuario ya no pertenece al grupo');
-    }
-
-    if (targetMemberDoc.data()?['role'] == 'admin') {
-      throw Exception('Este usuario ya es administrador');
-    }
-
-    transaction.update(targetMemberRef, {
-      'role': 'admin',
-      'promotedAt': FieldValue.serverTimestamp(),
-      'promotedByUid': currentUser.uid,
+    await callable.call<void>({
+      'groupId': groupId,
+      'targetUid': targetUid,
     });
-
-    transaction.set(
-      targetUserGroupRef,
-      {'role': 'admin'},
-      SetOptions(merge: true),
-    );
-
-    transaction.update(groupRef, {
-      'adminsCount': FieldValue.increment(1),
-      'lastActivityAt': FieldValue.serverTimestamp(),
-    });
-  });
-
-  await marcarActividadGrupo(groupId: groupId);
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo hacer administrador');
+  }
 }
 
 Future<void> expulsarMiembroGrupo({
   required String groupId,
   required String targetUid,
 }) async {
-  final currentUser = FirebaseAuth.instance.currentUser;
-  if (currentUser == null) {
-    throw Exception('No hay usuario autenticado');
-  }
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('expulsarMiembro');
 
-  if (targetUid == currentUser.uid) {
-    throw Exception('No puedes expulsarte a ti mismo');
-  }
-
-  final firestore = FirebaseFirestore.instance;
-  final groupRef = firestore.collection('groups').doc(groupId);
-  final currentMemberRef = groupRef.collection('members').doc(currentUser.uid);
-  final targetMemberRef = groupRef.collection('members').doc(targetUid);
-  final targetUserGroupRef = firestore
-      .collection('users')
-      .doc(targetUid)
-      .collection('groups')
-      .doc(groupId);
-
-  await firestore.runTransaction((transaction) async {
-    final currentMemberDoc = await transaction.get(currentMemberRef);
-    final targetMemberDoc = await transaction.get(targetMemberRef);
-
-    if (currentMemberDoc.data()?['role'] != 'admin') {
-      throw Exception('Solo un administrador puede expulsar usuarios');
-    }
-
-    if (!targetMemberDoc.exists) {
-      throw Exception('Este usuario ya no pertenece al grupo');
-    }
-
-    if (targetMemberDoc.data()?['role'] == 'admin') {
-      throw Exception('No puedes expulsar a otro administrador');
-    }
-
-    transaction.delete(targetMemberRef);
-    transaction.delete(targetUserGroupRef);
-    transaction.update(groupRef, {
-      'memberCount': FieldValue.increment(-1),
-      'lastActivityAt': FieldValue.serverTimestamp(),
+    await callable.call<void>({
+      'groupId': groupId,
+      'targetUid': targetUid,
     });
-  });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo expulsar al miembro');
+  }
+}
 
-  await marcarActividadGrupo(groupId: groupId);
+Future<void> permitirReingresoGrupo({
+  required String groupId,
+  required String targetUid,
+}) async {
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('permitirReingreso');
+
+    await callable.call<void>({
+      'groupId': groupId,
+      'targetUid': targetUid,
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo permitir el reingreso');
+  }
 }
 
 Future<void> actualizarNombreGrupo({
@@ -1788,69 +1671,28 @@ Future<String> actualizarFotoGrupo({
   return downloadUrl;
 }
 
-Future<void> abandonarGrupo({required String groupId}) async {
-  final currentUser = FirebaseAuth.instance.currentUser;
-  if (currentUser == null) {
-    throw Exception('No hay usuario autenticado');
+Future<void> regenerarInvitacionGrupo({required String groupId}) async {
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('regenerarInvitacion');
+
+    await callable.call<void>({
+      'groupId': groupId,
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo regenerar la invitación');
   }
+}
 
-  final firestore = FirebaseFirestore.instance;
-  final groupRef = firestore.collection('groups').doc(groupId);
-  final memberRef = groupRef.collection('members').doc(currentUser.uid);
-  final userGroupRef = firestore
-      .collection('users')
-      .doc(currentUser.uid)
-      .collection('groups')
-      .doc(groupId);
+Future<void> abandonarGrupo({required String groupId}) async {
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('abandonarGrupo');
 
-  await firestore.runTransaction((transaction) async {
-    final groupDoc = await transaction.get(groupRef);
-    final memberDoc = await transaction.get(memberRef);
-
-    if (!groupDoc.exists || !memberDoc.exists) {
-      throw Exception('Ya no perteneces a este grupo');
-    }
-
-    final groupData = groupDoc.data() as Map<String, dynamic>? ?? {};
-    final memberData = memberDoc.data() as Map<String, dynamic>? ?? {};
-    final role = (memberData['role'] ?? 'member').toString();
-    final rawMemberCount = groupData['memberCount'] ?? 1;
-    final rawAdminsCount = groupData['adminsCount'] ?? 1;
-    final memberCount = rawMemberCount is int
-        ? rawMemberCount
-        : int.tryParse('$rawMemberCount') ?? 1;
-    final adminsCount = rawAdminsCount is int
-        ? rawAdminsCount
-        : int.tryParse('$rawAdminsCount') ?? 1;
-
-    if (role == 'admin' && adminsCount <= 1 && memberCount > 1) {
-      throw Exception(
-        'Antes de abandonar el grupo, haz administrador a otro miembro',
-      );
-    }
-
-    final newMemberCount = (memberCount - 1).clamp(0, 999).toInt();
-    final newAdminsCount = role == 'admin'
-        ? (adminsCount - 1).clamp(0, 999).toInt()
-        : adminsCount;
-
-    transaction.delete(memberRef);
-    transaction.delete(userGroupRef);
-
-    final updates = <String, dynamic>{
-      'memberCount': newMemberCount,
-      'adminsCount': newAdminsCount,
-      'lastActivityAt': FieldValue.serverTimestamp(),
-    };
-
-    if (newMemberCount == 0) {
-      updates['deleted'] = true;
-      updates['deletedAt'] = FieldValue.serverTimestamp();
-      updates['deletedReason'] = 'empty_group';
-    }
-
-    transaction.update(groupRef, updates);
-  });
+    await callable.call<void>({
+      'groupId': groupId,
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo abandonar el grupo');
+  }
 }
 
 
@@ -1867,93 +1709,48 @@ Future<void> publicarSelfieReal({
 
   final firestore = FirebaseFirestore.instance;
   final storage = FirebaseStorage.instance;
-
-  final now = DateTime.now();
-  final isoYear = calcularAnioISO(now);
-  final isoWeek = calcularNumeroSemanaISO(now);
   final weekKey = obtenerWeekKeyActual();
-
-  final memberRef = firestore
-      .collection('groups')
-      .doc(groupId)
-      .collection('members')
-      .doc(user.uid);
-
-  final memberDoc = await memberRef.get();
-
-  if (!memberDoc.exists) {
-    throw Exception('No eres miembro de este grupo');
-  }
-
-  final memberData = memberDoc.data() as Map<String, dynamic>;
-  final authorName = memberData['effectiveName'] ?? 'Usuario';
-  final authorPhotoUrl = memberData['effectivePhotoUrl'];
-
-  final storagePath = 'groups/$groupId/weeks/$weekKey/${user.uid}.jpg';
-  final storageRef = storage.ref().child(storagePath);
-
-  await storageRef.putFile(
-    File(foto.path),
-    SettableMetadata(
-      contentType: 'image/jpeg',
-      customMetadata: {'groupId': groupId, 'weekKey': weekKey, 'uid': user.uid},
-    ),
-  );
-
-  final downloadUrl = await storageRef.getDownloadURL();
 
   final weekRef = firestore
       .collection('groups')
       .doc(groupId)
       .collection('weeks')
       .doc(weekKey);
-
   final postRef = weekRef.collection('posts').doc(user.uid);
+  final existingPost = await postRef.get();
 
-  await firestore.runTransaction((transaction) async {
-    final postDoc = await transaction.get(postRef);
+  if (existingPost.exists) {
+    throw Exception('Ya has publicado tu selfie de este domingo');
+  }
 
-    transaction.set(weekRef, {
-      'weekKey': weekKey,
-      'isoYear': isoYear,
-      'isoWeek': isoWeek,
-      'createdAt': FieldValue.serverTimestamp(),
-      'postCount': 1,
-    }, SetOptions(merge: true));
+  final storagePath = 'groups/$groupId/weeks/$weekKey/${user.uid}.jpg';
+  final storageRef = storage.ref().child(storagePath);
 
-    final postData = {
-      'uid': user.uid,
-      'authorName': authorName,
-      'authorPhotoUrl': authorPhotoUrl,
-      'updatedAt': FieldValue.serverTimestamp(),
-      'imageUrl': downloadUrl,
-      'thumbUrl': downloadUrl,
-      'storagePathFull': storagePath,
-      'storagePathThumb': storagePath,
-      'hasAnyReactions': false,
-      'selfReactionEmoji': null,
-    };
-
-    if (postDoc.exists) {
-      transaction.update(postRef, postData);
-    } else {
-      transaction.set(postRef, {
-        ...postData,
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-    }
-
-    transaction.set(
-      firestore.collection('users').doc(user.uid).collection('groups').doc(groupId),
-      {
-        'groupId': groupId,
-        'lastActivityAt': FieldValue.serverTimestamp(),
-      },
-      SetOptions(merge: true),
+  try {
+    await storageRef.putFile(
+      File(foto.path),
+      SettableMetadata(
+        contentType: 'image/jpeg',
+        customMetadata: {'groupId': groupId, 'weekKey': weekKey, 'uid': user.uid},
+      ),
     );
-  });
+  } on FirebaseException catch (uploadError) {
+    try {
+      await storageRef.getMetadata();
+    } catch (_) {
+      throw uploadError;
+    }
+  }
 
-  await marcarActividadGrupo(groupId: groupId);
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('registrarSelfie');
+
+    await callable.call<void>({
+      'groupId': groupId,
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo registrar la selfie');
+  }
 }
 
 Future<void> reaccionarASelfie({
@@ -1962,175 +1759,89 @@ Future<void> reaccionarASelfie({
   required String postUid,
   required String emoji,
 }) async {
-  final currentUser = FirebaseAuth.instance.currentUser;
-
-  if (currentUser == null) {
-    throw Exception('No hay usuario autenticado');
-  }
-
-  if (postUid == currentUser.uid) {
-    throw Exception('No puedes reaccionar a tu propio selfie');
-  }
-
   final cleanEmoji = normalizarEmojiReaccion(emoji);
   if (cleanEmoji.isEmpty) {
     throw Exception('Elige una reacción válida');
   }
 
-  final firestore = FirebaseFirestore.instance;
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'reaccionarASelfie',
+    );
 
-  final memberRef = firestore
-      .collection('groups')
-      .doc(groupId)
-      .collection('members')
-      .doc(currentUser.uid);
-
-  final memberDoc = await memberRef.get();
-  final memberData = memberDoc.data();
-
-  final reactionAuthorName = memberData?['effectiveName'] ?? 'Usuario';
-  final reactionAuthorPhotoUrl = memberData?['effectivePhotoUrl'];
-
-  final reactionRef = firestore
-      .collection('groups')
-      .doc(groupId)
-      .collection('weeks')
-      .doc(weekKey)
-      .collection('posts')
-      .doc(postUid)
-      .collection('reactions')
-      .doc(currentUser.uid);
-
-  await firestore.runTransaction((transaction) async {
-    final reactionDoc = await transaction.get(reactionRef);
-
-    final reactionData = {
-      'uid': currentUser.uid,
+    await callable.call<void>({
+      'groupId': groupId,
+      'weekKey': weekKey,
+      'postUid': postUid,
       'emoji': cleanEmoji,
-      'authorName': reactionAuthorName,
-      'authorPhotoUrl': reactionAuthorPhotoUrl,
-      'updatedAt': FieldValue.serverTimestamp(),
-    };
-
-    if (reactionDoc.exists) {
-      transaction.update(reactionRef, reactionData);
-    } else {
-      transaction.set(reactionRef, {
-        ...reactionData,
-        'createdAt': FieldValue.serverTimestamp(),
-      });
-    }
-  });
-
-  await marcarActividadGrupo(groupId: groupId);
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo guardar la reacción');
+  }
 }
 
 
 Future<void> enviarZumbidoSelfie({
   required String groupId,
-  required String groupName,
   required String targetUid,
-  required String targetName,
 }) async {
-  final currentUser = FirebaseAuth.instance.currentUser;
-
-  if (currentUser == null) {
-    throw Exception('No hay usuario autenticado');
-  }
-
-  if (targetUid == currentUser.uid) {
-    throw Exception('No puedes enviarte un zumbido a ti mismo');
-  }
-
-  if (!esDomingo()) {
-    throw Exception('Los recordatorios solo están disponibles los domingos');
-  }
-
-  final firestore = FirebaseFirestore.instance;
-  final weekKey = obtenerWeekKeyActual();
-  final reminderId = '${currentUser.uid}_$targetUid';
-
-  final senderMemberRef = firestore
-      .collection('groups')
-      .doc(groupId)
-      .collection('members')
-      .doc(currentUser.uid);
-
-  final targetMemberRef = firestore
-      .collection('groups')
-      .doc(groupId)
-      .collection('members')
-      .doc(targetUid);
-
-  final targetPostRef = firestore
-      .collection('groups')
-      .doc(groupId)
-      .collection('weeks')
-      .doc(weekKey)
-      .collection('posts')
-      .doc(targetUid);
-
-  final reminderRef = firestore
-      .collection('groups')
-      .doc(groupId)
-      .collection('weeks')
-      .doc(weekKey)
-      .collection('reminders')
-      .doc(reminderId);
-
-  await firestore.runTransaction((transaction) async {
-    final senderMemberDoc = await transaction.get(senderMemberRef);
-    final targetMemberDoc = await transaction.get(targetMemberRef);
-    final targetPostDoc = await transaction.get(targetPostRef);
-    final existingReminderDoc = await transaction.get(reminderRef);
-
-    if (!senderMemberDoc.exists) {
-      throw Exception('No perteneces a este grupo');
-    }
-
-    if (!targetMemberDoc.exists) {
-      throw Exception('Este usuario ya no pertenece al grupo');
-    }
-
-    if (targetPostDoc.exists) {
-      throw Exception('$targetName ya ha publicado esta semana');
-    }
-
-    if (existingReminderDoc.exists) {
-      throw Exception('Ya le has enviado un zumbido esta semana');
-    }
-
-    final senderData = senderMemberDoc.data() as Map<String, dynamic>? ?? {};
-    final targetData = targetMemberDoc.data() as Map<String, dynamic>? ?? {};
-    final senderName = formatUserDisplayName(
-      senderData['effectiveName'] ?? currentUser.displayName ?? 'Usuario',
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'enviarZumbidoSelfie',
     );
-    final senderPhotoUrl = senderData['effectivePhotoUrl'];
-    final resolvedTargetName = formatUserDisplayName(
-      targetData['effectiveName'] ?? targetName,
-    );
-    final targetPhotoUrl = targetData['effectivePhotoUrl'];
 
-    transaction.set(reminderRef, {
-      'type': 'friend_reminder',
+    await callable.call<void>({
       'groupId': groupId,
-      'groupName': groupName,
-      'weekKey': weekKey,
-      'senderUid': currentUser.uid,
-      'senderName': senderName,
-      'senderPhotoUrl': senderPhotoUrl,
       'targetUid': targetUid,
-      'targetName': resolvedTargetName,
-      'targetPhotoUrl': targetPhotoUrl,
-      'createdAt': FieldValue.serverTimestamp(),
-      'updatedAt': FieldValue.serverTimestamp(),
-      'notificationStatus': 'pending',
-      'notificationSentAt': null,
-      'readAt': null,
     });
-  });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo enviar el zumbido');
+  }
+}
 
-  await marcarActividadGrupo(groupId: groupId);
+const Map<String, String> kSelfieReportReasons = {
+  'contenido_inapropiado': 'Contenido inapropiado',
+  'acoso': 'Acoso o intimidación',
+  'spam': 'Spam o contenido engañoso',
+  'otro': 'Otro motivo',
+};
+
+Future<void> reportarSelfie({
+  required String groupId,
+  required String weekKey,
+  required String postUid,
+  required String reason,
+}) async {
+  if (!kSelfieReportReasons.containsKey(reason)) {
+    throw Exception('Elige un motivo válido');
+  }
+
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'reportarContenido',
+    );
+
+    await callable.call<void>({
+      'groupId': groupId,
+      'weekKey': weekKey,
+      'postUid': postUid,
+      'reason': reason,
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo enviar el reporte');
+  }
+}
+
+Future<void> borrarCuentaSundaySelfie() async {
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('borrarCuenta');
+
+    await callable.call<void>({
+      'confirmation': 'BORRAR',
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo borrar la cuenta');
+  }
 }
 
 
@@ -2172,7 +1883,7 @@ Future<void> enviarMensajeChatSemana({
     throw Exception('No perteneces a este grupo');
   }
 
-  final memberData = memberDoc.data() as Map<String, dynamic>? ?? {};
+  final memberData = memberDoc.data() ?? {};
   final authorName = formatUserDisplayName(
     memberData['effectiveName'] ?? currentUser.displayName ?? 'Usuario',
   );
@@ -3773,6 +3484,9 @@ class _SundayShellState extends State<SundayShell> {
           data['groupId'],
           data['weekKey'],
           data['authorUid'],
+          data['postUid'],
+          data['senderUid'],
+          data['reactorUid'],
         ].join('|');
   }
 
@@ -3792,8 +3506,8 @@ class _SundayShellState extends State<SundayShell> {
 
     debugPrint('Notificación abierta: $data');
 
-    if (type == 'new_selfie' &&
-        target == 'group' &&
+    if (target == 'group' &&
+        {'new_selfie', 'friend_reminder', 'reaction'}.contains(type) &&
         groupId != null &&
         groupId.isNotEmpty) {
       openGroupFromNotification(groupId);
@@ -3941,8 +3655,8 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  Future<void> _showCreateJoinSheet(String baseName) async {
-    final parentContext = context;
+  Future<void> _showCreateJoinSheet() async {
+    final navigator = Navigator.of(context);
 
     await showModalBottomSheet(
       context: context,
@@ -3987,12 +3701,9 @@ class _HomeScreenState extends State<HomeScreen> {
                   onTap: () {
                     Navigator.pop(sheetContext);
                     Future.microtask(() {
-                      Navigator.of(parentContext).push(
+                      navigator.push(
                         MaterialPageRoute(
-                          builder: (_) => CreateGroupScreen(
-                            user: widget.user,
-                            baseName: baseName,
-                          ),
+                          builder: (_) => const CreateGroupScreen(),
                         ),
                       );
                     });
@@ -4007,7 +3718,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   onTap: () {
                     Navigator.pop(sheetContext);
                     Future.microtask(() {
-                      Navigator.of(parentContext).push(
+                      navigator.push(
                         MaterialPageRoute(
                           builder: (_) => JoinGroupScreen(user: widget.user),
                         ),
@@ -4032,10 +3743,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
       stream: userRef.snapshots(),
-      builder: (context, userSnapshot) {
-        final userData = userSnapshot.data?.data();
-        final baseName = formatUserDisplayName(userData?['baseName'] ?? 'Usuario');
-
+      builder: (context, _) {
         return Scaffold(
           backgroundColor: ssBg,
           body: SafeArea(
@@ -4103,7 +3811,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                   const SizedBox(width: 8),
                                   SmallPillButton(
                                     text: '+ Nuevo grupo',
-                                    onTap: () => _showCreateJoinSheet(baseName),
+                                    onTap: _showCreateJoinSheet,
                                   ),
                                 ],
                               );
@@ -4112,11 +3820,11 @@ class _HomeScreenState extends State<HomeScreen> {
                           const SizedBox(height: 16),
                           if (groupDocs.isEmpty) ...[
                             EmptyGroupsCard(
-                              onTap: () => _showCreateJoinSheet(baseName),
+                              onTap: _showCreateJoinSheet,
                             ),
                             const SizedBox(height: 8),
                             InviteHintCard(
-                              onTap: () => _showCreateJoinSheet(baseName),
+                              onTap: _showCreateJoinSheet,
                             ),
                           ] else ...[
                             ...groupDocs.map(
@@ -4137,7 +3845,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             ),
                             const SizedBox(height: 2),
                             InviteHintCard(
-                              onTap: () => _showCreateJoinSheet(baseName),
+                              onTap: _showCreateJoinSheet,
                             ),
                           ],
                         ],
@@ -4201,7 +3909,6 @@ class RealGroupCard extends StatelessWidget {
           builder: (context, postsSnapshot) {
             final postDocs = postsSnapshot.data?.docs ?? [];
             final postedCount = postDocs.length;
-            final remaining = (memberCount - postedCount).clamp(0, 999);
 
             return SundayCard(
               onTap: onTap,
@@ -4291,14 +3998,7 @@ class RealGroupCard extends StatelessWidget {
 }
 
 class CreateGroupScreen extends StatefulWidget {
-  final User user;
-  final String baseName;
-
-  const CreateGroupScreen({
-    super.key,
-    required this.user,
-    required this.baseName,
-  });
+  const CreateGroupScreen({super.key});
 
   @override
   State<CreateGroupScreen> createState() => _CreateGroupScreenState();
@@ -4308,7 +4008,7 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
   final TextEditingController nameController = TextEditingController();
   XFile? selectedGroupPhoto;
   String? selectedGroupEmoji;
-  int selectedGroupColorValue = kGroupColorOptions.first.value;
+  int selectedGroupColorValue = kGroupColorOptions.first.toARGB32();
   bool creating = false;
 
   @override
@@ -4364,24 +4064,21 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
     setState(() => creating = true);
 
     try {
-      final groupId = await crearGrupoMinimo(
-        user: widget.user,
+      final createdGroup = await crearGrupoMinimo(
         nombreGrupo: name,
-        baseName: widget.baseName,
         groupPhoto: selectedGroupPhoto,
         groupEmoji: selectedGroupEmoji,
         groupColorValue: selectedGroupColorValue,
       );
-      final inviteCode = generarCodigoInvitacionDesdeGroupId(groupId);
 
       if (!mounted) return;
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
           builder: (_) => GroupInviteReadyScreen(
-            groupId: groupId,
+            groupId: createdGroup.groupId,
             groupName: name,
-            inviteCode: inviteCode,
+            inviteCode: createdGroup.inviteCode,
           ),
         ),
       );
@@ -4457,12 +4154,13 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
                       spacing: 18,
                       runSpacing: 16,
                       children: kGroupColorOptions.map((color) {
-                        final selected = selectedGroupColorValue == color.value;
+                        final selected =
+                            selectedGroupColorValue == color.toARGB32();
                         return GroupColorDot(
                           color: color,
                           selected: selected,
                           onTap: () => setState(
-                            () => selectedGroupColorValue = color.value,
+                            () => selectedGroupColorValue = color.toARGB32(),
                           ),
                         );
                       }).toList(),
@@ -4921,8 +4619,10 @@ class GroupInviteReadyScreen extends StatelessWidget {
                     InviteCodePreviewCard(inviteCode: inviteCode),
                     const SizedBox(height: 22),
                     GroupInviteActionButtons(
+                      groupId: groupId,
                       groupName: groupName,
                       inviteCode: inviteCode,
+                      isAdmin: false,
                     ),
                   ],
                 ),
@@ -5052,8 +4752,9 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
     final input = codeController.text.trim();
     if (input.isEmpty || joining) return;
 
-    final groupId = obtenerGroupIdDesdeCodigo(input);
+    final groupId = await resolverGroupIdDesdeInvitacion(input);
     if (groupId == null) {
+      if (!mounted) return;
       showSundaySnack(context, 'Invitación no válida');
       return;
     }
@@ -5151,21 +4852,33 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                     AnimatedBuilder(
                       animation: codeController,
                       builder: (context, _) {
-                        final groupId = obtenerGroupIdDesdeCodigo(
-                          codeController.text,
-                        );
+                        final input = codeController.text.trim();
 
-                        if (codeController.text.trim().isEmpty) {
+                        if (input.isEmpty) {
                           return const JoinInstructionCard();
                         }
 
-                        if (groupId == null) {
-                          return const InvalidInviteCard();
-                        }
+                        return FutureBuilder<String?>(
+                          future: resolverGroupIdDesdeInvitacion(input),
+                          builder: (context, snapshot) {
+                            if (snapshot.connectionState == ConnectionState.waiting) {
+                              return const JoinPreviewMessageCard(
+                                icon: Icons.search_rounded,
+                                title: 'Comprobando invitación',
+                                message: 'Estamos buscando el grupo asociado a este código.',
+                              );
+                            }
 
-                        return JoinGroupPreviewCard(
-                          groupId: groupId,
-                          currentUid: widget.user.uid,
+                            final groupId = snapshot.data;
+                            if (groupId == null) {
+                              return const InvalidInviteCard();
+                            }
+
+                            return JoinGroupPreviewCard(
+                              groupId: groupId,
+                              currentUid: widget.user.uid,
+                            );
+                          },
                         );
                       },
                     ),
@@ -5178,7 +4891,8 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
               child: AnimatedBuilder(
                 animation: codeController,
                 builder: (context, _) {
-                  final valid = obtenerGroupIdDesdeCodigo(codeController.text) != null;
+                  final valid =
+                      normalizarEntradaInvitacion(codeController.text).isNotEmpty;
                   return SundayButton(
                     text: joining ? 'Enviando solicitud...' : 'Enviar solicitud',
                     onPressed: joining || !valid ? null : _joinGroup,
@@ -5578,37 +5292,7 @@ class GroupScreen extends StatefulWidget {
 
 class _GroupScreenState extends State<GroupScreen> {
   String selectedWeekKey = obtenerWeekKeyActual();
-  bool uploading = false;
   bool chatExpanded = false;
-
-  Future<void> _openCameraAndUpload(User user) async {
-    final window = obtenerSundayWindowState();
-
-    if (!window.canUpload) {
-      showSundaySnack(context, 'La ventana de subida está cerrada');
-      return;
-    }
-
-    final foto = await Navigator.push<XFile>(
-      context,
-      MaterialPageRoute(builder: (_) => const CameraCaptureScreen()),
-    );
-
-    if (!mounted || foto == null) return;
-
-    setState(() => uploading = true);
-
-    try {
-      await publicarSelfieReal(groupId: widget.groupId, user: user, foto: foto);
-      if (!mounted) return;
-      showSundaySnack(context, 'Selfie publicado');
-    } catch (error) {
-      if (!mounted) return;
-      showSundaySnack(context, 'Error: $error');
-    } finally {
-      if (mounted) setState(() => uploading = false);
-    }
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -5660,7 +5344,6 @@ class _GroupScreenState extends State<GroupScreen> {
             final groupData = groupSnapshot.data!.data()!;
             final groupName = groupData['name'] ?? 'Grupo';
             final memberCount = groupData['memberCount'] ?? 0;
-            final window = obtenerSundayWindowState();
 
             return Column(
               children: [
@@ -5701,7 +5384,7 @@ class _GroupScreenState extends State<GroupScreen> {
                         scrollDirection: Axis.horizontal,
                         padding: const EdgeInsets.fromLTRB(16, 2, 16, 6),
                         itemCount: weekKeys.length,
-                        separatorBuilder: (_, __) => const SizedBox(width: 8),
+                        separatorBuilder: (_, _) => const SizedBox(width: 8),
                         itemBuilder: (context, index) {
                           final key = weekKeys[index];
                           final selected = key == selectedWeekKey;
@@ -5732,11 +5415,7 @@ class _GroupScreenState extends State<GroupScreen> {
                 Expanded(
                   child: GroupPostsGrid(
                     groupId: widget.groupId,
-                    groupName: groupName.toString(),
                     weekKey: selectedWeekKey,
-                    memberCount: memberCount is int
-                        ? memberCount
-                        : int.tryParse('$memberCount') ?? 0,
                   ),
                 ),
                 WeeklyChatPanel(
@@ -6394,6 +6073,8 @@ class GroupMembersHtmlContent extends StatelessWidget {
                     groupPhotoUrl: groupPhotoUrl,
                     inviteCodeVersion: inviteCodeVersion,
                   ),
+                if (isCurrentAdmin)
+                  GroupBlockedUsersInlineSection(groupId: groupId),
                 MembersHtmlSectionLabel(
                   text: 'MIEMBROS — ${memberDocs.length}',
                 ),
@@ -6404,7 +6085,6 @@ class GroupMembersHtmlContent extends StatelessWidget {
                   ...memberDocs.map(
                     (doc) => GroupMemberHtmlRow(
                       groupId: groupId,
-                      groupName: groupName,
                       memberDoc: doc,
                       posted: postedUids.contains(doc.id),
                       currentUserIsAdmin: isCurrentAdmin,
@@ -6434,8 +6114,10 @@ class GroupMembersHtmlContent extends StatelessWidget {
                 ),
                 const SizedBox(height: 10),
                 GroupInviteActionButtons(
+                  groupId: groupId,
                   groupName: groupName,
                   inviteCode: inviteCode,
+                  isAdmin: isCurrentAdmin,
                 ),
                 const SizedBox(height: 10),
                 InviteActionButton(
@@ -6494,7 +6176,6 @@ class MembersInlineEmptyText extends StatelessWidget {
 
 class GroupMemberHtmlRow extends StatelessWidget {
   final String groupId;
-  final String groupName;
   final QueryDocumentSnapshot<Map<String, dynamic>> memberDoc;
   final bool posted;
   final bool currentUserIsAdmin;
@@ -6502,7 +6183,6 @@ class GroupMemberHtmlRow extends StatelessWidget {
   const GroupMemberHtmlRow({
     super.key,
     required this.groupId,
-    required this.groupName,
     required this.memberDoc,
     required this.posted,
     required this.currentUserIsAdmin,
@@ -6517,7 +6197,6 @@ class GroupMemberHtmlRow extends StatelessWidget {
       backgroundColor: Colors.transparent,
       builder: (_) => MemberActionsSheet(
         groupId: groupId,
-        groupName: groupName,
         memberDoc: memberDoc,
         posted: posted,
         currentUserIsAdmin: currentUserIsAdmin,
@@ -6796,6 +6475,142 @@ class GroupJoinRequestsInlineSection extends StatelessWidget {
   }
 }
 
+class GroupBlockedUsersInlineSection extends StatelessWidget {
+  final String groupId;
+
+  const GroupBlockedUsersInlineSection({
+    super.key,
+    required this.groupId,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final blockedUsersRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId)
+        .collection('blockedUsers');
+
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: blockedUsersRef.snapshots(),
+      builder: (context, snapshot) {
+        final blockedUsers = snapshot.data?.docs ?? [];
+
+        if (snapshot.connectionState == ConnectionState.waiting ||
+            blockedUsers.isEmpty) {
+          return const SizedBox.shrink();
+        }
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            MembersHtmlSectionLabel(text: 'EXPULSADOS — ${blockedUsers.length}'),
+            const SizedBox(height: 8),
+            ...blockedUsers.map(
+              (doc) => GroupBlockedUserHtmlRow(
+                groupId: groupId,
+                blockedUserDoc: doc,
+              ),
+            ),
+            const SizedBox(height: 22),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class GroupBlockedUserHtmlRow extends StatefulWidget {
+  final String groupId;
+  final QueryDocumentSnapshot<Map<String, dynamic>> blockedUserDoc;
+
+  const GroupBlockedUserHtmlRow({
+    super.key,
+    required this.groupId,
+    required this.blockedUserDoc,
+  });
+
+  @override
+  State<GroupBlockedUserHtmlRow> createState() => _GroupBlockedUserHtmlRowState();
+}
+
+class _GroupBlockedUserHtmlRowState extends State<GroupBlockedUserHtmlRow> {
+  bool allowingRejoin = false;
+
+  Future<void> _allowRejoin(String name) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Permitir nueva solicitud'),
+        content: Text(
+          '$name podrá volver a solicitar entrada usando una invitación válida.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancelar'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Permitir'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || allowingRejoin) return;
+
+    setState(() => allowingRejoin = true);
+
+    try {
+      await permitirReingresoGrupo(
+        groupId: widget.groupId,
+        targetUid: widget.blockedUserDoc.id,
+      );
+      if (!mounted) return;
+      showSundaySnack(context, '$name puede volver a solicitar entrada');
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error: $error');
+    } finally {
+      if (mounted) setState(() => allowingRejoin = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final data = widget.blockedUserDoc.data();
+    final name = formatUserDisplayName(data['effectiveName'] ?? 'Usuario');
+    final photoUrl = data['effectivePhotoUrl'] as String?;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      decoration: const BoxDecoration(
+        border: Border(bottom: BorderSide(color: ssSeparator, width: 1)),
+      ),
+      child: Row(
+        children: [
+          MembersInitialAvatar(name: name, photoUrl: photoUrl, size: 40),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              name,
+              style: const TextStyle(
+                color: ssText,
+                fontSize: 14,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+          TextButton(
+            onPressed: allowingRejoin ? null : () => _allowRejoin(name),
+            child: Text(allowingRejoin ? '...' : 'Permitir'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class GroupJoinRequestHtmlRow extends StatefulWidget {
   final String groupId;
   final QueryDocumentSnapshot<Map<String, dynamic>> requestDoc;
@@ -6823,10 +6638,7 @@ class _GroupJoinRequestHtmlRowState extends State<GroupJoinRequestHtmlRow> {
   Future<void> _acceptRequest() async {
     if (accepting) return;
 
-    final data = widget.requestDoc.data();
     final requestUid = widget.requestDoc.id;
-    final requestName = (data['baseName'] ?? 'Usuario').toString();
-    final requestPhoto = data['basePhotoUrl'] as String?;
 
     setState(() => accepting = true);
 
@@ -6834,11 +6646,6 @@ class _GroupJoinRequestHtmlRowState extends State<GroupJoinRequestHtmlRow> {
       await aceptarSolicitudEntrada(
         groupId: widget.groupId,
         requestUid: requestUid,
-        requestBaseName: requestName,
-        requestBasePhotoUrl: requestPhoto,
-        groupName: widget.groupName,
-        groupPhotoUrl: widget.groupPhotoUrl,
-        inviteCodeVersion: widget.inviteCodeVersion,
       );
 
       if (!mounted) return;
@@ -6917,13 +6724,17 @@ class _GroupJoinRequestHtmlRowState extends State<GroupJoinRequestHtmlRow> {
 }
 
 class GroupInviteActionButtons extends StatelessWidget {
+  final String groupId;
   final String groupName;
   final String inviteCode;
+  final bool isAdmin;
 
   const GroupInviteActionButtons({
     super.key,
+    required this.groupId,
     required this.groupName,
     required this.inviteCode,
+    required this.isAdmin,
   });
 
   String get inviteLink => crearEnlaceInvitacion(inviteCode);
@@ -6949,6 +6760,50 @@ class GroupInviteActionButtons extends StatelessWidget {
     );
   }
 
+  Future<void> _regenerateInvite(BuildContext context) async {
+    if (!isAdmin) {
+      showSundaySnack(context, 'Solo los administradores pueden regenerar el código');
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(22),
+          ),
+          title: const Text('Regenerar invitación'),
+          content: const Text(
+            'El código anterior dejará de funcionar. Tendrás que compartir el nuevo código.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancelar'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Regenerar'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true || !context.mounted) return;
+
+    try {
+      await regenerarInvitacionGrupo(groupId: groupId);
+      if (!context.mounted) return;
+      showSundaySnack(context, 'Código de invitación regenerado');
+    } catch (error) {
+      if (!context.mounted) return;
+      showSundaySnack(context, 'Error regenerando invitación: $error');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -6965,6 +6820,14 @@ class GroupInviteActionButtons extends StatelessWidget {
           variant: InviteActionButtonVariant.outline,
           onTap: () => _copy(context, inviteCode.trim()),
         ),
+        if (isAdmin) ...[
+          const SizedBox(height: 10),
+          InviteActionButton(
+            text: '🔄 Regenerar código',
+            variant: InviteActionButtonVariant.outline,
+            onTap: () => _regenerateInvite(context),
+          ),
+        ],
       ],
     );
   }
@@ -7241,7 +7104,6 @@ class InviteSheetButton extends StatelessWidget {
 
 class MemberActionsSheet extends StatefulWidget {
   final String groupId;
-  final String groupName;
   final QueryDocumentSnapshot<Map<String, dynamic>> memberDoc;
   final bool posted;
   final bool currentUserIsAdmin;
@@ -7249,7 +7111,6 @@ class MemberActionsSheet extends StatefulWidget {
   const MemberActionsSheet({
     super.key,
     required this.groupId,
-    required this.groupName,
     required this.memberDoc,
     required this.posted,
     required this.currentUserIsAdmin,
@@ -7262,7 +7123,7 @@ class MemberActionsSheet extends StatefulWidget {
 class _MemberActionsSheetState extends State<MemberActionsSheet> {
   bool sendingReminder = false;
 
-  Future<void> _sendReminder(String name) async {
+  Future<void> _sendReminder() async {
     if (sendingReminder) return;
 
     setState(() => sendingReminder = true);
@@ -7270,9 +7131,7 @@ class _MemberActionsSheetState extends State<MemberActionsSheet> {
     try {
       await enviarZumbidoSelfie(
         groupId: widget.groupId,
-        groupName: widget.groupName,
         targetUid: widget.memberDoc.id,
-        targetName: name,
       );
 
       if (!mounted) return;
@@ -7406,7 +7265,7 @@ class _MemberActionsSheetState extends State<MemberActionsSheet> {
                     ? '🔔 Enviando zumbido...'
                     : '🔔 Enviar zumbido',
                 variant: InviteActionButtonVariant.primary,
-                onTap: sendingReminder ? () {} : () => _sendReminder(name),
+                onTap: sendingReminder ? () {} : _sendReminder,
               ),
               const SizedBox(height: 8),
               const Text(
@@ -7515,22 +7374,18 @@ Color memberAvatarColor(String seed) {
     Color(0xFFF7C59F),
   ];
 
-  final value = seed.codeUnits.fold<int>(0, (sum, code) => sum + code);
+  final value = seed.codeUnits.fold<int>(0, (total, code) => total + code);
   return colors[value % colors.length];
 }
 
 class GroupPostsGrid extends StatelessWidget {
   final String groupId;
-  final String groupName;
   final String weekKey;
-  final int memberCount;
 
   const GroupPostsGrid({
     super.key,
     required this.groupId,
-    required this.groupName,
     required this.weekKey,
-    required this.memberCount,
   });
 
   @override
@@ -7586,7 +7441,6 @@ class GroupPostsGrid extends StatelessWidget {
 
         final postDocs = postsSnapshot.data?.docs ?? [];
         final postedUids = postDocs.map((d) => d.id).toSet();
-        final totalMembers = memberCount <= 0 ? postDocs.length : memberCount;
 
         return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
           stream: membersRef.snapshots(),
@@ -7648,7 +7502,6 @@ class GroupPostsGrid extends StatelessWidget {
                       final photoUrl = missing['effectivePhotoUrl'] as String?;
                       return MissingSelfieTile(
                         groupId: groupId,
-                        groupName: groupName,
                         weekKey: weekKey,
                         targetUid: missingDoc.id,
                         name: name,
@@ -7794,7 +7647,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel> {
                         : ListView.separated(
                             padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
                             itemCount: messages.length,
-                            separatorBuilder: (_, __) => const SizedBox(height: 8),
+                            separatorBuilder: (_, _) => const SizedBox(height: 8),
                             itemBuilder: (context, index) {
                               final doc = messages[index];
                               return WeeklyChatMessageBubble(
@@ -8473,7 +8326,6 @@ class EmptyWeekCard extends StatelessWidget {
 
 class MissingSelfieTile extends StatefulWidget {
   final String groupId;
-  final String groupName;
   final String weekKey;
   final String targetUid;
   final String name;
@@ -8482,7 +8334,6 @@ class MissingSelfieTile extends StatefulWidget {
   const MissingSelfieTile({
     super.key,
     required this.groupId,
-    required this.groupName,
     required this.weekKey,
     required this.targetUid,
     required this.name,
@@ -8504,9 +8355,7 @@ class _MissingSelfieTileState extends State<MissingSelfieTile> {
     try {
       await enviarZumbidoSelfie(
         groupId: widget.groupId,
-        groupName: widget.groupName,
         targetUid: widget.targetUid,
-        targetName: widget.name,
       );
 
       if (!mounted) return;
@@ -8830,7 +8679,7 @@ class SelfieTile extends StatelessWidget {
                             if (progress == null) return child;
                             return const _ImageLoadingFill();
                           },
-                          errorBuilder: (_, __, ___) => Center(
+                          errorBuilder: (_, _, _) => Center(
                             child: Text(
                               initialsFromName(authorName),
                               style: const TextStyle(
@@ -8918,7 +8767,7 @@ class GroupAggregatedReactionsStrip extends StatelessWidget {
               vertical: compact ? 5 : 6,
             ),
             itemCount: counts.length,
-            separatorBuilder: (_, __) => SizedBox(width: compact ? 6 : 7),
+            separatorBuilder: (_, _) => SizedBox(width: compact ? 6 : 7),
             itemBuilder: (context, index) {
               final entry = counts.entries.elementAt(index);
               return InkWell(
@@ -9000,6 +8849,7 @@ class SelfieFullScreen extends StatefulWidget {
 
 class _SelfieFullScreenState extends State<SelfieFullScreen> {
   bool sendingReaction = false;
+  bool sendingReport = false;
   late int currentIndex;
 
   List<SelfieViewerEntry> get entries {
@@ -9039,7 +8889,86 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
     setState(() {
       currentIndex = next;
       sendingReaction = false;
+      sendingReport = false;
     });
+  }
+
+  Future<void> _reportSelfie(SelfieViewerEntry entry) async {
+    if (sendingReport) return;
+
+    final reason = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.white,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) {
+        return SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 18, 20, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  'Reportar esta selfie',
+                  style: TextStyle(
+                    color: ssText,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  'El reporte será privado y se enviará para revisión.',
+                  style: TextStyle(color: ssText2, fontSize: 13, height: 1.35),
+                ),
+                const SizedBox(height: 12),
+                ...kSelfieReportReasons.entries.map((entry) {
+                  return ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(
+                      Icons.flag_outlined,
+                      color: ssOrangeDark,
+                    ),
+                    title: Text(
+                      entry.value,
+                      style: const TextStyle(
+                        color: ssText,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    onTap: () => Navigator.pop(sheetContext, entry.key),
+                  );
+                }),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    if (reason == null || !mounted) return;
+
+    setState(() => sendingReport = true);
+
+    try {
+      await reportarSelfie(
+        groupId: entry.groupId,
+        weekKey: entry.weekKey,
+        postUid: entry.postUid,
+        reason: reason,
+      );
+
+      if (!mounted) return;
+      showSundaySnack(context, 'Reporte enviado para revisión');
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error enviando el reporte: $error');
+    } finally {
+      if (mounted) setState(() => sendingReport = false);
+    }
   }
 
   @override
@@ -9195,6 +9124,18 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
                               ],
                             ),
                           ),
+                          if (currentUser != null && !isOwnSelfie) ...[
+                            const SizedBox(width: 8),
+                            CircleIconButton(
+                              icon: sendingReport
+                                  ? Icons.hourglass_top_rounded
+                                  : Icons.flag_outlined,
+                              onTap: sendingReport
+                                  ? () {}
+                                  : () => _reportSelfie(entry),
+                              dark: true,
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -9263,7 +9204,7 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
                                   } catch (error) {
                                     if (mounted) {
                                       showSundaySnack(
-                                        context,
+                                        this.context,
                                         'Error al reaccionar: $error',
                                       );
                                     }
@@ -9700,6 +9641,17 @@ class _CameraTabScreenState extends State<CameraTabScreen> {
   bool uploading = false;
   String? uploadingGroupId;
 
+  void _openReplacementInfo({
+    required String groupName,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SelfieReplacementInfoScreen(groupName: groupName),
+      ),
+    );
+  }
+
   Future<void> _openCameraAndUpload({
     required String groupId,
     required String groupName,
@@ -9785,6 +9737,7 @@ class _CameraTabScreenState extends State<CameraTabScreen> {
                     uploading: uploading,
                     uploadingGroupId: uploadingGroupId,
                     onUpload: _openCameraAndUpload,
+                    onReplaceRequested: _openReplacementInfo,
                   );
                 },
               ),
@@ -9901,6 +9854,7 @@ class CameraOpenContent extends StatelessWidget {
   final String? uploadingGroupId;
   final Future<void> Function({required String groupId, required String groupName})
       onUpload;
+  final void Function({required String groupName}) onReplaceRequested;
 
   const CameraOpenContent({
     super.key,
@@ -9908,6 +9862,7 @@ class CameraOpenContent extends StatelessWidget {
     required this.uploading,
     required this.uploadingGroupId,
     required this.onUpload,
+    required this.onReplaceRequested,
   });
 
   @override
@@ -9961,6 +9916,7 @@ class CameraOpenContent extends StatelessWidget {
             uploading: isUploading,
             locked: uploading && !isUploading,
             onTap: () => onUpload(groupId: groupId, groupName: groupName),
+            onReplaceRequested: () => onReplaceRequested(groupName: groupName),
           );
         }),
       ],
@@ -9974,6 +9930,7 @@ class CameraGroupUploadCard extends StatelessWidget {
   final bool uploading;
   final bool locked;
   final VoidCallback onTap;
+  final VoidCallback onReplaceRequested;
 
   const CameraGroupUploadCard({
     super.key,
@@ -9982,6 +9939,7 @@ class CameraGroupUploadCard extends StatelessWidget {
     required this.uploading,
     required this.locked,
     required this.onTap,
+    required this.onReplaceRequested,
   });
 
   @override
@@ -9999,7 +9957,7 @@ class CameraGroupUploadCard extends StatelessWidget {
       stream: postRef.snapshots(),
       builder: (context, snapshot) {
         final hasSelfie = snapshot.data?.exists ?? false;
-        final enabled = !locked && !uploading && !hasSelfie;
+        final enabled = !locked && !uploading;
 
         return Container(
           margin: const EdgeInsets.only(bottom: 12),
@@ -10019,7 +9977,11 @@ class CameraGroupUploadCard extends StatelessWidget {
             color: Colors.transparent,
             child: InkWell(
               borderRadius: BorderRadius.circular(18),
-              onTap: enabled ? onTap : null,
+              onTap: enabled
+                  ? hasSelfie
+                        ? onReplaceRequested
+                        : onTap
+                  : null,
               child: Padding(
                 padding: const EdgeInsets.all(16),
                 child: Row(
@@ -10043,7 +10005,7 @@ class CameraGroupUploadCard extends StatelessWidget {
                           const SizedBox(height: 2),
                           Text(
                             hasSelfie
-                                ? 'Selfie publicado esta semana'
+                                ? 'Selfie publicado · ver reemplazo excepcional'
                                 : uploading
                                 ? 'Publicando selfie...'
                                 : 'Toca para abrir la cámara',
@@ -10074,7 +10036,7 @@ class CameraGroupUploadCard extends StatelessWidget {
                             )
                           : Icon(
                               hasSelfie
-                                  ? Icons.check_rounded
+                                  ? Icons.replay_rounded
                                   : Icons.photo_camera_rounded,
                               color: hasSelfie ? ssOrangeDark : Colors.white,
                               size: 22,
@@ -10087,6 +10049,122 @@ class CameraGroupUploadCard extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+class SelfieReplacementInfoScreen extends StatelessWidget {
+  final String groupName;
+
+  const SelfieReplacementInfoScreen({
+    super.key,
+    required this.groupName,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: ssBg,
+      body: SafeArea(
+        child: Column(
+          children: [
+            AppHeader(onBack: () => Navigator.pop(context)),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(24, 20, 24, 28),
+                children: [
+                  Container(
+                    width: 88,
+                    height: 88,
+                    decoration: const BoxDecoration(
+                      color: ssOrangeLight,
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.looks_one_rounded,
+                      color: ssOrange,
+                      size: 46,
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+                  const Text(
+                    'Una selfie por domingo',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: ssTitle,
+                      fontSize: 28,
+                      height: 1.1,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Ya has publicado tu Sunday Selfie en ${formatGroupDisplayName(groupName)}.',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: ssText2,
+                      fontSize: 15,
+                      height: 1.45,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 26),
+                  SundayCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Reemplazo excepcional',
+                          style: TextStyle(
+                            color: ssTitle,
+                            fontSize: 18,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'Sunday Selfie está pensado para guardar un único momento real de cada domingo.',
+                          style: TextStyle(
+                            color: ssText2,
+                            fontSize: 14,
+                            height: 1.45,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        const Text(
+                          'Para quienes apoyan el desarrollo de Sunday Selfie, más adelante permitiremos reemplazarla después de ver un anuncio.',
+                          style: TextStyle(
+                            color: ssText2,
+                            fontSize: 14,
+                            height: 1.45,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  SundayButton(
+                    text: 'Próximamente: ver anuncio para reemplazar',
+                    onPressed: () {
+                      showSundaySnack(
+                        context,
+                        'El reemplazo mediante anuncio estará disponible próximamente',
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Conservar mi selfie actual'),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -10741,99 +10819,6 @@ class _SelfiesGrid extends StatelessWidget {
   }
 }
 
-class _MySelfiesTitle extends StatelessWidget {
-  final String countLabel;
-
-  const _MySelfiesTitle({required this.countLabel});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.end,
-      children: [
-        const Expanded(
-          child: Text(
-            'Mis selfies',
-            style: TextStyle(
-              color: ssText,
-              fontSize: 34,
-              fontWeight: FontWeight.w900,
-              height: 1,
-            ),
-          ),
-        ),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 8),
-          decoration: BoxDecoration(
-            color: ssOrange,
-            borderRadius: BorderRadius.circular(999),
-            boxShadow: [
-              BoxShadow(
-                color: ssOrange.withValues(alpha: 0.25),
-                blurRadius: 16,
-                offset: const Offset(0, 7),
-              ),
-            ],
-          ),
-          child: Text(
-            countLabel,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 14,
-              fontWeight: FontWeight.w900,
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _MySelfiesLoadingGrid extends StatelessWidget {
-  const _MySelfiesLoadingGrid();
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Container(
-          height: 260,
-          decoration: BoxDecoration(
-            color: ssOrangeLight,
-            borderRadius: BorderRadius.circular(28),
-            border: Border.all(color: ssOrangeMid),
-          ),
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(child: _LoadingTile(height: 210)),
-            const SizedBox(width: 12),
-            Expanded(child: _LoadingTile(height: 178)),
-          ],
-        ),
-      ],
-    );
-  }
-}
-
-class _LoadingTile extends StatelessWidget {
-  final double height;
-
-  const _LoadingTile({required this.height});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      height: height,
-      decoration: BoxDecoration(
-        color: ssSeparator,
-        borderRadius: BorderRadius.circular(24),
-      ),
-    );
-  }
-}
-
 class MySelfieHistoryItem {
   final String groupId;
   final String groupName;
@@ -11448,7 +11433,7 @@ class _MontageScreenState extends State<MontageScreen> {
                                     scrollDirection: Axis.horizontal,
                                     padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
                                     itemCount: weekKeys.length,
-                                    separatorBuilder: (_, __) => const SizedBox(width: 8),
+                                    separatorBuilder: (_, _) => const SizedBox(width: 8),
                                     itemBuilder: (context, index) {
                                       final key = weekKeys[index];
                                       final selected = key == selectedMontageWeekKey;
@@ -11636,7 +11621,7 @@ class _MontageGroupSelector extends StatelessWidget {
             onTap: () => onSelected(index),
           );
         },
-        separatorBuilder: (_, __) => const SizedBox(width: 8),
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
         itemCount: groupDocs.length,
       ),
     );
@@ -12078,7 +12063,7 @@ class MontageSelfieTile extends StatelessWidget {
                   if (progress == null) return child;
                   return const _ImageLoadingFill();
                 },
-                errorBuilder: (_, __, ___) => const _ImageErrorFill(),
+                errorBuilder: (_, _, _) => const _ImageErrorFill(),
               )
             else
               Container(
@@ -12420,18 +12405,6 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
     }
   }
 
-  void _applyProfileFilter() {
-    if (selectedPhoto == null) {
-      showSundaySnack(context, 'Primero elige una foto de perfil');
-      return;
-    }
-
-    setState(() {
-      selectedPhotoFilterApplied = true;
-      saved = false;
-    });
-  }
-
   Future<void> _saveProfile({
     required String currentName,
     required String? currentPhotoStoragePath,
@@ -12700,7 +12673,7 @@ class EditableProfileAvatar extends StatelessWidget {
         fit: BoxFit.cover,
         alignment: Alignment.center,
         filterQuality: FilterQuality.high,
-        errorBuilder: (_, __, ___) => Center(
+        errorBuilder: (_, _, _) => Center(
           child: Text(
             initialsFromName(name),
             style: const TextStyle(
@@ -13206,6 +13179,7 @@ class AppSettingsScreen extends StatefulWidget {
 class _AppSettingsScreenState extends State<AppSettingsScreen> {
   bool autoDownload = true;
   bool clearDone = false;
+  bool deletingAccount = false;
 
   Future<void> _confirmClearCache() async {
     final confirmed = await showModalBottomSheet<bool>(
@@ -13269,6 +13243,100 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
       setState(() => clearDone = true);
       await Future<void>.delayed(const Duration(seconds: 3));
       if (mounted) setState(() => clearDone = false);
+    }
+  }
+
+  Future<void> _confirmDeleteAccount() async {
+    if (deletingAccount) return;
+
+    final confirmationController = TextEditingController();
+    var canDelete = false;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              backgroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(22),
+              ),
+              title: const Text('Borrar cuenta definitivamente'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.',
+                    style: TextStyle(color: ssText2, height: 1.35),
+                  ),
+                  const SizedBox(height: 10),
+                  const Text(
+                    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.',
+                    style: TextStyle(color: ssText2, height: 1.35),
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Escribe BORRAR para confirmar:',
+                    style: TextStyle(
+                      color: ssText,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: confirmationController,
+                    textCapitalization: TextCapitalization.characters,
+                    decoration: const InputDecoration(
+                      hintText: 'BORRAR',
+                      border: OutlineInputBorder(),
+                    ),
+                    onChanged: (value) {
+                      final nextCanDelete = value.trim() == 'BORRAR';
+                      if (nextCanDelete == canDelete) return;
+                      setDialogState(() => canDelete = nextCanDelete);
+                    },
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('Cancelar'),
+                ),
+                TextButton(
+                  onPressed: canDelete
+                      ? () => Navigator.pop(dialogContext, true)
+                      : null,
+                  child: const Text(
+                    'Borrar definitivamente',
+                    style: TextStyle(
+                      color: Color(0xFFE74C3C),
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    confirmationController.dispose();
+
+    if (confirmed != true || !mounted) return;
+
+    setState(() => deletingAccount = true);
+
+    try {
+      await borrarCuentaSundaySelfie();
+      await FirebaseAuth.instance.signOut();
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error borrando la cuenta: $error');
+    } finally {
+      if (mounted) setState(() => deletingAccount = false);
     }
   }
 
@@ -13352,6 +13420,22 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                     ],
                   ),
                   const SizedBox(height: 24),
+                  const SettingsSectionTitle('CUENTA'),
+                  SettingsSectionCard(
+                    children: [
+                      SettingsNavigationRow(
+                        title: deletingAccount
+                            ? 'Borrando cuenta...'
+                            : 'Borrar cuenta',
+                        subtitle:
+                            'Elimina definitivamente tu perfil y contenido personal',
+                        titleColor: const Color(0xFFE74C3C),
+                        showChevron: false,
+                        onTap: deletingAccount ? null : _confirmDeleteAccount,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
                   const Text(
                     'Sunday Selfie v1.0 (beta)',
                     textAlign: TextAlign.center,
@@ -13413,7 +13497,7 @@ class ProfileAvatar extends StatelessWidget {
                       fit: BoxFit.cover,
                       alignment: Alignment.center,
                       filterQuality: FilterQuality.high,
-                      errorBuilder: (_, __, ___) => Center(
+                      errorBuilder: (_, _, _) => Center(
                         child: Text(
                           initialsFromName(name),
                           style: TextStyle(
@@ -13986,7 +14070,7 @@ class GroupIconSmall extends StatelessWidget {
               fit: BoxFit.cover,
               alignment: Alignment.center,
               filterQuality: FilterQuality.high,
-              errorBuilder: (_, __, ___) => Center(
+              errorBuilder: (_, _, _) => Center(
                 child: Text(
                   emoji ?? initialsFromName(name),
                   style: const TextStyle(
@@ -14354,10 +14438,10 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
                     colors: [
-                      Colors.black.withOpacity(0.70),
+                      Colors.black.withValues(alpha: 0.70),
                       Colors.transparent,
                       Colors.transparent,
-                      Colors.black.withOpacity(0.80),
+                      Colors.black.withValues(alpha: 0.80),
                     ],
                     stops: const [0, 0.22, 0.68, 1],
                   ),
@@ -14403,7 +14487,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(
-                                color: Colors.white.withOpacity(0.75),
+                                color: Colors.white.withValues(alpha: 0.75),
                                 fontSize: 14,
                                 fontWeight: FontWeight.w700,
                               ),
@@ -14448,10 +14532,10 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                           vertical: 14,
                         ),
                         decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.34),
+                          color: Colors.black.withValues(alpha: 0.34),
                           borderRadius: BorderRadius.circular(28),
                           border: Border.all(
-                            color: Colors.white.withOpacity(0.14),
+                            color: Colors.white.withValues(alpha: 0.14),
                           ),
                         ),
                         child: Row(
@@ -14466,7 +14550,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                               child: Text(
                                 'Solo cámara in-app · sin galería',
                                 style: TextStyle(
-                                  color: Colors.white.withOpacity(0.78),
+                                  color: Colors.white.withValues(alpha: 0.78),
                                   fontSize: 13,
                                   fontWeight: FontWeight.w800,
                                 ),
@@ -14493,7 +14577,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                             border: Border.all(color: Colors.white, width: 5),
                             boxShadow: [
                               BoxShadow(
-                                color: ssOrange.withOpacity(0.35),
+                                color: ssOrange.withValues(alpha: 0.35),
                                 blurRadius: 30,
                                 offset: const Offset(0, 10),
                               ),
@@ -14534,12 +14618,12 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                               width: 54,
                               height: 54,
                               decoration: BoxDecoration(
-                                color: Colors.white.withOpacity(
-                                  cameras.length < 2 ? 0.18 : 0.28,
+                                color: Colors.white.withValues(
+                                  alpha: cameras.length < 2 ? 0.18 : 0.28,
                                 ),
                                 shape: BoxShape.circle,
                                 border: Border.all(
-                                  color: Colors.white.withOpacity(0.18),
+                                  color: Colors.white.withValues(alpha: 0.18),
                                 ),
                               ),
                               child: const Icon(
@@ -15132,7 +15216,7 @@ class GroupIcon extends StatelessWidget {
               fit: BoxFit.cover,
               alignment: Alignment.center,
               filterQuality: FilterQuality.high,
-              errorBuilder: (_, __, ___) => _GroupIconFallback(
+              errorBuilder: (_, _, _) => _GroupIconFallback(
                 name: name,
                 emoji: resolvedEmoji,
                 color: resolvedColor,
@@ -15228,7 +15312,7 @@ class MiniProfileAvatar extends StatelessWidget {
                       fit: BoxFit.cover,
                       alignment: Alignment.center,
                       filterQuality: FilterQuality.high,
-                      errorBuilder: (_, __, ___) => _MiniAvatarInitials(
+                      errorBuilder: (_, _, _) => _MiniAvatarInitials(
                         name: name,
                         size: size,
                       ),
@@ -15556,7 +15640,7 @@ class StreakRankingSheet extends StatelessWidget {
                     child: ListView.separated(
                       shrinkWrap: true,
                       itemCount: ranking.length,
-                      separatorBuilder: (_, __) =>
+                      separatorBuilder: (_, _) =>
                           const Divider(height: 1, color: ssSeparator),
                       itemBuilder: (context, index) {
                         final entry = ranking[index];

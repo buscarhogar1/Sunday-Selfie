@@ -25,9 +25,11 @@ service firebase.storage {
     }
 
     function isSundayUploadWindowOpen() {
-      return request.time.dayOfWeek() == 7
-        && request.time.time() >= duration.time(0, 0, 0, 0)
-        && request.time.time() <= duration.time(23, 59, 59, 999000000);
+      return (
+          request.time.dayOfWeek() == 6
+          && request.time.time() >= duration.time(22, 0, 0, 0)
+        )
+        || request.time.dayOfWeek() == 7;
     }
 
     function isValidSelfieUpload(groupId, weekKey, fileName) {
@@ -63,7 +65,9 @@ service firebase.storage {
     match /groups/{groupId}/weeks/{weekKey}/{fileName} {
       allow read: if isMember(groupId);
 
-      allow write: if isValidSelfieUpload(groupId, weekKey, fileName);
+      allow create: if isValidSelfieUpload(groupId, weekKey, fileName);
+
+      allow update, delete: if false;
     }
 
     match /groups/{groupId}/profile/{fileName} {

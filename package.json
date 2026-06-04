@@ -1,0 +1,14 @@
+{
+  "name": "sunday-selfie-local-checks",
+  "private": true,
+  "scripts": {
+    "test": "npm run check:local",
+    "check:local": "bash tool/run_stabilization_checks.sh",
+    "test:contracts": "node --test tool/security_contracts.test.js",
+    "test:rules": "bash tool/run_rules_tests.sh"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^4.0.1",
+    "firebase": "^11.0.0"
+  }
+}
