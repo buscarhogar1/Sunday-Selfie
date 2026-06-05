@@ -113,6 +113,10 @@ const REPORT_REASON_VALUES = new Set([
   "spam",
   "otro",
 ]);
+const MODERATION_DECISION_VALUES = new Set([
+  "dismiss",
+  "remove_selfie",
+]);
 const ACCOUNT_DELETE_CONFIRMATION = "BORRAR";
 const RECENT_AUTH_MAX_AGE_SECONDS = 15 * 60;
 
@@ -1709,6 +1713,387 @@ exports.reportarContenido = callable(async (data, context) => {
     success: true,
     alreadyReported,
   };
+});
+
+function timestampToMillis(value) {
+  if (value && typeof value.toMillis === "function") {
+    return value.toMillis();
+  }
+
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+
+  return null;
+}
+
+function buildModerationReportResponse(reportDoc, postDoc) {
+  const reportData = reportDoc.data() || {};
+  const postExists = Boolean(postDoc && postDoc.exists);
+  const postData = postExists ? postDoc.data() || {} : {};
+  const imageUrl = cleanString(
+    postData.imageUrl,
+    cleanString(postData.thumbUrl, "")
+  );
+
+  return {
+    reportId: reportDoc.id,
+    groupId: cleanString(reportData.groupId, ""),
+    weekKey: cleanString(reportData.weekKey, ""),
+    postUid: cleanString(reportData.reportedUid, ""),
+    reason: cleanString(reportData.reason, "otro"),
+    status: cleanString(reportData.status, "pending"),
+    authorName: cleanString(
+      reportData.authorNameSnapshot,
+      cleanString(postData.authorName, "Usuario")
+    ),
+    authorPhotoUrl: cleanString(postData.authorPhotoUrl, null),
+    imageUrl,
+    thumbUrl: cleanString(postData.thumbUrl, imageUrl),
+    postExists,
+    createdAtMillis: timestampToMillis(reportData.createdAt),
+    resolvedAtMillis: timestampToMillis(reportData.resolvedAt),
+    decision: cleanString(reportData.decision, null),
+  };
+}
+
+async function loadPostDocForReport(firestore, reportData) {
+  const postPath = cleanString(reportData.postPath, "");
+  const groupId = cleanString(reportData.groupId, "");
+
+  if (isValidDocumentId(groupId) && postPath.startsWith(`groups/${groupId}/weeks/`)) {
+    return firestore.doc(postPath).get();
+  }
+
+  const weekKey = cleanString(reportData.weekKey, "");
+  const postUid = cleanString(reportData.reportedUid, "");
+
+  if (
+    !isValidDocumentId(groupId)
+    || !isValidWeekKey(weekKey)
+    || !isValidDocumentId(postUid)
+  ) {
+    return null;
+  }
+
+  return firestore
+    .collection("groups")
+    .doc(groupId)
+    .collection("weeks")
+    .doc(weekKey)
+    .collection("posts")
+    .doc(postUid)
+    .get();
+}
+
+exports.listarReportesGrupo = callable(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError(
+      "unauthenticated",
+      "Usuario no autenticado"
+    );
+  }
+
+  const groupId = data && data.groupId;
+
+  if (!isValidDocumentId(groupId)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Solicitud no válida"
+    );
+  }
+
+  const adminUid = context.auth.uid;
+  const firestore = admin.firestore();
+  const groupRef = firestore.collection("groups").doc(groupId);
+  const adminMemberRef = groupRef.collection("members").doc(adminUid);
+  const [groupDoc, adminMemberDoc] = await Promise.all([
+    groupRef.get(),
+    adminMemberRef.get(),
+  ]);
+
+  if (!groupDoc.exists || groupDoc.data().deleted === true) {
+    throw new functions.https.HttpsError(
+      "not-found",
+      "El grupo ya no está disponible"
+    );
+  }
+
+  if (!adminMemberDoc.exists || adminMemberDoc.data().role !== "admin") {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Solo un administrador puede revisar reportes"
+    );
+  }
+
+  const reportsSnapshot = await firestore
+    .collection("reports")
+    .where("groupId", "==", groupId)
+    .get();
+
+  const pendingReports = reportsSnapshot.docs
+    .filter((doc) => {
+      const reportData = doc.data() || {};
+      return cleanString(reportData.status, "pending") === "pending";
+    })
+    .sort((a, b) => {
+      const bMillis = timestampToMillis(b.data().createdAt) || 0;
+      const aMillis = timestampToMillis(a.data().createdAt) || 0;
+
+      return bMillis - aMillis;
+    })
+    .slice(0, 50);
+
+  const reports = [];
+
+  for (const reportDoc of pendingReports) {
+    const postDoc = await loadPostDocForReport(firestore, reportDoc.data() || {});
+    reports.push(buildModerationReportResponse(reportDoc, postDoc));
+  }
+
+  return {reports};
+});
+
+async function resolveLinkedReports({
+  decision,
+  firestore,
+  groupId,
+  moderatorUid,
+  reportId,
+  weekKey,
+  postUid,
+}) {
+  const reportsSnapshot = await firestore
+    .collection("reports")
+    .where("groupId", "==", groupId)
+    .get();
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const linkedReports = reportsSnapshot.docs.filter((doc) => {
+    const data = doc.data() || {};
+
+    return doc.id !== reportId
+      && cleanString(data.status, "pending") === "pending"
+      && cleanString(data.weekKey, "") === weekKey
+      && cleanString(data.reportedUid, "") === postUid;
+  });
+
+  for (let index = 0; index < linkedReports.length; index += 400) {
+    const batch = firestore.batch();
+
+    linkedReports.slice(index, index + 400).forEach((doc) => {
+      batch.update(doc.ref, {
+        status: decision === "remove_selfie" ? "removed" : "dismissed",
+        decision,
+        resolvedAt: now,
+        resolvedByUid: moderatorUid,
+        updatedAt: now,
+      });
+    });
+
+    await batch.commit();
+  }
+}
+
+exports.resolverReporte = callable(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError(
+      "unauthenticated",
+      "Usuario no autenticado"
+    );
+  }
+
+  const reportId = data && data.reportId;
+  const decision = cleanString(data && data.decision, "");
+
+  if (
+    !isValidDocumentId(reportId)
+    || !MODERATION_DECISION_VALUES.has(decision)
+  ) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Decisión de moderación no válida"
+    );
+  }
+
+  const moderatorUid = context.auth.uid;
+  const firestore = admin.firestore();
+  const bucket = admin.storage().bucket();
+  const reportRef = firestore.collection("reports").doc(reportId);
+  let result = null;
+  let postRefToDelete = null;
+  let storagePathsToDelete = [];
+
+  await firestore.runTransaction(async (transaction) => {
+    const reportDoc = await transaction.get(reportRef);
+
+    if (!reportDoc.exists) {
+      throw new functions.https.HttpsError(
+        "not-found",
+        "El reporte ya no existe"
+      );
+    }
+
+    const reportData = reportDoc.data() || {};
+    const groupId = cleanString(reportData.groupId, "");
+    const weekKey = cleanString(reportData.weekKey, "");
+    const postUid = cleanString(reportData.reportedUid, "");
+
+    if (
+      reportData.type !== "selfie"
+      || !isValidDocumentId(groupId)
+      || !isValidWeekKey(weekKey)
+      || !isValidDocumentId(postUid)
+    ) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "El reporte no tiene datos válidos"
+      );
+    }
+
+    const groupRef = firestore.collection("groups").doc(groupId);
+    const adminMemberRef = groupRef.collection("members").doc(moderatorUid);
+    const weekRef = groupRef.collection("weeks").doc(weekKey);
+    const postRef = weekRef.collection("posts").doc(postUid);
+    const postsRef = weekRef.collection("posts");
+    const [
+      groupDoc,
+      adminMemberDoc,
+      weekDoc,
+      postDoc,
+      postsSnapshot,
+    ] = await Promise.all([
+      transaction.get(groupRef),
+      transaction.get(adminMemberRef),
+      transaction.get(weekRef),
+      transaction.get(postRef),
+      transaction.get(postsRef),
+    ]);
+
+    if (!groupDoc.exists || groupDoc.data().deleted === true) {
+      throw new functions.https.HttpsError(
+        "not-found",
+        "El grupo ya no está disponible"
+      );
+    }
+
+    if (!adminMemberDoc.exists || adminMemberDoc.data().role !== "admin") {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Solo un administrador puede resolver reportes"
+      );
+    }
+
+    if (cleanString(reportData.status, "pending") !== "pending") {
+      result = {
+        success: true,
+        alreadyResolved: true,
+        decision: cleanString(reportData.decision, null),
+        groupId,
+        weekKey,
+        postUid,
+      };
+      return;
+    }
+
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const reportUpdate = {
+      status: decision === "remove_selfie" ? "removed" : "dismissed",
+      decision,
+      resolvedAt: now,
+      resolvedByUid: moderatorUid,
+      updatedAt: now,
+    };
+
+    if (decision === "remove_selfie") {
+      const postData = postDoc.exists ? postDoc.data() || {} : {};
+      const weekData = weekDoc.exists ? weekDoc.data() || {} : {};
+      const currentPostCount = Number.isInteger(weekData.postCount)
+        ? weekData.postCount
+        : postsSnapshot.size;
+      const storagePath = `groups/${groupId}/weeks/${weekKey}/${postUid}.jpg`;
+
+      storagePathsToDelete = [
+        storagePath,
+        postData.storagePathFull,
+        postData.storagePathThumb,
+        reportData.storagePathFull,
+        reportData.storagePathThumb,
+      ];
+
+      if (postDoc.exists) {
+        transaction.delete(postRef);
+        transaction.set(
+          weekRef,
+          {
+            postCount: Math.max(currentPostCount - 1, 0),
+          },
+          {merge: true}
+        );
+        transaction.update(groupRef, {lastActivityAt: now});
+        postRefToDelete = postRef;
+      }
+
+      reportUpdate.postRemovedAt = now;
+      reportUpdate.postAlreadyMissing = !postDoc.exists;
+    }
+
+    transaction.update(reportRef, reportUpdate);
+
+    result = {
+      success: true,
+      alreadyResolved: false,
+      decision,
+      groupId,
+      weekKey,
+      postUid,
+      removedPost: decision === "remove_selfie",
+    };
+  });
+
+  if (!result) {
+    throw new functions.https.HttpsError(
+      "internal",
+      "No se pudo resolver el reporte"
+    );
+  }
+
+  if (!result.alreadyResolved) {
+    await resolveLinkedReports({
+      decision,
+      firestore,
+      groupId: result.groupId,
+      moderatorUid,
+      reportId,
+      weekKey: result.weekKey,
+      postUid: result.postUid,
+    });
+  }
+
+  if (postRefToDelete) {
+    try {
+      await firestore.recursiveDelete(postRefToDelete);
+    } catch (error) {
+      logger.warn("No se pudieron borrar subdatos de la selfie moderada", {
+        reportId,
+        postPath: postRefToDelete.path,
+        error,
+      });
+    }
+  }
+
+  if (storagePathsToDelete.length > 0) {
+    try {
+      await deleteStoragePaths(bucket, storagePathsToDelete);
+    } catch (error) {
+      logger.warn("No se pudieron borrar archivos de la selfie moderada", {
+        reportId,
+        storagePathsToDelete,
+        error,
+      });
+    }
+  }
+
+  return result;
 });
 
 async function deleteDocumentReferences(firestore, references) {

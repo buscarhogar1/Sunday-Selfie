@@ -1832,6 +1832,123 @@ Future<void> reportarSelfie({
   }
 }
 
+const String kModerationDecisionDismiss = 'dismiss';
+const String kModerationDecisionRemoveSelfie = 'remove_selfie';
+
+DateTime? moderationDateFromMillis(dynamic value) {
+  if (value is int) return DateTime.fromMillisecondsSinceEpoch(value);
+  if (value is double) {
+    return DateTime.fromMillisecondsSinceEpoch(value.round());
+  }
+  return null;
+}
+
+class ModerationReport {
+  final String reportId;
+  final String groupId;
+  final String weekKey;
+  final String postUid;
+  final String reason;
+  final String status;
+  final String authorName;
+  final String? authorPhotoUrl;
+  final String imageUrl;
+  final String thumbUrl;
+  final bool postExists;
+  final DateTime? createdAt;
+
+  const ModerationReport({
+    required this.reportId,
+    required this.groupId,
+    required this.weekKey,
+    required this.postUid,
+    required this.reason,
+    required this.status,
+    required this.authorName,
+    required this.authorPhotoUrl,
+    required this.imageUrl,
+    required this.thumbUrl,
+    required this.postExists,
+    required this.createdAt,
+  });
+
+  factory ModerationReport.fromData(Map<String, dynamic> data) {
+    final rawAuthorPhoto = data['authorPhotoUrl'];
+    final rawImageUrl = (data['imageUrl'] ?? '').toString().trim();
+    final rawThumbUrl = (data['thumbUrl'] ?? '').toString().trim();
+
+    return ModerationReport(
+      reportId: (data['reportId'] ?? '').toString(),
+      groupId: (data['groupId'] ?? '').toString(),
+      weekKey: (data['weekKey'] ?? '').toString(),
+      postUid: (data['postUid'] ?? '').toString(),
+      reason: (data['reason'] ?? 'otro').toString(),
+      status: (data['status'] ?? 'pending').toString(),
+      authorName: formatUserDisplayName(data['authorName'] ?? 'Usuario'),
+      authorPhotoUrl: rawAuthorPhoto is String && rawAuthorPhoto.trim().isNotEmpty
+          ? rawAuthorPhoto.trim()
+          : null,
+      imageUrl: rawImageUrl,
+      thumbUrl: rawThumbUrl.isEmpty ? rawImageUrl : rawThumbUrl,
+      postExists: data['postExists'] == true,
+      createdAt: moderationDateFromMillis(data['createdAtMillis']),
+    );
+  }
+
+  String get reasonLabel => kSelfieReportReasons[reason] ?? 'Otro motivo';
+}
+
+Future<List<ModerationReport>> listarReportesGrupo({
+  required String groupId,
+}) async {
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'listarReportesGrupo',
+    );
+    final result = await callable.call<dynamic>({
+      'groupId': groupId,
+    });
+    final data = result.data;
+
+    if (data is! Map) {
+      throw Exception('Firebase no devolvió reportes válidos');
+    }
+
+    final rawReports = data['reports'];
+    if (rawReports is! List) return [];
+
+    return rawReports
+        .whereType<Map>()
+        .map((raw) => ModerationReport.fromData(
+              Map<String, dynamic>.from(raw),
+            ))
+        .toList();
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudieron cargar los reportes');
+  }
+}
+
+Future<void> resolverReporteGrupo({
+  required String reportId,
+  required String decision,
+}) async {
+  if (decision != kModerationDecisionDismiss &&
+      decision != kModerationDecisionRemoveSelfie) {
+    throw Exception('Decisión de moderación no válida');
+  }
+
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('resolverReporte');
+
+    await callable.call<void>({
+      'reportId': reportId,
+      'decision': decision,
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo resolver el reporte');
+  }
+}
+
 Future<void> borrarCuentaSundaySelfie() async {
   try {
     final callable = FirebaseFunctions.instance.httpsCallable('borrarCuenta');
@@ -6075,6 +6192,8 @@ class GroupMembersHtmlContent extends StatelessWidget {
                   ),
                 if (isCurrentAdmin)
                   GroupBlockedUsersInlineSection(groupId: groupId),
+                if (isCurrentAdmin)
+                  GroupModerationReportsInlineSection(groupId: groupId),
                 MembersHtmlSectionLabel(
                   text: 'MIEMBROS — ${memberDocs.length}',
                 ),
@@ -6515,6 +6634,419 @@ class GroupBlockedUsersInlineSection extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+class GroupModerationReportsInlineSection extends StatefulWidget {
+  final String groupId;
+
+  const GroupModerationReportsInlineSection({
+    super.key,
+    required this.groupId,
+  });
+
+  @override
+  State<GroupModerationReportsInlineSection> createState() =>
+      _GroupModerationReportsInlineSectionState();
+}
+
+class _GroupModerationReportsInlineSectionState
+    extends State<GroupModerationReportsInlineSection> {
+  bool loading = true;
+  String? error;
+  String? resolvingReportId;
+  String? resolvingDecision;
+  List<ModerationReport> reports = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadReports(showLoading: false);
+  }
+
+  @override
+  void didUpdateWidget(covariant GroupModerationReportsInlineSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.groupId != widget.groupId) {
+      _loadReports();
+    }
+  }
+
+  Future<void> _loadReports({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        loading = true;
+        error = null;
+      });
+    }
+
+    try {
+      final nextReports = await listarReportesGrupo(groupId: widget.groupId);
+
+      if (!mounted) return;
+      setState(() {
+        reports = nextReports;
+        loading = false;
+        error = null;
+      });
+    } catch (loadError) {
+      if (!mounted) return;
+      setState(() {
+        loading = false;
+        error = loadError.toString();
+      });
+    }
+  }
+
+  void _openReport(ModerationReport report) {
+    if (!report.postExists || report.imageUrl.isEmpty) {
+      showSundaySnack(context, 'Esta selfie ya no está disponible');
+      return;
+    }
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SelfieFullScreen(
+          groupId: report.groupId,
+          weekKey: report.weekKey,
+          postUid: report.postUid,
+          post: {
+            'uid': report.postUid,
+            'authorName': report.authorName,
+            'authorPhotoUrl': report.authorPhotoUrl,
+            'imageUrl': report.imageUrl,
+            'thumbUrl': report.thumbUrl,
+          },
+        ),
+      ),
+    );
+  }
+
+  Future<bool> _confirmRemoval(ModerationReport report) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(22),
+          ),
+          title: const Text('Retirar selfie reportada'),
+          content: Text(
+            'La selfie de ${report.authorName} dejará de verse en el grupo y el reporte quedará resuelto.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancelar'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text(
+                'Retirar selfie',
+                style: TextStyle(
+                  color: Color(0xFFE74C3C),
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+
+    return confirmed == true;
+  }
+
+  Future<void> _resolveReport(
+    ModerationReport report,
+    String decision,
+  ) async {
+    if (resolvingReportId != null) return;
+
+    if (decision == kModerationDecisionRemoveSelfie) {
+      final confirmed = await _confirmRemoval(report);
+      if (!confirmed || !mounted) return;
+    }
+
+    setState(() {
+      resolvingReportId = report.reportId;
+      resolvingDecision = decision;
+    });
+
+    try {
+      await resolverReporteGrupo(
+        reportId: report.reportId,
+        decision: decision,
+      );
+
+      if (!mounted) return;
+      showSundaySnack(
+        context,
+        decision == kModerationDecisionRemoveSelfie
+            ? 'Selfie retirada del grupo'
+            : 'Reporte marcado como revisado',
+      );
+      await _loadReports(showLoading: false);
+    } catch (resolveError) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error resolviendo reporte: $resolveError');
+    } finally {
+      if (mounted) {
+        setState(() {
+          resolvingReportId = null;
+          resolvingDecision = null;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (loading && reports.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    if (error != null && reports.isEmpty) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const MembersHtmlSectionLabel(text: 'REPORTES'),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: ssBorder),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  'No se pudieron cargar los reportes: $error',
+                  style: const TextStyle(
+                    color: ssText2,
+                    fontSize: 13,
+                    height: 1.35,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: () => _loadReports(),
+                  child: const Text('Reintentar'),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 22),
+        ],
+      );
+    }
+
+    if (reports.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        MembersHtmlSectionLabel(text: 'REPORTES — ${reports.length}'),
+        const SizedBox(height: 8),
+        const Text(
+          'Solo los administradores pueden verlos. La persona que reportó permanece privada.',
+          style: TextStyle(
+            color: ssText3,
+            fontSize: 12,
+            height: 1.35,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 8),
+        ...reports.map((report) {
+          final busy = resolvingReportId == report.reportId;
+          return GroupModerationReportCard(
+            report: report,
+            busy: busy,
+            resolvingDecision: busy ? resolvingDecision : null,
+            onOpen: () => _openReport(report),
+            onDismiss: () => _resolveReport(
+              report,
+              kModerationDecisionDismiss,
+            ),
+            onRemove: () => _resolveReport(
+              report,
+              kModerationDecisionRemoveSelfie,
+            ),
+          );
+        }),
+        const SizedBox(height: 22),
+      ],
+    );
+  }
+}
+
+class GroupModerationReportCard extends StatelessWidget {
+  final ModerationReport report;
+  final bool busy;
+  final String? resolvingDecision;
+  final VoidCallback onOpen;
+  final VoidCallback onDismiss;
+  final VoidCallback onRemove;
+
+  const GroupModerationReportCard({
+    super.key,
+    required this.report,
+    required this.busy,
+    required this.resolvingDecision,
+    required this.onOpen,
+    required this.onDismiss,
+    required this.onRemove,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final dateLabel = report.createdAt == null
+        ? ''
+        : ' · ${formatShortDate(report.createdAt)}';
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: ssBorder),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.03),
+            blurRadius: 12,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          InkWell(
+            onTap: onOpen,
+            borderRadius: BorderRadius.circular(14),
+            child: Row(
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(14),
+                  child: Container(
+                    width: 58,
+                    height: 58,
+                    color: ssOrangeLight,
+                    child: report.postExists && report.thumbUrl.isNotEmpty
+                        ? Image.network(
+                            report.thumbUrl,
+                            fit: BoxFit.cover,
+                            errorBuilder: (_, _, _) => const Icon(
+                              Icons.broken_image_outlined,
+                              color: ssOrangeDark,
+                            ),
+                          )
+                        : const Icon(
+                            Icons.hide_image_outlined,
+                            color: ssOrangeDark,
+                          ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        report.authorName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: ssText,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        '${report.reasonLabel} · ${obtenerEtiquetaSemana(report.weekKey)}$dateLabel',
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: ssText2,
+                          fontSize: 12,
+                          height: 1.25,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      if (!report.postExists) ...[
+                        const SizedBox(height: 3),
+                        const Text(
+                          'La selfie ya no está disponible',
+                          style: TextStyle(
+                            color: ssText3,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                const Icon(Icons.chevron_right_rounded, color: ssText3),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: busy ? null : onDismiss,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: ssText,
+                    side: const BorderSide(color: ssBorder),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: Text(
+                    busy && resolvingDecision == kModerationDecisionDismiss
+                        ? 'Guardando...'
+                        : 'Mantener',
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: busy ? null : onRemove,
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFFE74C3C),
+                    side: const BorderSide(color: Color(0xFFF3C5C0)),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: Text(
+                    busy &&
+                            resolvingDecision ==
+                                kModerationDecisionRemoveSelfie
+                        ? 'Retirando...'
+                        : 'Retirar',
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }

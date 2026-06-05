@@ -16,6 +16,8 @@ const callableNames = [
   "abandonarGrupo",
   "regenerarInvitacion",
   "reportarContenido",
+  "listarReportesGrupo",
+  "resolverReporte",
   "borrarCuenta",
 ];
 
@@ -41,6 +43,27 @@ test("content reports validate their target before accessing Firestore", async (
         weekKey: "2026-W22",
         postUid: "member-user",
         reason: "otro",
+      },
+    }),
+    (error) => error && error.code === "invalid-argument"
+  );
+});
+
+test("moderation calls validate basic arguments before accessing Firestore", async () => {
+  await assert.rejects(
+    () => callableFunctions.listarReportesGrupo.run({
+      auth: {uid: "admin-user", token: {}},
+      data: {groupId: ""},
+    }),
+    (error) => error && error.code === "invalid-argument"
+  );
+
+  await assert.rejects(
+    () => callableFunctions.resolverReporte.run({
+      auth: {uid: "admin-user", token: {}},
+      data: {
+        reportId: "report-id",
+        decision: "invented-decision",
       },
     }),
     (error) => error && error.code === "invalid-argument"

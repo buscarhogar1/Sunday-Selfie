@@ -72,6 +72,8 @@ test("Flutter delegates sensitive actions to Cloud Functions", () => {
     "reaccionarASelfie",
     "enviarZumbidoSelfie",
     "reportarContenido",
+    "listarReportesGrupo",
+    "resolverReporte",
     "borrarCuenta",
   ];
 
@@ -97,4 +99,16 @@ test("account deletion removes personal data before deleting authentication", ()
     functionsSource.indexOf("await firestore.recursiveDelete(userRef);")
       < functionsSource.indexOf("await admin.auth().deleteUser(uid);")
   );
+});
+
+test("moderation reviews reports privately and removes content server-side", () => {
+  assert.match(functionsSource, /exports\.listarReportesGrupo\s*=/);
+  assert.match(functionsSource, /exports\.resolverReporte\s*=/);
+  assert.match(functionsSource, /Solo un administrador puede revisar reportes/);
+  assert.match(functionsSource, /Solo un administrador puede resolver reportes/);
+  assert.match(functionsSource, /transaction\.delete\(postRef\);/);
+  assert.match(functionsSource, /await firestore\.recursiveDelete\(postRefToDelete\);/);
+  assert.match(functionsSource, /await deleteStoragePaths\(bucket, storagePathsToDelete\);/);
+  assert.doesNotMatch(flutterSource, /collection\('reports'\)\.snapshots\(/);
+  assert.doesNotMatch(flutterSource, /collection\('reports'\)\.get\(/);
 });
