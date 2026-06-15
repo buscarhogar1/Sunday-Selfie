@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Sunday Selfie</title>
+<link rel="icon" type="image/png" href="logo-no-dot.png"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Dancing+Script:wght@600;700&family=DM+Sans:wght@300..700&display=swap" rel="stylesheet"/>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --orange: #F4A261;
+    --orange-d: #E8884A;
+    --orange-light: #FEF3E8;
+    --orange-mid: #FAD9B8;
+    --bg: #F0EBE3;
+    --surface: #FFFDF9;
+    --text: #1C1C1E;
+    --text-2: #6B6B70;
+    --text-3: #AEAEB2;
+  }
+  html, body {
+    min-height: 100%;
+    background: var(--bg);
+    font-family: 'DM Sans', sans-serif;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 24px;
+    position: relative;
+    overflow-x: hidden;
+  }
+  /* Soft warm glow behind the content */
+  .glow {
+    position: fixed;
+    top: 50%; left: 50%;
+    width: 760px; height: 760px;
+    transform: translate(-50%, -58%);
+    background: radial-gradient(circle, var(--orange-light) 0%, rgba(254,243,232,0.45) 38%, rgba(240,235,227,0) 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .card {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    max-width: 480px;
+    width: 100%;
+  }
+
+  /* Resting state is fully visible and static — no time-based CSS so it
+     renders reliably in every context (print, screenshots, all browsers). */
+  .logo {
+    width: 168px;
+    height: 168px;
+    object-fit: contain;
+    display: block;
+    margin-bottom: 6px;
+    filter: drop-shadow(0 18px 36px rgba(244,162,97,0.28));
+  }
+
+  .wordmark {
+    font-family: 'Dancing Script', cursive;
+    font-weight: 700;
+    font-size: 60px;
+    line-height: 1.1;
+    color: var(--orange);
+    -webkit-text-stroke: 0.9px var(--orange);
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+  }
+
+  .tagline {
+    margin-top: 14px;
+    font-size: 17px;
+    font-weight: 500;
+    color: var(--text-2);
+    letter-spacing: 0.1px;
+  }
+
+  .stores {
+    display: flex;
+    gap: 16px;
+    margin-top: 40px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .badge {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: #1C1C1E;
+    color: #fff;
+    text-decoration: none;
+    padding: 13px 22px 13px 20px;
+    border-radius: 15px;
+    min-width: 200px;
+    box-shadow: 0 8px 22px rgba(28,28,30,0.18);
+    transition: transform .18s ease, box-shadow .18s ease, background .18s ease;
+  }
+  .badge:hover {
+    transform: translateY(-3px);
+    background: #000;
+    box-shadow: 0 14px 30px rgba(28,28,30,0.26);
+  }
+  .badge:active { transform: translateY(-1px); }
+  .badge svg { flex-shrink: 0; }
+  .badge .txt {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    line-height: 1.15;
+    text-align: left;
+  }
+  .badge .small {
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+    opacity: 0.92;
+    white-space: nowrap;
+  }
+  .badge .big {
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: 0.1px;
+    margin-top: 1px;
+    white-space: nowrap;
+  }
+
+  .footer {
+    position: relative;
+    z-index: 1;
+    margin-top: 56px;
+    font-size: 13px;
+    color: var(--text-3);
+    letter-spacing: 0.2px;
+    text-align: center;
+  }
+  .footer .dot { margin: 0 7px; opacity: 0.55; }
+
+  @media (max-width: 520px) {
+    .logo { width: 132px; height: 132px; }
+    .wordmark { font-size: 46px; }
+    .tagline { font-size: 15.5px; }
+    .stores { margin-top: 32px; gap: 12px; }
+    .badge { min-width: 0; flex: 1 1 100%; justify-content: center; }
+  }
+</style>
+</head>
+<body>
+  <div class="glow"></div>
+
+  <main class="card">
+    <img class="logo" src="logo-no-dot.png" alt="Sunday Selfie"/>
+    <h1 class="wordmark">Sunday Selfie</h1>
+    <p class="tagline">Seguir conectados una vez por semana</p>
+
+    <div class="stores">
+      <!-- Sustituye href="#" por el enlace real de la App Store cuando esté publicada -->
+      <a class="badge" href="#" aria-label="Descargar en la App Store">
+        <svg width="26" height="32" viewBox="0 0 24 28" fill="#fff" aria-hidden="true">
+          <path d="M17.05 14.86c-.03-2.7 2.2-4 2.3-4.06-1.25-1.83-3.2-2.08-3.9-2.11-1.66-.17-3.24.97-4.08.97-.84 0-2.14-.95-3.52-.92-1.81.03-3.48 1.05-4.41 2.67-1.88 3.27-.48 8.11 1.35 10.76.9 1.3 1.97 2.75 3.37 2.7 1.35-.05 1.86-.87 3.5-.87 1.62 0 2.09.87 3.52.84 1.45-.03 2.37-1.32 3.26-2.62 1.03-1.5 1.45-2.96 1.47-3.04-.03-.01-2.82-1.08-2.86-4.29z"/>
+          <path d="M14.4 6.97c.74-.9 1.24-2.15 1.1-3.4-1.07.04-2.36.71-3.13 1.61-.69.79-1.29 2.06-1.13 3.27 1.19.09 2.42-.6 3.16-1.48z"/>
+        </svg>
+        <span class="txt">
+          <span class="small">Descárgalo en la</span>
+          <span class="big">App Store</span>
+        </span>
+      </a>
+
+      <!-- Sustituye href="#" por el enlace real de Google Play cuando esté publicada -->
+      <a class="badge" href="#" aria-label="Disponible en Google Play">
+        <svg width="26" height="28" viewBox="0 0 24 26" aria-hidden="true">
+          <path d="M2.4 1.2C2.16 1.46 2 1.86 2 2.38v21.24c0 .52.16.92.4 1.18l.07.07L14.4 13.07v-.14L2.47 1.13l-.07.07z" fill="#00D7FE"/>
+          <path d="M18.4 17.08l-4-4v-.16l4-4 .09.05 4.74 2.69c1.35.77 1.35 2.03 0 2.8l-4.74 2.7-.09.06z" fill="#FFBC00"/>
+          <path d="M18.49 17.02L14.4 13 2.4 25c.45.47 1.18.53 2.01.06l14.08-8.04z" fill="#F9320C"/>
+          <path d="M18.49 8.98L4.41.94C3.58.47 2.85.53 2.4 1l12 12 4.09-4.02z" fill="#00F076"/>
+        </svg>
+        <span class="txt">
+          <span class="small">Disponible en</span>
+          <span class="big">Google Play</span>
+        </span>
+      </a>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <span>© 2026 Sunday Selfie</span>
+    <span class="dot">·</span>
+    <span>Hecho para mantener el contacto</span>
+  </footer>
+</body>
+</html>
