@@ -31,10 +31,24 @@ migrate_working_dir/
 .pub-cache/
 .pub/
 /build/
+**/build/
 /coverage/
 node_modules/
 firebase-debug.log
 firebase-debug.*.log
+.firebase/
+*.local
+.env
+.env.*
+!.env.example
+backups/
+firebase-export-*/
+service-account*.json
+*serviceAccount*.json
+*.pem
+*.p8
+*.p12
+*.key
 
 # Symbolication related
 app.*.symbols

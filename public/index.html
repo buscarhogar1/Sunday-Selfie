@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sunday Selfie - Invitación</title>
+    <meta name="description" content="Abre una invitación de Sunday Selfie.">
+    <link rel="icon" href="favicon.png" type="image/png">
+    <style>
+      :root {
+        color-scheme: light;
+        --orange: #f4a261;
+        --orange-dark: #e8884a;
+        --orange-light: #fef3e8;
+        --orange-mid: #fad9b8;
+        --paper: #fffdf9;
+        --surface: #ffffff;
+        --title: #545a60;
+        --text: #6b6b70;
+        --muted: #8b8f94;
+        --border: #f0ebe3;
+        --green: #5f9f80;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background: var(--paper);
+        color: var(--text);
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      main {
+        width: min(100%, 460px);
+        padding: 30px;
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        background: var(--surface);
+        box-shadow: 0 20px 60px rgba(84, 90, 96, 0.13);
+        text-align: center;
+      }
+
+      .brand-mark {
+        width: 88px;
+        height: 88px;
+        margin: 0 auto 18px;
+        object-fit: contain;
+        border-radius: 24px;
+        background: var(--surface);
+        box-shadow: 0 10px 28px rgba(84, 90, 96, 0.12);
+      }
+
+      .brand-name {
+        margin: 0 0 8px;
+        color: var(--orange-dark);
+        font-size: 14px;
+        font-weight: 900;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        color: var(--title);
+        font-size: 28px;
+        line-height: 1.12;
+      }
+
+      p {
+        margin: 12px 0 0;
+        color: var(--text);
+        font-size: 16px;
+        line-height: 1.5;
+      }
+
+      code {
+        display: inline-block;
+        max-width: 100%;
+        margin-top: 18px;
+        padding: 10px 12px;
+        overflow-wrap: anywhere;
+        border: 1px solid var(--orange-mid);
+        border-radius: 14px;
+        background: var(--orange-light);
+        color: var(--orange-dark);
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 14px;
+        font-weight: 900;
+      }
+
+      .actions {
+        display: grid;
+        gap: 10px;
+        margin-top: 22px;
+      }
+
+      a {
+        display: block;
+        padding: 15px 18px;
+        border-radius: 16px;
+        font-weight: 900;
+        text-decoration: none;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      .primary {
+        background: var(--orange);
+        color: white;
+        box-shadow: 0 10px 24px rgba(244, 162, 97, 0.26);
+      }
+
+      .secondary {
+        border: 1px solid var(--border);
+        background: #f8fbf9;
+        color: var(--green);
+      }
+
+      .desktop-store {
+        display: grid;
+        gap: 10px;
+        margin-top: 10px;
+      }
+
+      .hint {
+        margin-top: 16px;
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      @media (max-width: 380px) {
+        main {
+          padding: 26px 20px;
+        }
+
+        .brand-mark {
+          width: 76px;
+          height: 76px;
+        }
+
+        h1 {
+          font-size: 25px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img class="brand-mark" src="assets/sunday-selfie-icon.png" alt="Sunday Selfie">
+      <p class="brand-name">Sunday Selfie</p>
+      <h1>Invitación a un grupo privado</h1>
+      <p id="intro">Estamos preparando tu invitación.</p>
+      <code id="invite-code">Cargando invitación...</code>
+      <div class="actions">
+        <a class="primary" id="open-app" href="https://sundayselfie.app">Abrir Sunday Selfie</a>
+        <a class="secondary" id="store-link" href="https://sundayselfie.app">Descargar la app</a>
+        <div class="desktop-store" id="desktop-store" hidden>
+          <a class="secondary" href="https://apps.apple.com/search?term=Sunday%20Selfie">App Store</a>
+          <a class="secondary" href="https://play.google.com/store/apps/details?id=app.sundayselfie">Google Play</a>
+        </div>
+      </div>
+      <p class="hint" id="hint">Si la app no se abre, usa el botón de descarga.</p>
+    </main>
+    <script>
+      const APP_STORE_URL = "https://apps.apple.com/search?term=Sunday%20Selfie";
+      const PLAY_STORE_URL =
+        "https://play.google.com/store/apps/details?id=app.sundayselfie";
+
+      const userAgent = window.navigator.userAgent || "";
+      const isAndroid = /Android/i.test(userAgent);
+      const isIos = /iPhone|iPad|iPod/i.test(userAgent);
+      const segments = window.location.pathname.split("/").filter(Boolean);
+      const inviteCode = segments.length >= 2 ? decodeURIComponent(segments[1]) : "";
+      const inviteUrl = window.location.href;
+      const storeUrl = isAndroid ? PLAY_STORE_URL : isIos ? APP_STORE_URL : "";
+
+      document.getElementById("open-app").href = inviteUrl;
+      document.getElementById("invite-code").textContent = inviteCode
+        ? `Código: ${inviteCode}`
+        : "Invitación no encontrada";
+      document.getElementById("intro").textContent = inviteCode
+        ? "Si tienes la app instalada, este enlace abrirá la solicitud del grupo."
+        : "No hemos encontrado un código válido en este enlace.";
+
+      if (storeUrl) {
+        const storeLink = document.getElementById("store-link");
+        storeLink.href = storeUrl;
+        storeLink.textContent = isAndroid
+          ? "Descargar en Google Play"
+          : "Descargar en App Store";
+
+        window.setTimeout(() => {
+          window.location.href = storeUrl;
+        }, 1800);
+      } else {
+        document.getElementById("store-link").hidden = true;
+        document.getElementById("desktop-store").hidden = false;
+        document.getElementById("hint").textContent =
+          "Abre este enlace desde tu móvil para continuar con la invitación.";
+      }
+    </script>
+  </body>
+</html>

@@ -41,3 +41,8 @@ Pruebas de Flutter:
 ```
 
 No es necesario ejecutar un deploy para ninguna de estas comprobaciones.
+
+## Seguridad
+
+Consulta [SECURITY.md](SECURITY.md) antes de desplegar cambios de Firebase,
+App Check o claves de configuracion.

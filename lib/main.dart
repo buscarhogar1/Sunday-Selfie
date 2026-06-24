@@ -4,25 +4,344 @@ import 'dart:math' as math;
 import 'dart:ui';
 import 'dart:convert';
 
+import 'package:app_links/app_links.dart';
 import 'package:camera/camera.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_app_check/firebase_app_check.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:cloud_functions/cloud_functions.dart';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:image/image.dart' as image_lib;
 import 'package:image_picker/image_picker.dart' as image_picker;
+import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import 'firebase_options.dart';
 
+final GlobalKey<NavigatorState> sundayNavigatorKey =
+    GlobalKey<NavigatorState>();
+const MethodChannel foregroundNotificationChannel = MethodChannel(
+  'sunday_selfie/foreground_notifications',
+);
+const MethodChannel mediaSaverChannel = MethodChannel(
+  'sunday_selfie/media_saver',
+);
+
+void logDebug(String message) {
+  if (kDebugMode) {
+    debugPrint(message);
+  }
+}
+
+class LocalPhotoCache {
+  LocalPhotoCache._();
+
+  static final LocalPhotoCache instance = LocalPhotoCache._();
+
+  final Map<String, Future<File?>> _inFlightDownloads = {};
+  final Map<String, File> _readyFiles = {};
+  Directory? _cacheDirectory;
+
+  bool get isSupported =>
+      !kIsWeb &&
+      (Platform.isAndroid ||
+          Platform.isIOS ||
+          Platform.isMacOS ||
+          Platform.isLinux ||
+          Platform.isWindows);
+
+  Future<Directory?> _directory() async {
+    if (!isSupported) return null;
+    final cachedDirectory = _cacheDirectory;
+    if (cachedDirectory != null) return cachedDirectory;
+
+    try {
+      final documentsDirectory = await getApplicationDocumentsDirectory();
+      final directory = Directory(
+        '${documentsDirectory.path}/sunday_photo_cache',
+      );
+      if (!await directory.exists()) {
+        await directory.create(recursive: true);
+      }
+      _cacheDirectory = directory;
+      return directory;
+    } catch (error) {
+      logDebug('No se pudo abrir la caché local de fotos: $error');
+      return null;
+    }
+  }
+
+  String _fileNameForUrl(String url, String variant) {
+    final digest = sha1.convert(utf8.encode(url.trim())).toString();
+    return '${variant}_$digest.img';
+  }
+
+  Future<File?> getOrDownload(String url, {required String variant}) async {
+    final trimmedUrl = url.trim();
+    if (trimmedUrl.isEmpty) return null;
+
+    final directory = await _directory();
+    if (directory == null) return null;
+
+    final key = '$variant|$trimmedUrl';
+    final readyFile = _readyFiles[key];
+    if (readyFile != null) {
+      if (await readyFile.exists() && await readyFile.length() > 0) {
+        return readyFile;
+      }
+      _readyFiles.remove(key);
+    }
+
+    final file = File(
+      '${directory.path}/${_fileNameForUrl(trimmedUrl, variant)}',
+    );
+    if (await file.exists()) {
+      if (await file.length() > 0) {
+        _readyFiles[key] = file;
+        return file;
+      }
+      await file.delete();
+    }
+
+    final existingDownload = _inFlightDownloads[key];
+    if (existingDownload != null) return existingDownload;
+
+    final download = _downloadToFile(trimmedUrl, file);
+    _inFlightDownloads[key] = download;
+    try {
+      final downloadedFile = await download;
+      if (downloadedFile != null) {
+        _readyFiles[key] = downloadedFile;
+      }
+      return downloadedFile;
+    } finally {
+      _inFlightDownloads.remove(key);
+    }
+  }
+
+  Future<void> prefetch(String? url, {required String variant}) async {
+    final trimmedUrl = url?.trim();
+    if (trimmedUrl == null || trimmedUrl.isEmpty) return;
+    try {
+      await getOrDownload(trimmedUrl, variant: variant);
+    } catch (_) {
+      // Best-effort warming only; the visible widget will handle errors.
+    }
+  }
+
+  Future<File?> _downloadToFile(String url, File file) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.hasScheme) return null;
+
+    final tempFile = File('${file.path}.download');
+    final httpClient = HttpClient();
+    try {
+      final request = await httpClient.getUrl(uri);
+      final response = await request.close();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return null;
+      }
+
+      final bytes = await consolidateHttpClientResponseBytes(response);
+      await tempFile.writeAsBytes(bytes, flush: true);
+      if (await file.exists()) await file.delete();
+      await tempFile.rename(file.path);
+      return file;
+    } catch (error) {
+      logDebug('No se pudo descargar la foto en caché: $error');
+      if (await tempFile.exists()) {
+        await tempFile.delete();
+      }
+      return null;
+    } finally {
+      httpClient.close(force: true);
+    }
+  }
+
+  Future<int> clear() async {
+    final directory = await _directory();
+    if (directory == null || !await directory.exists()) return 0;
+
+    var deletedCount = 0;
+    await for (final entity in directory.list(followLinks: false)) {
+      try {
+        if (entity is File) {
+          await entity.delete();
+          deletedCount += 1;
+        } else if (entity is Directory) {
+          await entity.delete(recursive: true);
+          deletedCount += 1;
+        }
+      } catch (error) {
+        logDebug('No se pudo borrar un archivo de caché: $error');
+      }
+    }
+
+    PaintingBinding.instance.imageCache.clear();
+    PaintingBinding.instance.imageCache.clearLiveImages();
+    _readyFiles.clear();
+    return deletedCount;
+  }
+}
+
+class CachedRemoteImage extends StatefulWidget {
+  final String imageUrl;
+  final String cacheVariant;
+  final BoxFit fit;
+  final double? width;
+  final double? height;
+  final AlignmentGeometry alignment;
+  final FilterQuality filterQuality;
+  final bool gaplessPlayback;
+  final String? semanticLabel;
+  final Widget? loadingWidget;
+  final Widget? errorWidget;
+
+  const CachedRemoteImage({
+    super.key,
+    required this.imageUrl,
+    required this.cacheVariant,
+    this.fit = BoxFit.cover,
+    this.width,
+    this.height,
+    this.alignment = Alignment.center,
+    this.filterQuality = FilterQuality.high,
+    this.gaplessPlayback = false,
+    this.semanticLabel,
+    this.loadingWidget,
+    this.errorWidget,
+  });
+
+  @override
+  State<CachedRemoteImage> createState() => _CachedRemoteImageState();
+}
+
+class _CachedRemoteImageState extends State<CachedRemoteImage> {
+  Future<File?>? fileFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    configureFuture();
+  }
+
+  @override
+  void didUpdateWidget(covariant CachedRemoteImage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.imageUrl != widget.imageUrl ||
+        oldWidget.cacheVariant != widget.cacheVariant) {
+      configureFuture();
+    }
+  }
+
+  void configureFuture() {
+    final trimmedUrl = widget.imageUrl.trim();
+    fileFuture = trimmedUrl.isEmpty
+        ? null
+        : LocalPhotoCache.instance.getOrDownload(
+            trimmedUrl,
+            variant: widget.cacheVariant,
+          );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final trimmedUrl = widget.imageUrl.trim();
+    if (trimmedUrl.isEmpty) {
+      return widget.errorWidget ?? const SizedBox.shrink();
+    }
+
+    final currentFuture = fileFuture;
+    if (currentFuture == null) {
+      return _networkFallback(trimmedUrl);
+    }
+
+    return FutureBuilder<File?>(
+      future: currentFuture,
+      builder: (context, snapshot) {
+        final file = snapshot.data;
+        if (file != null) {
+          return Image.file(
+            file,
+            width: widget.width,
+            height: widget.height,
+            fit: widget.fit,
+            alignment: widget.alignment,
+            filterQuality: widget.filterQuality,
+            gaplessPlayback: widget.gaplessPlayback,
+            semanticLabel: widget.semanticLabel,
+            errorBuilder: (_, _, _) =>
+                widget.errorWidget ?? const _ImageErrorFill(),
+          );
+        }
+
+        if (snapshot.connectionState != ConnectionState.done) {
+          return widget.loadingWidget ?? const _ImageLoadingFill();
+        }
+
+        return _networkFallback(trimmedUrl);
+      },
+    );
+  }
+
+  Widget _networkFallback(String url) {
+    return Image.network(
+      url,
+      width: widget.width,
+      height: widget.height,
+      fit: widget.fit,
+      alignment: widget.alignment,
+      filterQuality: widget.filterQuality,
+      gaplessPlayback: widget.gaplessPlayback,
+      semanticLabel: widget.semanticLabel,
+      loadingBuilder: (context, child, loadingProgress) {
+        if (loadingProgress == null) return child;
+        return widget.loadingWidget ?? const _ImageLoadingFill();
+      },
+      errorBuilder: (_, _, _) => widget.errorWidget ?? const _ImageErrorFill(),
+    );
+  }
+}
+
+void prefetchPostPhotoCache(
+  Map<String, dynamic> post, {
+  bool includeOriginal = false,
+}) {
+  final thumbUrl = (post['thumbUrl'] ?? post['imageUrl'] ?? '').toString();
+  if (thumbUrl.trim().isNotEmpty) {
+    unawaited(
+      LocalPhotoCache.instance.prefetch(thumbUrl, variant: 'thumbnail'),
+    );
+  }
+
+  final authorPhotoUrl = post['authorPhotoUrl'];
+  if (authorPhotoUrl is String && authorPhotoUrl.trim().isNotEmpty) {
+    unawaited(
+      LocalPhotoCache.instance.prefetch(authorPhotoUrl, variant: 'avatar'),
+    );
+  }
+
+  if (!includeOriginal) return;
+
+  final imageUrl = (post['imageUrl'] ?? thumbUrl).toString();
+  if (imageUrl.trim().isNotEmpty) {
+    unawaited(LocalPhotoCache.instance.prefetch(imageUrl, variant: 'original'));
+  }
+}
+
 const Color ssOrange = Color(0xFFF4A261);
+const Color ssOrangeChip = Color(0xE6F4A261);
 const Color ssOrangeDark = Color(0xFFE8884A);
 const Color ssOrangeLight = Color(0xFFFEF3E8);
 const Color ssOrangeMid = Color(0xFFFAD9B8);
@@ -35,6 +354,123 @@ const Color ssText2 = Color(0xFF6B6B70);
 const Color ssText3 = Color(0xFFAEAEB2);
 const Color ssBorder = Color(0xFFF0EBE3);
 const Color ssSeparator = Color(0xFFF5F0EB);
+const double ssHeaderActionSize = 48;
+const double ssHeaderActionTop = 2;
+const double ssHeaderBackIconSize = 24;
+const double ssHeaderBackStrokeFactor = 0.162;
+const double ssHeaderMoreIconSize = 19.2;
+const double ssHeaderMoreIconGapFactor = 0.16;
+const double ssHeaderTopPadding = 12;
+const TextStyle ssGroupHeaderSubtitleStyle = TextStyle(
+  color: ssText2,
+  fontSize: 17,
+  fontWeight: FontWeight.w800,
+  height: 1.15,
+);
+
+class SundayHeaderBackIcon extends StatelessWidget {
+  final double size;
+  final Color color;
+
+  const SundayHeaderBackIcon({
+    super.key,
+    this.size = ssHeaderBackIconSize,
+    this.color = ssOrange,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.square(
+      dimension: size,
+      child: CustomPaint(painter: _SundayHeaderBackIconPainter(color)),
+    );
+  }
+}
+
+class _SundayHeaderBackIconPainter extends CustomPainter {
+  final Color color;
+
+  const _SundayHeaderBackIconPainter(this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final stroke = size.shortestSide * ssHeaderBackStrokeFactor;
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+    final path = Path()
+      ..moveTo(size.width * 0.68, size.height * 0.18)
+      ..lineTo(size.width * 0.39, size.height * 0.44)
+      ..quadraticBezierTo(
+        size.width * 0.27,
+        size.height * 0.50,
+        size.width * 0.39,
+        size.height * 0.56,
+      )
+      ..lineTo(size.width * 0.68, size.height * 0.82);
+
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _SundayHeaderBackIconPainter oldDelegate) {
+    return oldDelegate.color != color;
+  }
+}
+
+class SundayHeaderMoreIcon extends StatelessWidget {
+  final double size;
+  final Color color;
+
+  const SundayHeaderMoreIcon({
+    super.key,
+    this.size = ssHeaderMoreIconSize,
+    this.color = ssOrange,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.square(
+      dimension: size,
+      child: CustomPaint(painter: _SundayHeaderMoreIconPainter(color)),
+    );
+  }
+}
+
+class _SundayHeaderMoreIconPainter extends CustomPainter {
+  final Color color;
+
+  const _SundayHeaderMoreIconPainter(this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final dotSize = size.shortestSide * 0.28;
+    final gap = size.shortestSide * ssHeaderMoreIconGapFactor;
+    final totalHeight = dotSize * 3 + gap * 2;
+    final left = (size.width - dotSize) / 2;
+    var top = (size.height - totalHeight) / 2;
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.fill;
+
+    for (var index = 0; index < 3; index += 1) {
+      final rect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(left, top, dotSize, dotSize),
+        Radius.circular(dotSize * 0.32),
+      );
+      canvas.drawRRect(rect, paint);
+      top += dotSize + gap;
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _SundayHeaderMoreIconPainter oldDelegate) {
+    return oldDelegate.color != color;
+  }
+}
 
 const String kSundaySelfieLogoMarkBase64 =
     'iVBORw0KGgoAAAANSUhEUgAAAQsAAAEYCAYAAABLF9NnAABf6UlEQVR4nO29d5wdV3n//3nOOTNz264k27KNbVwBY5kaTC/GdEJo'
@@ -372,9 +808,81 @@ const String kGoogleGLogoPngBase64 =
 
 const String kGoogleServerClientId =
     '1034344193488-b1ahotfvo55t8br81e03m6fp1a9i4hq6.apps.googleusercontent.com';
+const String kRewardedBuzzAdUnitAndroid = String.fromEnvironment(
+  'SUNDAY_REWARDED_BUZZ_AD_UNIT_ANDROID',
+  defaultValue: 'ca-app-pub-3940256099942544/5224354917',
+);
+const String kRewardedBuzzAdUnitIos = String.fromEnvironment(
+  'SUNDAY_REWARDED_BUZZ_AD_UNIT_IOS',
+  defaultValue: 'ca-app-pub-3940256099942544/1712485313',
+);
 
 extension FirstOrNullExtension<T> on Iterable<T> {
   T? get firstOrNull => isEmpty ? null : first;
+}
+
+DateTime inicioDiaLocal(DateTime date) {
+  return DateTime(date.year, date.month, date.day);
+}
+
+DateTime proximoRefrescoCambioDeDia(DateTime now) {
+  return DateTime(
+    now.year,
+    now.month,
+    now.day + 1,
+  ).add(const Duration(milliseconds: 250));
+}
+
+class SundayClock extends ChangeNotifier with WidgetsBindingObserver {
+  Timer? _timer;
+
+  SundayClock() {
+    WidgetsBinding.instance.addObserver(this);
+    _scheduleNextDayRefresh();
+  }
+
+  void refresh() {
+    notifyListeners();
+    _scheduleNextDayRefresh();
+  }
+
+  void _scheduleNextDayRefresh() {
+    _timer?.cancel();
+    final now = DateTime.now();
+    final delay = proximoRefrescoCambioDeDia(now).difference(now);
+    _timer = Timer(delay.isNegative ? Duration.zero : delay, _handleDayRefresh);
+  }
+
+  void _handleDayRefresh() {
+    notifyListeners();
+    _scheduleNextDayRefresh();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      refresh();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _timer?.cancel();
+    super.dispose();
+  }
+}
+
+class SundayClockScope extends InheritedNotifier<SundayClock> {
+  const SundayClockScope({
+    super.key,
+    required SundayClock clock,
+    required super.child,
+  }) : super(notifier: clock);
+
+  static void watch(BuildContext context) {
+    context.dependOnInheritedWidgetOfExactType<SundayClockScope>();
+  }
 }
 
 Future<void> main() async {
@@ -384,27 +892,45 @@ Future<void> main() async {
     DeviceOrientation.portraitDown,
   ]);
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  await FirebaseAppCheck.instance.activate(
+    providerAndroid: kDebugMode
+        ? const AndroidDebugProvider()
+        : const AndroidPlayIntegrityProvider(),
+    providerApple: kDebugMode
+        ? const AppleDebugProvider()
+        : const AppleAppAttestWithDeviceCheckFallbackProvider(),
+  );
+  if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
+    unawaited(MobileAds.instance.initialize());
+  }
 
   runApp(const MyApp());
 }
 
 Future<void> crearUsuarioSiNoExiste(User user) async {
   final userRef = FirebaseFirestore.instance.collection('users').doc(user.uid);
+  final authDisplayName = user.displayName?.trim();
+  final initialBaseName = authDisplayName != null && authDisplayName.isNotEmpty
+      ? formatUserDisplayName(authDisplayName)
+      : 'Usuario';
+  final authPhotoUrl = user.photoURL?.trim();
+  final initialBasePhotoUrl = authPhotoUrl != null && authPhotoUrl.isNotEmpty
+      ? authPhotoUrl
+      : null;
 
   await FirebaseFirestore.instance.runTransaction((transaction) async {
     final userDoc = await transaction.get(userRef);
 
     if (!userDoc.exists) {
       transaction.set(userRef, {
-        'baseName': 'Usuario',
-        'basePhotoUrl': null,
+        'baseName': initialBaseName,
+        'basePhotoUrl': initialBasePhotoUrl,
         'createdAt': FieldValue.serverTimestamp(),
         'lastActiveAt': FieldValue.serverTimestamp(),
         'profileOnboardingCompleted': false,
         'profileOnboardingCompletedAt': null,
-        'profileFilterApplied': false,
         'notificationSettings': kDefaultNotificationSettings,
-        'notificationSettingsDefaultsVersion': 2,
+        'notificationSettingsDefaultsVersion': 3,
       });
     } else {
       final data = userDoc.data();
@@ -419,13 +945,26 @@ Future<void> crearUsuarioSiNoExiste(User user) async {
 
       if (data == null || data['notificationSettings'] is! Map) {
         updates['notificationSettings'] = kDefaultNotificationSettings;
-        updates['notificationSettingsDefaultsVersion'] = 2;
-      } else if (data['notificationSettingsDefaultsVersion'] != 2) {
-        updates['notificationSettings.newMembersEnabled'] = true;
-        updates['notificationSettings.weeklySummaryEnabled'] = false;
-        updates['notificationSettings.soundEnabled'] = true;
-        updates['notificationSettings.vibrationEnabled'] = true;
-        updates['notificationSettingsDefaultsVersion'] = 2;
+        updates['notificationSettingsDefaultsVersion'] = 3;
+      } else if (data['notificationSettingsDefaultsVersion'] != 3) {
+        final rawSettings = data['notificationSettings'];
+        final settings = rawSettings is Map ? rawSettings : const {};
+        if (settings['newMembersEnabled'] is! bool) {
+          updates['notificationSettings.newMembersEnabled'] = true;
+        }
+        if (settings['weeklySummaryEnabled'] is! bool) {
+          updates['notificationSettings.weeklySummaryEnabled'] = false;
+        }
+        if (settings['soundEnabled'] is! bool) {
+          updates['notificationSettings.soundEnabled'] = true;
+        }
+        if (settings['vibrationEnabled'] is! bool) {
+          updates['notificationSettings.vibrationEnabled'] = true;
+        }
+        if (settings['chatMessagesEnabled'] is! bool) {
+          updates['notificationSettings.chatMessagesEnabled'] = false;
+        }
+        updates['notificationSettingsDefaultsVersion'] = 3;
       }
 
       transaction.update(userRef, updates);
@@ -440,7 +979,8 @@ Future<void> crearUsuarioSiNoExiste(User user) async {
     final effectiveName = rawName is String && rawName.trim().isNotEmpty
         ? rawName.trim()
         : null;
-    final effectivePhotoUrl = rawPhotoUrl is String && rawPhotoUrl.trim().isNotEmpty
+    final effectivePhotoUrl =
+        rawPhotoUrl is String && rawPhotoUrl.trim().isNotEmpty
         ? rawPhotoUrl.trim()
         : null;
 
@@ -450,7 +990,7 @@ Future<void> crearUsuarioSiNoExiste(User user) async {
       effectivePhotoUrl: effectivePhotoUrl,
     );
   } catch (error) {
-    debugPrint('No se pudo sincronizar el perfil con los grupos: $error');
+    logDebug('No se pudo sincronizar el perfil con los grupos: $error');
   }
 }
 
@@ -469,7 +1009,7 @@ Future<void> actualizarNombreUsuario(User user, String nuevoNombre) async {
   try {
     await user.updateDisplayName(trimmedName);
   } catch (error) {
-    debugPrint('No se pudo actualizar el nombre en Auth: $error');
+    logDebug('No se pudo actualizar el nombre en Auth: $error');
   }
 
   try {
@@ -478,7 +1018,22 @@ Future<void> actualizarNombreUsuario(User user, String nuevoNombre) async {
       effectiveName: trimmedName,
     );
   } catch (error) {
-    debugPrint('No se pudo propagar el nombre a los grupos: $error');
+    logDebug('No se pudo propagar el nombre a los grupos: $error');
+  }
+}
+
+Future<void> borrarFotoPerfilAnterior(String? storagePath) async {
+  final trimmedPath = storagePath?.trim();
+  if (trimmedPath == null || trimmedPath.isEmpty) return;
+
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'borrarFotoPerfilAnterior',
+    );
+
+    await callable.call<void>({'storagePath': trimmedPath});
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo borrar la foto anterior');
   }
 }
 
@@ -491,6 +1046,8 @@ Future<String> actualizarFotoPerfilUsuario({
     throw Exception('La foto de perfil solo se puede cambiar los domingos');
   }
 
+  await validarFotoSelfie(foto);
+
   final firestore = FirebaseFirestore.instance;
   final storage = FirebaseStorage.instance;
   final timestamp = DateTime.now().millisecondsSinceEpoch;
@@ -501,11 +1058,7 @@ Future<String> actualizarFotoPerfilUsuario({
     File(foto.path),
     SettableMetadata(
       contentType: 'image/jpeg',
-      customMetadata: {
-        'uid': user.uid,
-        'kind': 'profilePhoto',
-        'filter': 'sundaySelfie_v1',
-      },
+      customMetadata: {'uid': user.uid, 'kind': 'profilePhoto'},
     ),
   );
 
@@ -514,8 +1067,6 @@ Future<String> actualizarFotoPerfilUsuario({
   await firestore.collection('users').doc(user.uid).set({
     'basePhotoUrl': downloadUrl,
     'profilePhotoStoragePath': storagePath,
-    'profileFilterApplied': true,
-    'profileFilterVersion': 'sundaySelfie_v1',
     'profilePhotoUpdatedAt': FieldValue.serverTimestamp(),
     'lastActiveAt': FieldValue.serverTimestamp(),
   }, SetOptions(merge: true));
@@ -523,7 +1074,7 @@ Future<String> actualizarFotoPerfilUsuario({
   try {
     await user.updatePhotoURL(downloadUrl);
   } catch (error) {
-    debugPrint('No se pudo actualizar la foto en Auth: $error');
+    logDebug('No se pudo actualizar la foto en Auth: $error');
   }
 
   try {
@@ -532,19 +1083,59 @@ Future<String> actualizarFotoPerfilUsuario({
       effectivePhotoUrl: downloadUrl,
     );
   } catch (error) {
-    debugPrint('No se pudo propagar la foto a los grupos: $error');
+    logDebug('No se pudo propagar la foto a los grupos: $error');
   }
 
   final oldPath = previousStoragePath?.trim();
   if (oldPath != null && oldPath.isNotEmpty && oldPath != storagePath) {
-    try {
-      await storage.ref().child(oldPath).delete();
-    } catch (error) {
-      debugPrint('No se pudo borrar la foto anterior: $error');
-    }
+    await borrarFotoPerfilAnterior(oldPath);
   }
 
   return downloadUrl;
+}
+
+Future<void> reemplazarFotoPerfilConSelfie({
+  required User user,
+  required String selfieUrl,
+}) async {
+  final trimmedUrl = selfieUrl.trim();
+  if (trimmedUrl.isEmpty) {
+    throw Exception('Esta selfie no tiene una imagen disponible');
+  }
+
+  final firestore = FirebaseFirestore.instance;
+  final userRef = firestore.collection('users').doc(user.uid);
+  final userSnapshot = await userRef.get();
+  final previousStoragePath = userSnapshot
+      .data()?['profilePhotoStoragePath']
+      ?.toString()
+      .trim();
+
+  await userRef.set({
+    'basePhotoUrl': trimmedUrl,
+    'profilePhotoStoragePath': FieldValue.delete(),
+    'profilePhotoUpdatedAt': FieldValue.serverTimestamp(),
+    'lastActiveAt': FieldValue.serverTimestamp(),
+  }, SetOptions(merge: true));
+
+  try {
+    await user.updatePhotoURL(trimmedUrl);
+  } catch (error) {
+    logDebug('No se pudo actualizar la foto en Auth: $error');
+  }
+
+  try {
+    await propagarPerfilUsuarioAGrupos(
+      uid: user.uid,
+      effectivePhotoUrl: trimmedUrl,
+    );
+  } catch (error) {
+    logDebug('No se pudo propagar la foto a los grupos: $error');
+  }
+
+  if (previousStoragePath != null && previousStoragePath.isNotEmpty) {
+    await borrarFotoPerfilAnterior(previousStoragePath);
+  }
 }
 
 Future<void> propagarPerfilUsuarioAGrupos({
@@ -552,20 +1143,11 @@ Future<void> propagarPerfilUsuarioAGrupos({
   String? effectiveName,
   String? effectivePhotoUrl,
 }) async {
-  final updates = <String, dynamic>{};
-
   final trimmedName = effectiveName?.trim();
-  if (trimmedName != null && trimmedName.isNotEmpty) {
-    updates['effectiveName'] = trimmedName;
-  }
+  final shouldSyncName = trimmedName != null && trimmedName.isNotEmpty;
+  final shouldSyncPhoto = effectivePhotoUrl != null;
 
-  if (effectivePhotoUrl != null) {
-    updates['effectivePhotoUrl'] = effectivePhotoUrl;
-  }
-
-  if (updates.isEmpty) return;
-
-  updates['profileSyncedAt'] = FieldValue.serverTimestamp();
+  if (!shouldSyncName && !shouldSyncPhoto) return;
 
   final firestore = FirebaseFirestore.instance;
   final userGroupsSnapshot = await firestore
@@ -599,7 +1181,29 @@ Future<void> propagarPerfilUsuarioAGrupos({
         .collection('members')
         .doc(uid);
 
-    batch.set(memberRef, updates, SetOptions(merge: true));
+    final memberUpdates = <String, dynamic>{};
+
+    if (shouldSyncName) {
+      final memberDoc = await memberRef.get();
+      if (!memberDoc.exists) continue;
+
+      final groupNameOverride = nonEmptyStringOrNull(
+        memberDoc.data()?['groupNameOverride'],
+      );
+      if (groupNameOverride == null) {
+        memberUpdates['effectiveName'] = trimmedName;
+      }
+    }
+
+    if (shouldSyncPhoto) {
+      memberUpdates['effectivePhotoUrl'] = effectivePhotoUrl;
+    }
+
+    if (memberUpdates.isEmpty) continue;
+
+    memberUpdates['profileSyncedAt'] = FieldValue.serverTimestamp();
+
+    batch.set(memberRef, memberUpdates, SetOptions(merge: true));
     batchCount += 1;
     await commitIfNeeded();
   }
@@ -623,11 +1227,9 @@ Future<void> marcarActividadGrupo({required String groupId}) async {
     batchCount = 0;
   }
 
-  batch.set(
-    groupRef,
-    {'lastActivityAt': FieldValue.serverTimestamp()},
-    SetOptions(merge: true),
-  );
+  batch.set(groupRef, {
+    'lastActivityAt': FieldValue.serverTimestamp(),
+  }, SetOptions(merge: true));
   batchCount += 1;
 
   for (final memberDoc in membersSnapshot.docs) {
@@ -637,14 +1239,10 @@ Future<void> marcarActividadGrupo({required String groupId}) async {
         .collection('groups')
         .doc(groupId);
 
-    batch.set(
-      userGroupRef,
-      {
-        'groupId': groupId,
-        'lastActivityAt': FieldValue.serverTimestamp(),
-      },
-      SetOptions(merge: true),
-    );
+    batch.set(userGroupRef, {
+      'groupId': groupId,
+      'lastActivityAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
     batchCount += 1;
     await commitIfNeeded();
   }
@@ -663,6 +1261,8 @@ Future<void> actualizarPerfilInicialUsuario({
     throw Exception('El nombre no puede estar vacío');
   }
 
+  await validarFotoSelfie(foto);
+
   final firestore = FirebaseFirestore.instance;
   final storage = FirebaseStorage.instance;
   final timestamp = DateTime.now().millisecondsSinceEpoch;
@@ -673,11 +1273,7 @@ Future<void> actualizarPerfilInicialUsuario({
     File(foto.path),
     SettableMetadata(
       contentType: 'image/jpeg',
-      customMetadata: {
-        'uid': user.uid,
-        'kind': 'profilePhoto',
-        'filter': 'sundaySelfie_v1',
-      },
+      customMetadata: {'uid': user.uid, 'kind': 'profilePhoto'},
     ),
   );
 
@@ -687,8 +1283,6 @@ Future<void> actualizarPerfilInicialUsuario({
     'baseName': trimmedName,
     'basePhotoUrl': downloadUrl,
     'profilePhotoStoragePath': storagePath,
-    'profileFilterApplied': true,
-    'profileFilterVersion': 'sundaySelfie_v1',
     'profileOnboardingCompleted': true,
     'profileOnboardingCompletedAt': FieldValue.serverTimestamp(),
     'lastActiveAt': FieldValue.serverTimestamp(),
@@ -698,7 +1292,7 @@ Future<void> actualizarPerfilInicialUsuario({
     await user.updateDisplayName(trimmedName);
     await user.updatePhotoURL(downloadUrl);
   } catch (error) {
-    debugPrint('No se pudo actualizar el perfil Auth: $error');
+    logDebug('No se pudo actualizar el perfil Auth: $error');
   }
 }
 
@@ -728,18 +1322,4451 @@ const Map<String, bool> kDefaultNotificationSettings = {
   'reactionsEnabled': true,
   'newMembersEnabled': true,
   'weeklySummaryEnabled': false,
+  'chatMessagesEnabled': false,
   'soundEnabled': true,
   'vibrationEnabled': true,
 };
 
-const List<String> kSundayReactionEmojis = [
-  '❤️', '😂', '😍', '🔥', '👏', '🙌', '🥰', '😎', '😊', '😄',
-  '🥳', '🤩', '😮', '😢', '😭', '😜', '😇', '🤗', '😋', '😆',
-  '👍', '👎', '💪', '🙏', '🤝', '👌', '✌️', '🫶', '💯', '✨',
-  '⭐', '🌟', '💫', '🌞', '🌈', '🎉', '🎊', '🏆', '🥇', '👑',
-  '🐶', '🐱', '🐵', '🦄', '🍕', '🍔', '🍟', '🍩', '🍰', '☕',
-  '🏖️', '✈️', '🏠', '💼', '🎓', '⚽', '🏀', '🎾', '🎮', '🎵',
+const Set<String> kForegroundLocalNotificationTypes = {
+  'friend_reminder',
+  'join_request',
+  'join_accepted',
+  'chat_message',
+};
+
+const String kSelfieNotPortraitMessage =
+    'La foto debe ser vertical. Haz o elige una foto en vertical.';
+const String kSelfieNoFaceMessage =
+    'La foto no es selfie. Debes realizar un selfie.';
+const String kSelfieValidationFailedMessage =
+    'No se pudo comprobar la foto. Inténtalo de nuevo.';
+const String kSelfieTooLargeMessage =
+    'La foto pesa demasiado. Haz otro selfie e inténtalo de nuevo.';
+const int kSelfieUploadMaxBytes = 9 * 1024 * 1024;
+const int kSelfieUploadMaxLongEdge = 1920;
+const int kSelfieUploadJpegQuality = 88;
+const int kSelfieThumbnailMaxLongEdge = 720;
+const int kSelfieThumbnailJpegQuality = 82;
+
+final Set<String> _validatedSelfiePhotoPaths = <String>{};
+
+class SelfiePhotoValidationException implements Exception {
+  final String message;
+
+  const SelfiePhotoValidationException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+Map<String, int>? _decodeOrientedImageSize(Uint8List bytes) {
+  final decodedImage = image_lib.decodeImage(bytes);
+  if (decodedImage == null) return null;
+
+  return <String, int>{
+    'width': decodedImage.width,
+    'height': decodedImage.height,
+  };
+}
+
+Uint8List? _createSelfieThumbnailBytes(Uint8List bytes) {
+  final decodedImage = image_lib.decodeImage(bytes);
+  if (decodedImage == null) return null;
+
+  final orientedImage = image_lib.bakeOrientation(decodedImage);
+  final width = orientedImage.width;
+  final height = orientedImage.height;
+  final longestEdge = math.max(width, height);
+  if (width <= 0 || height <= 0 || longestEdge <= 0) return null;
+
+  final image_lib.Image resizedImage;
+  if (longestEdge <= kSelfieThumbnailMaxLongEdge) {
+    resizedImage = orientedImage;
+  } else if (height >= width) {
+    resizedImage = image_lib.copyResize(
+      orientedImage,
+      height: kSelfieThumbnailMaxLongEdge,
+      interpolation: image_lib.Interpolation.average,
+    );
+  } else {
+    resizedImage = image_lib.copyResize(
+      orientedImage,
+      width: kSelfieThumbnailMaxLongEdge,
+      interpolation: image_lib.Interpolation.average,
+    );
+  }
+
+  return Uint8List.fromList(
+    image_lib.encodeJpg(resizedImage, quality: kSelfieThumbnailJpegQuality),
+  );
+}
+
+Uint8List? _createSelfieUploadBytes(Uint8List bytes) {
+  final decodedImage = image_lib.decodeImage(bytes);
+  if (decodedImage == null) return null;
+
+  final orientedImage = image_lib.bakeOrientation(decodedImage);
+  final width = orientedImage.width;
+  final height = orientedImage.height;
+  final longestEdge = math.max(width, height);
+  if (width <= 0 || height <= 0 || longestEdge <= 0) return null;
+
+  image_lib.Image resizedImage = orientedImage;
+  if (longestEdge > kSelfieUploadMaxLongEdge) {
+    resizedImage = height >= width
+        ? image_lib.copyResize(
+            orientedImage,
+            height: kSelfieUploadMaxLongEdge,
+            interpolation: image_lib.Interpolation.average,
+          )
+        : image_lib.copyResize(
+            orientedImage,
+            width: kSelfieUploadMaxLongEdge,
+            interpolation: image_lib.Interpolation.average,
+          );
+  }
+
+  Uint8List? smallestBytes;
+  for (final quality in const [kSelfieUploadJpegQuality, 82, 76, 70]) {
+    final encoded = Uint8List.fromList(
+      image_lib.encodeJpg(resizedImage, quality: quality),
+    );
+    smallestBytes = encoded;
+    if (encoded.length <= kSelfieUploadMaxBytes) return encoded;
+  }
+
+  if (math.max(resizedImage.width, resizedImage.height) > 1280) {
+    resizedImage = resizedImage.height >= resizedImage.width
+        ? image_lib.copyResize(
+            resizedImage,
+            height: 1280,
+            interpolation: image_lib.Interpolation.average,
+          )
+        : image_lib.copyResize(
+            resizedImage,
+            width: 1280,
+            interpolation: image_lib.Interpolation.average,
+          );
+    smallestBytes = Uint8List.fromList(
+      image_lib.encodeJpg(resizedImage, quality: 82),
+    );
+  }
+
+  return smallestBytes;
+}
+
+String _safeTempFilePart(String value) {
+  return value
+      .replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_')
+      .replaceAll(RegExp(r'_+'), '_')
+      .trim();
+}
+
+Future<File> _prepararArchivoSelfieParaSubidaTemporal({
+  required XFile foto,
+  required String groupId,
+  required String weekKey,
+  required String uid,
+}) async {
+  final originalFile = File(foto.path);
+  final originalExists = await originalFile.exists();
+  final originalLength = originalExists
+      ? await originalFile.length()
+      : await foto.length();
+
+  if (originalExists &&
+      originalLength > 0 &&
+      originalLength <= kSelfieUploadMaxBytes) {
+    return originalFile;
+  }
+
+  final bytes = await foto.readAsBytes();
+  final uploadBytes = await compute<Uint8List, Uint8List?>(
+    _createSelfieUploadBytes,
+    bytes,
+  );
+
+  if (uploadBytes == null || uploadBytes.isEmpty) {
+    throw const SelfiePhotoValidationException(kSelfieValidationFailedMessage);
+  }
+
+  if (uploadBytes.length > kSelfieUploadMaxBytes) {
+    throw const SelfiePhotoValidationException(kSelfieTooLargeMessage);
+  }
+
+  final safeGroupId = _safeTempFilePart(groupId);
+  final safeWeekKey = _safeTempFilePart(weekKey);
+  final safeUid = _safeTempFilePart(uid);
+  final timestamp = DateTime.now().microsecondsSinceEpoch;
+  final file = File(
+    '${Directory.systemTemp.path}/sunday_upload_${safeGroupId}_${safeWeekKey}_${safeUid}_$timestamp.jpg',
+  );
+  await file.writeAsBytes(uploadBytes, flush: true);
+  return file;
+}
+
+Future<File?> crearMiniaturaSelfieTemporal({
+  required XFile foto,
+  required String groupId,
+  required String weekKey,
+  required String uid,
+}) async {
+  final bytes = await foto.readAsBytes();
+  final thumbnailBytes = await compute<Uint8List, Uint8List?>(
+    _createSelfieThumbnailBytes,
+    bytes,
+  );
+  if (thumbnailBytes == null || thumbnailBytes.isEmpty) return null;
+
+  final safeGroupId = _safeTempFilePart(groupId);
+  final safeWeekKey = _safeTempFilePart(weekKey);
+  final safeUid = _safeTempFilePart(uid);
+  final timestamp = DateTime.now().microsecondsSinceEpoch;
+  final file = File(
+    '${Directory.systemTemp.path}/sunday_thumb_${safeGroupId}_${safeWeekKey}_${safeUid}_$timestamp.jpg',
+  );
+  await file.writeAsBytes(thumbnailBytes, flush: true);
+  return file;
+}
+
+Future<void> validarFotoSelfie(XFile foto) async {
+  final cacheKey = foto.path.trim();
+  if (cacheKey.isNotEmpty && _validatedSelfiePhotoPaths.contains(cacheKey)) {
+    return;
+  }
+
+  final bytes = await foto.readAsBytes();
+  final dimensions = await compute<Uint8List, Map<String, int>?>(
+    _decodeOrientedImageSize,
+    bytes,
+  );
+
+  final width = dimensions?['width'] ?? 0;
+  final height = dimensions?['height'] ?? 0;
+
+  if (width <= 0 || height <= 0) {
+    throw const SelfiePhotoValidationException(kSelfieValidationFailedMessage);
+  }
+
+  if (height <= width) {
+    throw const SelfiePhotoValidationException(kSelfieNotPortraitMessage);
+  }
+
+  final detector = FaceDetector(
+    options: FaceDetectorOptions(
+      performanceMode: FaceDetectorMode.fast,
+      enableClassification: false,
+      enableContours: false,
+      enableLandmarks: false,
+      enableTracking: false,
+      minFaceSize: 0.08,
+    ),
+  );
+
+  try {
+    final faces = await detector.processImage(
+      InputImage.fromFilePath(foto.path),
+    );
+    if (faces.isEmpty) {
+      throw const SelfiePhotoValidationException(kSelfieNoFaceMessage);
+    }
+
+    if (cacheKey.isNotEmpty) {
+      _validatedSelfiePhotoPaths.add(cacheKey);
+    }
+  } on SelfiePhotoValidationException {
+    rethrow;
+  } on MissingPluginException catch (error) {
+    logDebug('Detector de caras no disponible: $error');
+    throw const SelfiePhotoValidationException(kSelfieValidationFailedMessage);
+  } on PlatformException catch (error) {
+    logDebug('No se pudo validar la foto con ML Kit: $error');
+    throw const SelfiePhotoValidationException(kSelfieValidationFailedMessage);
+  } finally {
+    await detector.close();
+  }
+}
+
+Future<bool> validarFotoSelfieParaSubida(
+  BuildContext context,
+  XFile foto,
+) async {
+  try {
+    await validarFotoSelfie(foto);
+    return true;
+  } on SelfiePhotoValidationException catch (error) {
+    if (context.mounted) showSundaySnack(context, error.message);
+    return false;
+  } catch (error) {
+    logDebug('No se pudo comprobar la foto: $error');
+    if (context.mounted) {
+      showSundaySnack(context, kSelfieValidationFailedMessage);
+    }
+    return false;
+  }
+}
+
+class EmojiReactionSection {
+  final String label;
+  final String icon;
+  final List<String> emojis;
+
+  const EmojiReactionSection({
+    required this.label,
+    required this.icon,
+    required this.emojis,
+  });
+}
+
+class EmojiReactionChoiceGroup {
+  final String key;
+  final String displayEmoji;
+  final List<String> variants;
+
+  const EmojiReactionChoiceGroup({
+    required this.key,
+    required this.displayEmoji,
+    required this.variants,
+  });
+}
+
+bool _isEmojiSkinToneModifier(int value) {
+  return value >= 0x1F3FB && value <= 0x1F3FF;
+}
+
+String emojiReactionGroupKey(String emoji) {
+  final cleanEmoji = normalizarEmojiReaccion(emoji);
+  if (cleanEmoji.isEmpty) return '';
+
+  final codePoints = cleanEmoji.runes
+      .where((value) => !_isEmojiSkinToneModifier(value))
+      .toList(growable: false);
+  final base = String.fromCharCodes(codePoints);
+  return normalizarEmojiReaccion(base).isEmpty ? cleanEmoji : base;
+}
+
+List<EmojiReactionChoiceGroup> agruparEmojisReaccion(List<String> emojis) {
+  final grouped = <String, List<String>>{};
+
+  for (final emoji in emojis) {
+    final cleanEmoji = normalizarEmojiReaccion(emoji);
+    if (cleanEmoji.isEmpty) continue;
+
+    final key = emojiReactionGroupKey(cleanEmoji);
+    if (key.isEmpty) continue;
+
+    final variants = grouped.putIfAbsent(key, () => []);
+    if (!variants.contains(cleanEmoji)) {
+      variants.add(cleanEmoji);
+    }
+  }
+
+  return grouped.entries
+      .map((entry) {
+        final variants = entry.value;
+        final displayEmoji = variants.contains(entry.key)
+            ? entry.key
+            : variants.first;
+
+        return EmojiReactionChoiceGroup(
+          key: entry.key,
+          displayEmoji: displayEmoji,
+          variants: List.unmodifiable(variants),
+        );
+      })
+      .toList(growable: false);
+}
+
+const List<EmojiReactionSection> kSundayReactionEmojiCategorySections = [
+  EmojiReactionSection(
+    label: 'Favoritos',
+    icon: '❤️',
+    emojis: [
+      '❤️',
+      '😂',
+      '😍',
+      '🔥',
+      '👏',
+      '🙌',
+      '🥰',
+      '😎',
+      '😊',
+      '😄',
+      '🥳',
+      '🤩',
+      '😮',
+      '😢',
+      '😭',
+      '😜',
+      '😇',
+      '🤗',
+      '😋',
+      '😆',
+      '👍',
+      '👎',
+      '💪',
+      '🙏',
+      '🤝',
+      '👌',
+      '✌️',
+      '🫶',
+      '💯',
+      '✨',
+      '⭐',
+      '🌟',
+      '💫',
+      '🌞',
+      '🌈',
+      '🎉',
+      '🎊',
+      '🏆',
+      '🥇',
+      '👑',
+      '📸',
+      '💅',
+      '🤌',
+      '🥹',
+      '🫠',
+      '🫡',
+      '🤯',
+      '😱',
+      '😳',
+      '😌',
+      '😏',
+      '🙃',
+      '😉',
+      '😘',
+      '💖',
+      '💘',
+      '💙',
+      '💚',
+      '💜',
+      '🖤',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Caras',
+    icon: '😀',
+    emojis: [
+      '😀',
+      '😃',
+      '😄',
+      '😁',
+      '😆',
+      '😅',
+      '🤣',
+      '😂',
+      '🙂',
+      '🙃',
+      '🫠',
+      '😉',
+      '😊',
+      '😇',
+      '🥰',
+      '😍',
+      '🤩',
+      '😘',
+      '😗',
+      '☺️',
+      '😚',
+      '😙',
+      '🥲',
+      '😋',
+      '😛',
+      '😜',
+      '🤪',
+      '😝',
+      '🤑',
+      '🤗',
+      '🤭',
+      '🫢',
+      '🫣',
+      '🤫',
+      '🤔',
+      '🫡',
+      '🤐',
+      '🤨',
+      '😐',
+      '😑',
+      '😶',
+      '🫥',
+      '😶‍🌫️',
+      '😏',
+      '😒',
+      '🙄',
+      '😬',
+      '😮‍💨',
+      '🤥',
+      '🫨',
+      '🙂‍↔️',
+      '🙂‍↕️',
+      '😌',
+      '😔',
+      '😪',
+      '🤤',
+      '😴',
+      '🫩',
+      '😷',
+      '🤒',
+      '🤕',
+      '🤢',
+      '🤮',
+      '🤧',
+      '🥵',
+      '🥶',
+      '🥴',
+      '😵',
+      '😵‍💫',
+      '🤯',
+      '🤠',
+      '🥳',
+      '🥸',
+      '😎',
+      '🤓',
+      '🧐',
+      '😕',
+      '🫤',
+      '😟',
+      '🙁',
+      '☹️',
+      '😮',
+      '😯',
+      '😲',
+      '😳',
+      '🫪',
+      '🥺',
+      '🥹',
+      '😦',
+      '😧',
+      '😨',
+      '😰',
+      '😥',
+      '😢',
+      '😭',
+      '😱',
+      '😖',
+      '😣',
+      '😞',
+      '😓',
+      '😩',
+      '😫',
+      '🥱',
+      '😤',
+      '😡',
+      '😠',
+      '🤬',
+      '😈',
+      '👿',
+      '💀',
+      '☠️',
+      '💩',
+      '🤡',
+      '👹',
+      '👺',
+      '👻',
+      '👽',
+      '👾',
+      '🤖',
+      '😺',
+      '😸',
+      '😹',
+      '😻',
+      '😼',
+      '😽',
+      '🙀',
+      '😿',
+      '😾',
+      '🙈',
+      '🙉',
+      '🙊',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Personas',
+    icon: '👍',
+    emojis: [
+      '👋',
+      '👋🏻',
+      '👋🏼',
+      '👋🏽',
+      '👋🏾',
+      '👋🏿',
+      '🤚',
+      '🤚🏻',
+      '🤚🏼',
+      '🤚🏽',
+      '🤚🏾',
+      '🤚🏿',
+      '🖐️',
+      '🖐🏻',
+      '🖐🏼',
+      '🖐🏽',
+      '🖐🏾',
+      '🖐🏿',
+      '✋',
+      '✋🏻',
+      '✋🏼',
+      '✋🏽',
+      '✋🏾',
+      '✋🏿',
+      '🖖',
+      '🖖🏻',
+      '🖖🏼',
+      '🖖🏽',
+      '🖖🏾',
+      '🖖🏿',
+      '🫱',
+      '🫱🏻',
+      '🫱🏼',
+      '🫱🏽',
+      '🫱🏾',
+      '🫱🏿',
+      '🫲',
+      '🫲🏻',
+      '🫲🏼',
+      '🫲🏽',
+      '🫲🏾',
+      '🫲🏿',
+      '🫳',
+      '🫳🏻',
+      '🫳🏼',
+      '🫳🏽',
+      '🫳🏾',
+      '🫳🏿',
+      '🫴',
+      '🫴🏻',
+      '🫴🏼',
+      '🫴🏽',
+      '🫴🏾',
+      '🫴🏿',
+      '🫷',
+      '🫷🏻',
+      '🫷🏼',
+      '🫷🏽',
+      '🫷🏾',
+      '🫷🏿',
+      '🫸',
+      '🫸🏻',
+      '🫸🏼',
+      '🫸🏽',
+      '🫸🏾',
+      '🫸🏿',
+      '👌',
+      '👌🏻',
+      '👌🏼',
+      '👌🏽',
+      '👌🏾',
+      '👌🏿',
+      '🤌',
+      '🤌🏻',
+      '🤌🏼',
+      '🤌🏽',
+      '🤌🏾',
+      '🤌🏿',
+      '🤏',
+      '🤏🏻',
+      '🤏🏼',
+      '🤏🏽',
+      '🤏🏾',
+      '🤏🏿',
+      '✌️',
+      '✌🏻',
+      '✌🏼',
+      '✌🏽',
+      '✌🏾',
+      '✌🏿',
+      '🤞',
+      '🤞🏻',
+      '🤞🏼',
+      '🤞🏽',
+      '🤞🏾',
+      '🤞🏿',
+      '🫰',
+      '🫰🏻',
+      '🫰🏼',
+      '🫰🏽',
+      '🫰🏾',
+      '🫰🏿',
+      '🤟',
+      '🤟🏻',
+      '🤟🏼',
+      '🤟🏽',
+      '🤟🏾',
+      '🤟🏿',
+      '🤘',
+      '🤘🏻',
+      '🤘🏼',
+      '🤘🏽',
+      '🤘🏾',
+      '🤘🏿',
+      '🤙',
+      '🤙🏻',
+      '🤙🏼',
+      '🤙🏽',
+      '🤙🏾',
+      '🤙🏿',
+      '👈',
+      '👈🏻',
+      '👈🏼',
+      '👈🏽',
+      '👈🏾',
+      '👈🏿',
+      '👉',
+      '👉🏻',
+      '👉🏼',
+      '👉🏽',
+      '👉🏾',
+      '👉🏿',
+      '👆',
+      '👆🏻',
+      '👆🏼',
+      '👆🏽',
+      '👆🏾',
+      '👆🏿',
+      '🖕',
+      '🖕🏻',
+      '🖕🏼',
+      '🖕🏽',
+      '🖕🏾',
+      '🖕🏿',
+      '👇',
+      '👇🏻',
+      '👇🏼',
+      '👇🏽',
+      '👇🏾',
+      '👇🏿',
+      '☝️',
+      '☝🏻',
+      '☝🏼',
+      '☝🏽',
+      '☝🏾',
+      '☝🏿',
+      '🫵',
+      '🫵🏻',
+      '🫵🏼',
+      '🫵🏽',
+      '🫵🏾',
+      '🫵🏿',
+      '👍',
+      '👍🏻',
+      '👍🏼',
+      '👍🏽',
+      '👍🏾',
+      '👍🏿',
+      '👎',
+      '👎🏻',
+      '👎🏼',
+      '👎🏽',
+      '👎🏾',
+      '👎🏿',
+      '✊',
+      '✊🏻',
+      '✊🏼',
+      '✊🏽',
+      '✊🏾',
+      '✊🏿',
+      '👊',
+      '👊🏻',
+      '👊🏼',
+      '👊🏽',
+      '👊🏾',
+      '👊🏿',
+      '🤛',
+      '🤛🏻',
+      '🤛🏼',
+      '🤛🏽',
+      '🤛🏾',
+      '🤛🏿',
+      '🤜',
+      '🤜🏻',
+      '🤜🏼',
+      '🤜🏽',
+      '🤜🏾',
+      '🤜🏿',
+      '👏',
+      '👏🏻',
+      '👏🏼',
+      '👏🏽',
+      '👏🏾',
+      '👏🏿',
+      '🙌',
+      '🙌🏻',
+      '🙌🏼',
+      '🙌🏽',
+      '🙌🏾',
+      '🙌🏿',
+      '🫶',
+      '🫶🏻',
+      '🫶🏼',
+      '🫶🏽',
+      '🫶🏾',
+      '🫶🏿',
+      '👐',
+      '👐🏻',
+      '👐🏼',
+      '👐🏽',
+      '👐🏾',
+      '👐🏿',
+      '🤲',
+      '🤲🏻',
+      '🤲🏼',
+      '🤲🏽',
+      '🤲🏾',
+      '🤲🏿',
+      '🤝',
+      '🤝🏻',
+      '🤝🏼',
+      '🤝🏽',
+      '🤝🏾',
+      '🤝🏿',
+      '🫱🏻‍🫲🏼',
+      '🫱🏻‍🫲🏽',
+      '🫱🏻‍🫲🏾',
+      '🫱🏻‍🫲🏿',
+      '🫱🏼‍🫲🏻',
+      '🫱🏼‍🫲🏽',
+      '🫱🏼‍🫲🏾',
+      '🫱🏼‍🫲🏿',
+      '🫱🏽‍🫲🏻',
+      '🫱🏽‍🫲🏼',
+      '🫱🏽‍🫲🏾',
+      '🫱🏽‍🫲🏿',
+      '🫱🏾‍🫲🏻',
+      '🫱🏾‍🫲🏼',
+      '🫱🏾‍🫲🏽',
+      '🫱🏾‍🫲🏿',
+      '🫱🏿‍🫲🏻',
+      '🫱🏿‍🫲🏼',
+      '🫱🏿‍🫲🏽',
+      '🫱🏿‍🫲🏾',
+      '🙏',
+      '🙏🏻',
+      '🙏🏼',
+      '🙏🏽',
+      '🙏🏾',
+      '🙏🏿',
+      '✍️',
+      '✍🏻',
+      '✍🏼',
+      '✍🏽',
+      '✍🏾',
+      '✍🏿',
+      '💅',
+      '💅🏻',
+      '💅🏼',
+      '💅🏽',
+      '💅🏾',
+      '💅🏿',
+      '🤳',
+      '🤳🏻',
+      '🤳🏼',
+      '🤳🏽',
+      '🤳🏾',
+      '🤳🏿',
+      '💪',
+      '💪🏻',
+      '💪🏼',
+      '💪🏽',
+      '💪🏾',
+      '💪🏿',
+      '🦾',
+      '🦿',
+      '🦵',
+      '🦵🏻',
+      '🦵🏼',
+      '🦵🏽',
+      '🦵🏾',
+      '🦵🏿',
+      '🦶',
+      '🦶🏻',
+      '🦶🏼',
+      '🦶🏽',
+      '🦶🏾',
+      '🦶🏿',
+      '👂',
+      '👂🏻',
+      '👂🏼',
+      '👂🏽',
+      '👂🏾',
+      '👂🏿',
+      '🦻',
+      '🦻🏻',
+      '🦻🏼',
+      '🦻🏽',
+      '🦻🏾',
+      '🦻🏿',
+      '👃',
+      '👃🏻',
+      '👃🏼',
+      '👃🏽',
+      '👃🏾',
+      '👃🏿',
+      '🧠',
+      '🫀',
+      '🫁',
+      '🦷',
+      '🦴',
+      '👀',
+      '👁️',
+      '👅',
+      '👄',
+      '🫦',
+      '👶',
+      '👶🏻',
+      '👶🏼',
+      '👶🏽',
+      '👶🏾',
+      '👶🏿',
+      '🧒',
+      '🧒🏻',
+      '🧒🏼',
+      '🧒🏽',
+      '🧒🏾',
+      '🧒🏿',
+      '👦',
+      '👦🏻',
+      '👦🏼',
+      '👦🏽',
+      '👦🏾',
+      '👦🏿',
+      '👧',
+      '👧🏻',
+      '👧🏼',
+      '👧🏽',
+      '👧🏾',
+      '👧🏿',
+      '🧑',
+      '🧑🏻',
+      '🧑🏼',
+      '🧑🏽',
+      '🧑🏾',
+      '🧑🏿',
+      '👱',
+      '👱🏻',
+      '👱🏼',
+      '👱🏽',
+      '👱🏾',
+      '👱🏿',
+      '👨',
+      '👨🏻',
+      '👨🏼',
+      '👨🏽',
+      '👨🏾',
+      '👨🏿',
+      '🧔',
+      '🧔🏻',
+      '🧔🏼',
+      '🧔🏽',
+      '🧔🏾',
+      '🧔🏿',
+      '🧔‍♂️',
+      '🧔🏻‍♂️',
+      '🧔🏼‍♂️',
+      '🧔🏽‍♂️',
+      '🧔🏾‍♂️',
+      '🧔🏿‍♂️',
+      '🧔‍♀️',
+      '🧔🏻‍♀️',
+      '🧔🏼‍♀️',
+      '🧔🏽‍♀️',
+      '🧔🏾‍♀️',
+      '🧔🏿‍♀️',
+      '👨‍🦰',
+      '👨🏻‍🦰',
+      '👨🏼‍🦰',
+      '👨🏽‍🦰',
+      '👨🏾‍🦰',
+      '👨🏿‍🦰',
+      '👨‍🦱',
+      '👨🏻‍🦱',
+      '👨🏼‍🦱',
+      '👨🏽‍🦱',
+      '👨🏾‍🦱',
+      '👨🏿‍🦱',
+      '👨‍🦳',
+      '👨🏻‍🦳',
+      '👨🏼‍🦳',
+      '👨🏽‍🦳',
+      '👨🏾‍🦳',
+      '👨🏿‍🦳',
+      '👨‍🦲',
+      '👨🏻‍🦲',
+      '👨🏼‍🦲',
+      '👨🏽‍🦲',
+      '👨🏾‍🦲',
+      '👨🏿‍🦲',
+      '👩',
+      '👩🏻',
+      '👩🏼',
+      '👩🏽',
+      '👩🏾',
+      '👩🏿',
+      '👩‍🦰',
+      '👩🏻‍🦰',
+      '👩🏼‍🦰',
+      '👩🏽‍🦰',
+      '👩🏾‍🦰',
+      '👩🏿‍🦰',
+      '🧑‍🦰',
+      '🧑🏻‍🦰',
+      '🧑🏼‍🦰',
+      '🧑🏽‍🦰',
+      '🧑🏾‍🦰',
+      '🧑🏿‍🦰',
+      '👩‍🦱',
+      '👩🏻‍🦱',
+      '👩🏼‍🦱',
+      '👩🏽‍🦱',
+      '👩🏾‍🦱',
+      '👩🏿‍🦱',
+      '🧑‍🦱',
+      '🧑🏻‍🦱',
+      '🧑🏼‍🦱',
+      '🧑🏽‍🦱',
+      '🧑🏾‍🦱',
+      '🧑🏿‍🦱',
+      '👩‍🦳',
+      '👩🏻‍🦳',
+      '👩🏼‍🦳',
+      '👩🏽‍🦳',
+      '👩🏾‍🦳',
+      '👩🏿‍🦳',
+      '🧑‍🦳',
+      '🧑🏻‍🦳',
+      '🧑🏼‍🦳',
+      '🧑🏽‍🦳',
+      '🧑🏾‍🦳',
+      '🧑🏿‍🦳',
+      '👩‍🦲',
+      '👩🏻‍🦲',
+      '👩🏼‍🦲',
+      '👩🏽‍🦲',
+      '👩🏾‍🦲',
+      '👩🏿‍🦲',
+      '🧑‍🦲',
+      '🧑🏻‍🦲',
+      '🧑🏼‍🦲',
+      '🧑🏽‍🦲',
+      '🧑🏾‍🦲',
+      '🧑🏿‍🦲',
+      '👱‍♀️',
+      '👱🏻‍♀️',
+      '👱🏼‍♀️',
+      '👱🏽‍♀️',
+      '👱🏾‍♀️',
+      '👱🏿‍♀️',
+      '👱‍♂️',
+      '👱🏻‍♂️',
+      '👱🏼‍♂️',
+      '👱🏽‍♂️',
+      '👱🏾‍♂️',
+      '👱🏿‍♂️',
+      '🧓',
+      '🧓🏻',
+      '🧓🏼',
+      '🧓🏽',
+      '🧓🏾',
+      '🧓🏿',
+      '👴',
+      '👴🏻',
+      '👴🏼',
+      '👴🏽',
+      '👴🏾',
+      '👴🏿',
+      '👵',
+      '👵🏻',
+      '👵🏼',
+      '👵🏽',
+      '👵🏾',
+      '👵🏿',
+      '🙍',
+      '🙍🏻',
+      '🙍🏼',
+      '🙍🏽',
+      '🙍🏾',
+      '🙍🏿',
+      '🙍‍♂️',
+      '🙍🏻‍♂️',
+      '🙍🏼‍♂️',
+      '🙍🏽‍♂️',
+      '🙍🏾‍♂️',
+      '🙍🏿‍♂️',
+      '🙍‍♀️',
+      '🙍🏻‍♀️',
+      '🙍🏼‍♀️',
+      '🙍🏽‍♀️',
+      '🙍🏾‍♀️',
+      '🙍🏿‍♀️',
+      '🙎',
+      '🙎🏻',
+      '🙎🏼',
+      '🙎🏽',
+      '🙎🏾',
+      '🙎🏿',
+      '🙎‍♂️',
+      '🙎🏻‍♂️',
+      '🙎🏼‍♂️',
+      '🙎🏽‍♂️',
+      '🙎🏾‍♂️',
+      '🙎🏿‍♂️',
+      '🙎‍♀️',
+      '🙎🏻‍♀️',
+      '🙎🏼‍♀️',
+      '🙎🏽‍♀️',
+      '🙎🏾‍♀️',
+      '🙎🏿‍♀️',
+      '🙅',
+      '🙅🏻',
+      '🙅🏼',
+      '🙅🏽',
+      '🙅🏾',
+      '🙅🏿',
+      '🙅‍♂️',
+      '🙅🏻‍♂️',
+      '🙅🏼‍♂️',
+      '🙅🏽‍♂️',
+      '🙅🏾‍♂️',
+      '🙅🏿‍♂️',
+      '🙅‍♀️',
+      '🙅🏻‍♀️',
+      '🙅🏼‍♀️',
+      '🙅🏽‍♀️',
+      '🙅🏾‍♀️',
+      '🙅🏿‍♀️',
+      '🙆',
+      '🙆🏻',
+      '🙆🏼',
+      '🙆🏽',
+      '🙆🏾',
+      '🙆🏿',
+      '🙆‍♂️',
+      '🙆🏻‍♂️',
+      '🙆🏼‍♂️',
+      '🙆🏽‍♂️',
+      '🙆🏾‍♂️',
+      '🙆🏿‍♂️',
+      '🙆‍♀️',
+      '🙆🏻‍♀️',
+      '🙆🏼‍♀️',
+      '🙆🏽‍♀️',
+      '🙆🏾‍♀️',
+      '🙆🏿‍♀️',
+      '💁',
+      '💁🏻',
+      '💁🏼',
+      '💁🏽',
+      '💁🏾',
+      '💁🏿',
+      '💁‍♂️',
+      '💁🏻‍♂️',
+      '💁🏼‍♂️',
+      '💁🏽‍♂️',
+      '💁🏾‍♂️',
+      '💁🏿‍♂️',
+      '💁‍♀️',
+      '💁🏻‍♀️',
+      '💁🏼‍♀️',
+      '💁🏽‍♀️',
+      '💁🏾‍♀️',
+      '💁🏿‍♀️',
+      '🙋',
+      '🙋🏻',
+      '🙋🏼',
+      '🙋🏽',
+      '🙋🏾',
+      '🙋🏿',
+      '🙋‍♂️',
+      '🙋🏻‍♂️',
+      '🙋🏼‍♂️',
+      '🙋🏽‍♂️',
+      '🙋🏾‍♂️',
+      '🙋🏿‍♂️',
+      '🙋‍♀️',
+      '🙋🏻‍♀️',
+      '🙋🏼‍♀️',
+      '🙋🏽‍♀️',
+      '🙋🏾‍♀️',
+      '🙋🏿‍♀️',
+      '🧏',
+      '🧏🏻',
+      '🧏🏼',
+      '🧏🏽',
+      '🧏🏾',
+      '🧏🏿',
+      '🧏‍♂️',
+      '🧏🏻‍♂️',
+      '🧏🏼‍♂️',
+      '🧏🏽‍♂️',
+      '🧏🏾‍♂️',
+      '🧏🏿‍♂️',
+      '🧏‍♀️',
+      '🧏🏻‍♀️',
+      '🧏🏼‍♀️',
+      '🧏🏽‍♀️',
+      '🧏🏾‍♀️',
+      '🧏🏿‍♀️',
+      '🙇',
+      '🙇🏻',
+      '🙇🏼',
+      '🙇🏽',
+      '🙇🏾',
+      '🙇🏿',
+      '🙇‍♂️',
+      '🙇🏻‍♂️',
+      '🙇🏼‍♂️',
+      '🙇🏽‍♂️',
+      '🙇🏾‍♂️',
+      '🙇🏿‍♂️',
+      '🙇‍♀️',
+      '🙇🏻‍♀️',
+      '🙇🏼‍♀️',
+      '🙇🏽‍♀️',
+      '🙇🏾‍♀️',
+      '🙇🏿‍♀️',
+      '🤦',
+      '🤦🏻',
+      '🤦🏼',
+      '🤦🏽',
+      '🤦🏾',
+      '🤦🏿',
+      '🤦‍♂️',
+      '🤦🏻‍♂️',
+      '🤦🏼‍♂️',
+      '🤦🏽‍♂️',
+      '🤦🏾‍♂️',
+      '🤦🏿‍♂️',
+      '🤦‍♀️',
+      '🤦🏻‍♀️',
+      '🤦🏼‍♀️',
+      '🤦🏽‍♀️',
+      '🤦🏾‍♀️',
+      '🤦🏿‍♀️',
+      '🤷',
+      '🤷🏻',
+      '🤷🏼',
+      '🤷🏽',
+      '🤷🏾',
+      '🤷🏿',
+      '🤷‍♂️',
+      '🤷🏻‍♂️',
+      '🤷🏼‍♂️',
+      '🤷🏽‍♂️',
+      '🤷🏾‍♂️',
+      '🤷🏿‍♂️',
+      '🤷‍♀️',
+      '🤷🏻‍♀️',
+      '🤷🏼‍♀️',
+      '🤷🏽‍♀️',
+      '🤷🏾‍♀️',
+      '🤷🏿‍♀️',
+      '🧑‍⚕️',
+      '🧑🏻‍⚕️',
+      '🧑🏼‍⚕️',
+      '🧑🏽‍⚕️',
+      '🧑🏾‍⚕️',
+      '🧑🏿‍⚕️',
+      '👨‍⚕️',
+      '👨🏻‍⚕️',
+      '👨🏼‍⚕️',
+      '👨🏽‍⚕️',
+      '👨🏾‍⚕️',
+      '👨🏿‍⚕️',
+      '👩‍⚕️',
+      '👩🏻‍⚕️',
+      '👩🏼‍⚕️',
+      '👩🏽‍⚕️',
+      '👩🏾‍⚕️',
+      '👩🏿‍⚕️',
+      '🧑‍🎓',
+      '🧑🏻‍🎓',
+      '🧑🏼‍🎓',
+      '🧑🏽‍🎓',
+      '🧑🏾‍🎓',
+      '🧑🏿‍🎓',
+      '👨‍🎓',
+      '👨🏻‍🎓',
+      '👨🏼‍🎓',
+      '👨🏽‍🎓',
+      '👨🏾‍🎓',
+      '👨🏿‍🎓',
+      '👩‍🎓',
+      '👩🏻‍🎓',
+      '👩🏼‍🎓',
+      '👩🏽‍🎓',
+      '👩🏾‍🎓',
+      '👩🏿‍🎓',
+      '🧑‍🏫',
+      '🧑🏻‍🏫',
+      '🧑🏼‍🏫',
+      '🧑🏽‍🏫',
+      '🧑🏾‍🏫',
+      '🧑🏿‍🏫',
+      '👨‍🏫',
+      '👨🏻‍🏫',
+      '👨🏼‍🏫',
+      '👨🏽‍🏫',
+      '👨🏾‍🏫',
+      '👨🏿‍🏫',
+      '👩‍🏫',
+      '👩🏻‍🏫',
+      '👩🏼‍🏫',
+      '👩🏽‍🏫',
+      '👩🏾‍🏫',
+      '👩🏿‍🏫',
+      '🧑‍⚖️',
+      '🧑🏻‍⚖️',
+      '🧑🏼‍⚖️',
+      '🧑🏽‍⚖️',
+      '🧑🏾‍⚖️',
+      '🧑🏿‍⚖️',
+      '👨‍⚖️',
+      '👨🏻‍⚖️',
+      '👨🏼‍⚖️',
+      '👨🏽‍⚖️',
+      '👨🏾‍⚖️',
+      '👨🏿‍⚖️',
+      '👩‍⚖️',
+      '👩🏻‍⚖️',
+      '👩🏼‍⚖️',
+      '👩🏽‍⚖️',
+      '👩🏾‍⚖️',
+      '👩🏿‍⚖️',
+      '🧑‍🌾',
+      '🧑🏻‍🌾',
+      '🧑🏼‍🌾',
+      '🧑🏽‍🌾',
+      '🧑🏾‍🌾',
+      '🧑🏿‍🌾',
+      '👨‍🌾',
+      '👨🏻‍🌾',
+      '👨🏼‍🌾',
+      '👨🏽‍🌾',
+      '👨🏾‍🌾',
+      '👨🏿‍🌾',
+      '👩‍🌾',
+      '👩🏻‍🌾',
+      '👩🏼‍🌾',
+      '👩🏽‍🌾',
+      '👩🏾‍🌾',
+      '👩🏿‍🌾',
+      '🧑‍🍳',
+      '🧑🏻‍🍳',
+      '🧑🏼‍🍳',
+      '🧑🏽‍🍳',
+      '🧑🏾‍🍳',
+      '🧑🏿‍🍳',
+      '👨‍🍳',
+      '👨🏻‍🍳',
+      '👨🏼‍🍳',
+      '👨🏽‍🍳',
+      '👨🏾‍🍳',
+      '👨🏿‍🍳',
+      '👩‍🍳',
+      '👩🏻‍🍳',
+      '👩🏼‍🍳',
+      '👩🏽‍🍳',
+      '👩🏾‍🍳',
+      '👩🏿‍🍳',
+      '🧑‍🔧',
+      '🧑🏻‍🔧',
+      '🧑🏼‍🔧',
+      '🧑🏽‍🔧',
+      '🧑🏾‍🔧',
+      '🧑🏿‍🔧',
+      '👨‍🔧',
+      '👨🏻‍🔧',
+      '👨🏼‍🔧',
+      '👨🏽‍🔧',
+      '👨🏾‍🔧',
+      '👨🏿‍🔧',
+      '👩‍🔧',
+      '👩🏻‍🔧',
+      '👩🏼‍🔧',
+      '👩🏽‍🔧',
+      '👩🏾‍🔧',
+      '👩🏿‍🔧',
+      '🧑‍🏭',
+      '🧑🏻‍🏭',
+      '🧑🏼‍🏭',
+      '🧑🏽‍🏭',
+      '🧑🏾‍🏭',
+      '🧑🏿‍🏭',
+      '👨‍🏭',
+      '👨🏻‍🏭',
+      '👨🏼‍🏭',
+      '👨🏽‍🏭',
+      '👨🏾‍🏭',
+      '👨🏿‍🏭',
+      '👩‍🏭',
+      '👩🏻‍🏭',
+      '👩🏼‍🏭',
+      '👩🏽‍🏭',
+      '👩🏾‍🏭',
+      '👩🏿‍🏭',
+      '🧑‍💼',
+      '🧑🏻‍💼',
+      '🧑🏼‍💼',
+      '🧑🏽‍💼',
+      '🧑🏾‍💼',
+      '🧑🏿‍💼',
+      '👨‍💼',
+      '👨🏻‍💼',
+      '👨🏼‍💼',
+      '👨🏽‍💼',
+      '👨🏾‍💼',
+      '👨🏿‍💼',
+      '👩‍💼',
+      '👩🏻‍💼',
+      '👩🏼‍💼',
+      '👩🏽‍💼',
+      '👩🏾‍💼',
+      '👩🏿‍💼',
+      '🧑‍🔬',
+      '🧑🏻‍🔬',
+      '🧑🏼‍🔬',
+      '🧑🏽‍🔬',
+      '🧑🏾‍🔬',
+      '🧑🏿‍🔬',
+      '👨‍🔬',
+      '👨🏻‍🔬',
+      '👨🏼‍🔬',
+      '👨🏽‍🔬',
+      '👨🏾‍🔬',
+      '👨🏿‍🔬',
+      '👩‍🔬',
+      '👩🏻‍🔬',
+      '👩🏼‍🔬',
+      '👩🏽‍🔬',
+      '👩🏾‍🔬',
+      '👩🏿‍🔬',
+      '🧑‍💻',
+      '🧑🏻‍💻',
+      '🧑🏼‍💻',
+      '🧑🏽‍💻',
+      '🧑🏾‍💻',
+      '🧑🏿‍💻',
+      '👨‍💻',
+      '👨🏻‍💻',
+      '👨🏼‍💻',
+      '👨🏽‍💻',
+      '👨🏾‍💻',
+      '👨🏿‍💻',
+      '👩‍💻',
+      '👩🏻‍💻',
+      '👩🏼‍💻',
+      '👩🏽‍💻',
+      '👩🏾‍💻',
+      '👩🏿‍💻',
+      '🧑‍🎤',
+      '🧑🏻‍🎤',
+      '🧑🏼‍🎤',
+      '🧑🏽‍🎤',
+      '🧑🏾‍🎤',
+      '🧑🏿‍🎤',
+      '👨‍🎤',
+      '👨🏻‍🎤',
+      '👨🏼‍🎤',
+      '👨🏽‍🎤',
+      '👨🏾‍🎤',
+      '👨🏿‍🎤',
+      '👩‍🎤',
+      '👩🏻‍🎤',
+      '👩🏼‍🎤',
+      '👩🏽‍🎤',
+      '👩🏾‍🎤',
+      '👩🏿‍🎤',
+      '🧑‍🎨',
+      '🧑🏻‍🎨',
+      '🧑🏼‍🎨',
+      '🧑🏽‍🎨',
+      '🧑🏾‍🎨',
+      '🧑🏿‍🎨',
+      '👨‍🎨',
+      '👨🏻‍🎨',
+      '👨🏼‍🎨',
+      '👨🏽‍🎨',
+      '👨🏾‍🎨',
+      '👨🏿‍🎨',
+      '👩‍🎨',
+      '👩🏻‍🎨',
+      '👩🏼‍🎨',
+      '👩🏽‍🎨',
+      '👩🏾‍🎨',
+      '👩🏿‍🎨',
+      '🧑‍✈️',
+      '🧑🏻‍✈️',
+      '🧑🏼‍✈️',
+      '🧑🏽‍✈️',
+      '🧑🏾‍✈️',
+      '🧑🏿‍✈️',
+      '👨‍✈️',
+      '👨🏻‍✈️',
+      '👨🏼‍✈️',
+      '👨🏽‍✈️',
+      '👨🏾‍✈️',
+      '👨🏿‍✈️',
+      '👩‍✈️',
+      '👩🏻‍✈️',
+      '👩🏼‍✈️',
+      '👩🏽‍✈️',
+      '👩🏾‍✈️',
+      '👩🏿‍✈️',
+      '🧑‍🚀',
+      '🧑🏻‍🚀',
+      '🧑🏼‍🚀',
+      '🧑🏽‍🚀',
+      '🧑🏾‍🚀',
+      '🧑🏿‍🚀',
+      '👨‍🚀',
+      '👨🏻‍🚀',
+      '👨🏼‍🚀',
+      '👨🏽‍🚀',
+      '👨🏾‍🚀',
+      '👨🏿‍🚀',
+      '👩‍🚀',
+      '👩🏻‍🚀',
+      '👩🏼‍🚀',
+      '👩🏽‍🚀',
+      '👩🏾‍🚀',
+      '👩🏿‍🚀',
+      '🧑‍🚒',
+      '🧑🏻‍🚒',
+      '🧑🏼‍🚒',
+      '🧑🏽‍🚒',
+      '🧑🏾‍🚒',
+      '🧑🏿‍🚒',
+      '👨‍🚒',
+      '👨🏻‍🚒',
+      '👨🏼‍🚒',
+      '👨🏽‍🚒',
+      '👨🏾‍🚒',
+      '👨🏿‍🚒',
+      '👩‍🚒',
+      '👩🏻‍🚒',
+      '👩🏼‍🚒',
+      '👩🏽‍🚒',
+      '👩🏾‍🚒',
+      '👩🏿‍🚒',
+      '👮',
+      '👮🏻',
+      '👮🏼',
+      '👮🏽',
+      '👮🏾',
+      '👮🏿',
+      '👮‍♂️',
+      '👮🏻‍♂️',
+      '👮🏼‍♂️',
+      '👮🏽‍♂️',
+      '👮🏾‍♂️',
+      '👮🏿‍♂️',
+      '👮‍♀️',
+      '👮🏻‍♀️',
+      '👮🏼‍♀️',
+      '👮🏽‍♀️',
+      '👮🏾‍♀️',
+      '👮🏿‍♀️',
+      '🕵️',
+      '🕵🏻',
+      '🕵🏼',
+      '🕵🏽',
+      '🕵🏾',
+      '🕵🏿',
+      '🕵️‍♂️',
+      '🕵🏻‍♂️',
+      '🕵🏼‍♂️',
+      '🕵🏽‍♂️',
+      '🕵🏾‍♂️',
+      '🕵🏿‍♂️',
+      '🕵️‍♀️',
+      '🕵🏻‍♀️',
+      '🕵🏼‍♀️',
+      '🕵🏽‍♀️',
+      '🕵🏾‍♀️',
+      '🕵🏿‍♀️',
+      '💂',
+      '💂🏻',
+      '💂🏼',
+      '💂🏽',
+      '💂🏾',
+      '💂🏿',
+      '💂‍♂️',
+      '💂🏻‍♂️',
+      '💂🏼‍♂️',
+      '💂🏽‍♂️',
+      '💂🏾‍♂️',
+      '💂🏿‍♂️',
+      '💂‍♀️',
+      '💂🏻‍♀️',
+      '💂🏼‍♀️',
+      '💂🏽‍♀️',
+      '💂🏾‍♀️',
+      '💂🏿‍♀️',
+      '🥷',
+      '🥷🏻',
+      '🥷🏼',
+      '🥷🏽',
+      '🥷🏾',
+      '🥷🏿',
+      '👷',
+      '👷🏻',
+      '👷🏼',
+      '👷🏽',
+      '👷🏾',
+      '👷🏿',
+      '👷‍♂️',
+      '👷🏻‍♂️',
+      '👷🏼‍♂️',
+      '👷🏽‍♂️',
+      '👷🏾‍♂️',
+      '👷🏿‍♂️',
+      '👷‍♀️',
+      '👷🏻‍♀️',
+      '👷🏼‍♀️',
+      '👷🏽‍♀️',
+      '👷🏾‍♀️',
+      '👷🏿‍♀️',
+      '🫅',
+      '🫅🏻',
+      '🫅🏼',
+      '🫅🏽',
+      '🫅🏾',
+      '🫅🏿',
+      '🤴',
+      '🤴🏻',
+      '🤴🏼',
+      '🤴🏽',
+      '🤴🏾',
+      '🤴🏿',
+      '👸',
+      '👸🏻',
+      '👸🏼',
+      '👸🏽',
+      '👸🏾',
+      '👸🏿',
+      '👳',
+      '👳🏻',
+      '👳🏼',
+      '👳🏽',
+      '👳🏾',
+      '👳🏿',
+      '👳‍♂️',
+      '👳🏻‍♂️',
+      '👳🏼‍♂️',
+      '👳🏽‍♂️',
+      '👳🏾‍♂️',
+      '👳🏿‍♂️',
+      '👳‍♀️',
+      '👳🏻‍♀️',
+      '👳🏼‍♀️',
+      '👳🏽‍♀️',
+      '👳🏾‍♀️',
+      '👳🏿‍♀️',
+      '👲',
+      '👲🏻',
+      '👲🏼',
+      '👲🏽',
+      '👲🏾',
+      '👲🏿',
+      '🧕',
+      '🧕🏻',
+      '🧕🏼',
+      '🧕🏽',
+      '🧕🏾',
+      '🧕🏿',
+      '🤵',
+      '🤵🏻',
+      '🤵🏼',
+      '🤵🏽',
+      '🤵🏾',
+      '🤵🏿',
+      '🤵‍♂️',
+      '🤵🏻‍♂️',
+      '🤵🏼‍♂️',
+      '🤵🏽‍♂️',
+      '🤵🏾‍♂️',
+      '🤵🏿‍♂️',
+      '🤵‍♀️',
+      '🤵🏻‍♀️',
+      '🤵🏼‍♀️',
+      '🤵🏽‍♀️',
+      '🤵🏾‍♀️',
+      '🤵🏿‍♀️',
+      '👰',
+      '👰🏻',
+      '👰🏼',
+      '👰🏽',
+      '👰🏾',
+      '👰🏿',
+      '👰‍♂️',
+      '👰🏻‍♂️',
+      '👰🏼‍♂️',
+      '👰🏽‍♂️',
+      '👰🏾‍♂️',
+      '👰🏿‍♂️',
+      '👰‍♀️',
+      '👰🏻‍♀️',
+      '👰🏼‍♀️',
+      '👰🏽‍♀️',
+      '👰🏾‍♀️',
+      '👰🏿‍♀️',
+      '🤰',
+      '🤰🏻',
+      '🤰🏼',
+      '🤰🏽',
+      '🤰🏾',
+      '🤰🏿',
+      '🫃',
+      '🫃🏻',
+      '🫃🏼',
+      '🫃🏽',
+      '🫃🏾',
+      '🫃🏿',
+      '🫄',
+      '🫄🏻',
+      '🫄🏼',
+      '🫄🏽',
+      '🫄🏾',
+      '🫄🏿',
+      '🤱',
+      '🤱🏻',
+      '🤱🏼',
+      '🤱🏽',
+      '🤱🏾',
+      '🤱🏿',
+      '👩‍🍼',
+      '👩🏻‍🍼',
+      '👩🏼‍🍼',
+      '👩🏽‍🍼',
+      '👩🏾‍🍼',
+      '👩🏿‍🍼',
+      '👨‍🍼',
+      '👨🏻‍🍼',
+      '👨🏼‍🍼',
+      '👨🏽‍🍼',
+      '👨🏾‍🍼',
+      '👨🏿‍🍼',
+      '🧑‍🍼',
+      '🧑🏻‍🍼',
+      '🧑🏼‍🍼',
+      '🧑🏽‍🍼',
+      '🧑🏾‍🍼',
+      '🧑🏿‍🍼',
+      '👼',
+      '👼🏻',
+      '👼🏼',
+      '👼🏽',
+      '👼🏾',
+      '👼🏿',
+      '🎅',
+      '🎅🏻',
+      '🎅🏼',
+      '🎅🏽',
+      '🎅🏾',
+      '🎅🏿',
+      '🤶',
+      '🤶🏻',
+      '🤶🏼',
+      '🤶🏽',
+      '🤶🏾',
+      '🤶🏿',
+      '🧑‍🎄',
+      '🧑🏻‍🎄',
+      '🧑🏼‍🎄',
+      '🧑🏽‍🎄',
+      '🧑🏾‍🎄',
+      '🧑🏿‍🎄',
+      '🦸',
+      '🦸🏻',
+      '🦸🏼',
+      '🦸🏽',
+      '🦸🏾',
+      '🦸🏿',
+      '🦸‍♂️',
+      '🦸🏻‍♂️',
+      '🦸🏼‍♂️',
+      '🦸🏽‍♂️',
+      '🦸🏾‍♂️',
+      '🦸🏿‍♂️',
+      '🦸‍♀️',
+      '🦸🏻‍♀️',
+      '🦸🏼‍♀️',
+      '🦸🏽‍♀️',
+      '🦸🏾‍♀️',
+      '🦸🏿‍♀️',
+      '🦹',
+      '🦹🏻',
+      '🦹🏼',
+      '🦹🏽',
+      '🦹🏾',
+      '🦹🏿',
+      '🦹‍♂️',
+      '🦹🏻‍♂️',
+      '🦹🏼‍♂️',
+      '🦹🏽‍♂️',
+      '🦹🏾‍♂️',
+      '🦹🏿‍♂️',
+      '🦹‍♀️',
+      '🦹🏻‍♀️',
+      '🦹🏼‍♀️',
+      '🦹🏽‍♀️',
+      '🦹🏾‍♀️',
+      '🦹🏿‍♀️',
+      '🧙',
+      '🧙🏻',
+      '🧙🏼',
+      '🧙🏽',
+      '🧙🏾',
+      '🧙🏿',
+      '🧙‍♂️',
+      '🧙🏻‍♂️',
+      '🧙🏼‍♂️',
+      '🧙🏽‍♂️',
+      '🧙🏾‍♂️',
+      '🧙🏿‍♂️',
+      '🧙‍♀️',
+      '🧙🏻‍♀️',
+      '🧙🏼‍♀️',
+      '🧙🏽‍♀️',
+      '🧙🏾‍♀️',
+      '🧙🏿‍♀️',
+      '🧚',
+      '🧚🏻',
+      '🧚🏼',
+      '🧚🏽',
+      '🧚🏾',
+      '🧚🏿',
+      '🧚‍♂️',
+      '🧚🏻‍♂️',
+      '🧚🏼‍♂️',
+      '🧚🏽‍♂️',
+      '🧚🏾‍♂️',
+      '🧚🏿‍♂️',
+      '🧚‍♀️',
+      '🧚🏻‍♀️',
+      '🧚🏼‍♀️',
+      '🧚🏽‍♀️',
+      '🧚🏾‍♀️',
+      '🧚🏿‍♀️',
+      '🧛',
+      '🧛🏻',
+      '🧛🏼',
+      '🧛🏽',
+      '🧛🏾',
+      '🧛🏿',
+      '🧛‍♂️',
+      '🧛🏻‍♂️',
+      '🧛🏼‍♂️',
+      '🧛🏽‍♂️',
+      '🧛🏾‍♂️',
+      '🧛🏿‍♂️',
+      '🧛‍♀️',
+      '🧛🏻‍♀️',
+      '🧛🏼‍♀️',
+      '🧛🏽‍♀️',
+      '🧛🏾‍♀️',
+      '🧛🏿‍♀️',
+      '🧜',
+      '🧜🏻',
+      '🧜🏼',
+      '🧜🏽',
+      '🧜🏾',
+      '🧜🏿',
+      '🧜‍♂️',
+      '🧜🏻‍♂️',
+      '🧜🏼‍♂️',
+      '🧜🏽‍♂️',
+      '🧜🏾‍♂️',
+      '🧜🏿‍♂️',
+      '🧜‍♀️',
+      '🧜🏻‍♀️',
+      '🧜🏼‍♀️',
+      '🧜🏽‍♀️',
+      '🧜🏾‍♀️',
+      '🧜🏿‍♀️',
+      '🧝',
+      '🧝🏻',
+      '🧝🏼',
+      '🧝🏽',
+      '🧝🏾',
+      '🧝🏿',
+      '🧝‍♂️',
+      '🧝🏻‍♂️',
+      '🧝🏼‍♂️',
+      '🧝🏽‍♂️',
+      '🧝🏾‍♂️',
+      '🧝🏿‍♂️',
+      '🧝‍♀️',
+      '🧝🏻‍♀️',
+      '🧝🏼‍♀️',
+      '🧝🏽‍♀️',
+      '🧝🏾‍♀️',
+      '🧝🏿‍♀️',
+      '🧞',
+      '🧞‍♂️',
+      '🧞‍♀️',
+      '🧟',
+      '🧟‍♂️',
+      '🧟‍♀️',
+      '🧌',
+      '🫈',
+      '💆',
+      '💆🏻',
+      '💆🏼',
+      '💆🏽',
+      '💆🏾',
+      '💆🏿',
+      '💆‍♂️',
+      '💆🏻‍♂️',
+      '💆🏼‍♂️',
+      '💆🏽‍♂️',
+      '💆🏾‍♂️',
+      '💆🏿‍♂️',
+      '💆‍♀️',
+      '💆🏻‍♀️',
+      '💆🏼‍♀️',
+      '💆🏽‍♀️',
+      '💆🏾‍♀️',
+      '💆🏿‍♀️',
+      '💇',
+      '💇🏻',
+      '💇🏼',
+      '💇🏽',
+      '💇🏾',
+      '💇🏿',
+      '💇‍♂️',
+      '💇🏻‍♂️',
+      '💇🏼‍♂️',
+      '💇🏽‍♂️',
+      '💇🏾‍♂️',
+      '💇🏿‍♂️',
+      '💇‍♀️',
+      '💇🏻‍♀️',
+      '💇🏼‍♀️',
+      '💇🏽‍♀️',
+      '💇🏾‍♀️',
+      '💇🏿‍♀️',
+      '🚶',
+      '🚶🏻',
+      '🚶🏼',
+      '🚶🏽',
+      '🚶🏾',
+      '🚶🏿',
+      '🚶‍♂️',
+      '🚶🏻‍♂️',
+      '🚶🏼‍♂️',
+      '🚶🏽‍♂️',
+      '🚶🏾‍♂️',
+      '🚶🏿‍♂️',
+      '🚶‍♀️',
+      '🚶🏻‍♀️',
+      '🚶🏼‍♀️',
+      '🚶🏽‍♀️',
+      '🚶🏾‍♀️',
+      '🚶🏿‍♀️',
+      '🚶‍➡️',
+      '🚶🏻‍➡️',
+      '🚶🏼‍➡️',
+      '🚶🏽‍➡️',
+      '🚶🏾‍➡️',
+      '🚶🏿‍➡️',
+      '🚶‍♀️‍➡️',
+      '🚶🏻‍♀️‍➡️',
+      '🚶🏼‍♀️‍➡️',
+      '🚶🏽‍♀️‍➡️',
+      '🚶🏾‍♀️‍➡️',
+      '🚶🏿‍♀️‍➡️',
+      '🚶‍♂️‍➡️',
+      '🚶🏻‍♂️‍➡️',
+      '🚶🏼‍♂️‍➡️',
+      '🚶🏽‍♂️‍➡️',
+      '🚶🏾‍♂️‍➡️',
+      '🚶🏿‍♂️‍➡️',
+      '🧍',
+      '🧍🏻',
+      '🧍🏼',
+      '🧍🏽',
+      '🧍🏾',
+      '🧍🏿',
+      '🧍‍♂️',
+      '🧍🏻‍♂️',
+      '🧍🏼‍♂️',
+      '🧍🏽‍♂️',
+      '🧍🏾‍♂️',
+      '🧍🏿‍♂️',
+      '🧍‍♀️',
+      '🧍🏻‍♀️',
+      '🧍🏼‍♀️',
+      '🧍🏽‍♀️',
+      '🧍🏾‍♀️',
+      '🧍🏿‍♀️',
+      '🧎',
+      '🧎🏻',
+      '🧎🏼',
+      '🧎🏽',
+      '🧎🏾',
+      '🧎🏿',
+      '🧎‍♂️',
+      '🧎🏻‍♂️',
+      '🧎🏼‍♂️',
+      '🧎🏽‍♂️',
+      '🧎🏾‍♂️',
+      '🧎🏿‍♂️',
+      '🧎‍♀️',
+      '🧎🏻‍♀️',
+      '🧎🏼‍♀️',
+      '🧎🏽‍♀️',
+      '🧎🏾‍♀️',
+      '🧎🏿‍♀️',
+      '🧎‍➡️',
+      '🧎🏻‍➡️',
+      '🧎🏼‍➡️',
+      '🧎🏽‍➡️',
+      '🧎🏾‍➡️',
+      '🧎🏿‍➡️',
+      '🧎‍♀️‍➡️',
+      '🧎🏻‍♀️‍➡️',
+      '🧎🏼‍♀️‍➡️',
+      '🧎🏽‍♀️‍➡️',
+      '🧎🏾‍♀️‍➡️',
+      '🧎🏿‍♀️‍➡️',
+      '🧎‍♂️‍➡️',
+      '🧎🏻‍♂️‍➡️',
+      '🧎🏼‍♂️‍➡️',
+      '🧎🏽‍♂️‍➡️',
+      '🧎🏾‍♂️‍➡️',
+      '🧎🏿‍♂️‍➡️',
+      '🧑‍🦯',
+      '🧑🏻‍🦯',
+      '🧑🏼‍🦯',
+      '🧑🏽‍🦯',
+      '🧑🏾‍🦯',
+      '🧑🏿‍🦯',
+      '🧑‍🦯‍➡️',
+      '🧑🏻‍🦯‍➡️',
+      '🧑🏼‍🦯‍➡️',
+      '🧑🏽‍🦯‍➡️',
+      '🧑🏾‍🦯‍➡️',
+      '🧑🏿‍🦯‍➡️',
+      '👨‍🦯',
+      '👨🏻‍🦯',
+      '👨🏼‍🦯',
+      '👨🏽‍🦯',
+      '👨🏾‍🦯',
+      '👨🏿‍🦯',
+      '👨‍🦯‍➡️',
+      '👨🏻‍🦯‍➡️',
+      '👨🏼‍🦯‍➡️',
+      '👨🏽‍🦯‍➡️',
+      '👨🏾‍🦯‍➡️',
+      '👨🏿‍🦯‍➡️',
+      '👩‍🦯',
+      '👩🏻‍🦯',
+      '👩🏼‍🦯',
+      '👩🏽‍🦯',
+      '👩🏾‍🦯',
+      '👩🏿‍🦯',
+      '👩‍🦯‍➡️',
+      '👩🏻‍🦯‍➡️',
+      '👩🏼‍🦯‍➡️',
+      '👩🏽‍🦯‍➡️',
+      '👩🏾‍🦯‍➡️',
+      '👩🏿‍🦯‍➡️',
+      '🧑‍🦼',
+      '🧑🏻‍🦼',
+      '🧑🏼‍🦼',
+      '🧑🏽‍🦼',
+      '🧑🏾‍🦼',
+      '🧑🏿‍🦼',
+      '🧑‍🦼‍➡️',
+      '🧑🏻‍🦼‍➡️',
+      '🧑🏼‍🦼‍➡️',
+      '🧑🏽‍🦼‍➡️',
+      '🧑🏾‍🦼‍➡️',
+      '🧑🏿‍🦼‍➡️',
+      '👨‍🦼',
+      '👨🏻‍🦼',
+      '👨🏼‍🦼',
+      '👨🏽‍🦼',
+      '👨🏾‍🦼',
+      '👨🏿‍🦼',
+      '👨‍🦼‍➡️',
+      '👨🏻‍🦼‍➡️',
+      '👨🏼‍🦼‍➡️',
+      '👨🏽‍🦼‍➡️',
+      '👨🏾‍🦼‍➡️',
+      '👨🏿‍🦼‍➡️',
+      '👩‍🦼',
+      '👩🏻‍🦼',
+      '👩🏼‍🦼',
+      '👩🏽‍🦼',
+      '👩🏾‍🦼',
+      '👩🏿‍🦼',
+      '👩‍🦼‍➡️',
+      '👩🏻‍🦼‍➡️',
+      '👩🏼‍🦼‍➡️',
+      '👩🏽‍🦼‍➡️',
+      '👩🏾‍🦼‍➡️',
+      '👩🏿‍🦼‍➡️',
+      '🧑‍🦽',
+      '🧑🏻‍🦽',
+      '🧑🏼‍🦽',
+      '🧑🏽‍🦽',
+      '🧑🏾‍🦽',
+      '🧑🏿‍🦽',
+      '🧑‍🦽‍➡️',
+      '🧑🏻‍🦽‍➡️',
+      '🧑🏼‍🦽‍➡️',
+      '🧑🏽‍🦽‍➡️',
+      '🧑🏾‍🦽‍➡️',
+      '🧑🏿‍🦽‍➡️',
+      '👨‍🦽',
+      '👨🏻‍🦽',
+      '👨🏼‍🦽',
+      '👨🏽‍🦽',
+      '👨🏾‍🦽',
+      '👨🏿‍🦽',
+      '👨‍🦽‍➡️',
+      '👨🏻‍🦽‍➡️',
+      '👨🏼‍🦽‍➡️',
+      '👨🏽‍🦽‍➡️',
+      '👨🏾‍🦽‍➡️',
+      '👨🏿‍🦽‍➡️',
+      '👩‍🦽',
+      '👩🏻‍🦽',
+      '👩🏼‍🦽',
+      '👩🏽‍🦽',
+      '👩🏾‍🦽',
+      '👩🏿‍🦽',
+      '👩‍🦽‍➡️',
+      '👩🏻‍🦽‍➡️',
+      '👩🏼‍🦽‍➡️',
+      '👩🏽‍🦽‍➡️',
+      '👩🏾‍🦽‍➡️',
+      '👩🏿‍🦽‍➡️',
+      '🏃',
+      '🏃🏻',
+      '🏃🏼',
+      '🏃🏽',
+      '🏃🏾',
+      '🏃🏿',
+      '🏃‍♂️',
+      '🏃🏻‍♂️',
+      '🏃🏼‍♂️',
+      '🏃🏽‍♂️',
+      '🏃🏾‍♂️',
+      '🏃🏿‍♂️',
+      '🏃‍♀️',
+      '🏃🏻‍♀️',
+      '🏃🏼‍♀️',
+      '🏃🏽‍♀️',
+      '🏃🏾‍♀️',
+      '🏃🏿‍♀️',
+      '🏃‍➡️',
+      '🏃🏻‍➡️',
+      '🏃🏼‍➡️',
+      '🏃🏽‍➡️',
+      '🏃🏾‍➡️',
+      '🏃🏿‍➡️',
+      '🏃‍♀️‍➡️',
+      '🏃🏻‍♀️‍➡️',
+      '🏃🏼‍♀️‍➡️',
+      '🏃🏽‍♀️‍➡️',
+      '🏃🏾‍♀️‍➡️',
+      '🏃🏿‍♀️‍➡️',
+      '🏃‍♂️‍➡️',
+      '🏃🏻‍♂️‍➡️',
+      '🏃🏼‍♂️‍➡️',
+      '🏃🏽‍♂️‍➡️',
+      '🏃🏾‍♂️‍➡️',
+      '🏃🏿‍♂️‍➡️',
+      '🧑‍🩰',
+      '🧑🏻‍🩰',
+      '🧑🏼‍🩰',
+      '🧑🏽‍🩰',
+      '🧑🏾‍🩰',
+      '🧑🏿‍🩰',
+      '💃',
+      '💃🏻',
+      '💃🏼',
+      '💃🏽',
+      '💃🏾',
+      '💃🏿',
+      '🕺',
+      '🕺🏻',
+      '🕺🏼',
+      '🕺🏽',
+      '🕺🏾',
+      '🕺🏿',
+      '🕴️',
+      '🕴🏻',
+      '🕴🏼',
+      '🕴🏽',
+      '🕴🏾',
+      '🕴🏿',
+      '👯',
+      '👯🏻',
+      '👯🏼',
+      '👯🏽',
+      '👯🏾',
+      '👯🏿',
+      '👯‍♂️',
+      '👯🏻‍♂️',
+      '👯🏼‍♂️',
+      '👯🏽‍♂️',
+      '👯🏾‍♂️',
+      '👯🏿‍♂️',
+      '👯‍♀️',
+      '👯🏻‍♀️',
+      '👯🏼‍♀️',
+      '👯🏽‍♀️',
+      '👯🏾‍♀️',
+      '👯🏿‍♀️',
+      '🧑🏻‍🐰‍🧑🏼',
+      '🧑🏻‍🐰‍🧑🏽',
+      '🧑🏻‍🐰‍🧑🏾',
+      '🧑🏻‍🐰‍🧑🏿',
+      '🧑🏼‍🐰‍🧑🏻',
+      '🧑🏼‍🐰‍🧑🏽',
+      '🧑🏼‍🐰‍🧑🏾',
+      '🧑🏼‍🐰‍🧑🏿',
+      '🧑🏽‍🐰‍🧑🏻',
+      '🧑🏽‍🐰‍🧑🏼',
+      '🧑🏽‍🐰‍🧑🏾',
+      '🧑🏽‍🐰‍🧑🏿',
+      '🧑🏾‍🐰‍🧑🏻',
+      '🧑🏾‍🐰‍🧑🏼',
+      '🧑🏾‍🐰‍🧑🏽',
+      '🧑🏾‍🐰‍🧑🏿',
+      '🧑🏿‍🐰‍🧑🏻',
+      '🧑🏿‍🐰‍🧑🏼',
+      '🧑🏿‍🐰‍🧑🏽',
+      '🧑🏿‍🐰‍🧑🏾',
+      '👨🏻‍🐰‍👨🏼',
+      '👨🏻‍🐰‍👨🏽',
+      '👨🏻‍🐰‍👨🏾',
+      '👨🏻‍🐰‍👨🏿',
+      '👨🏼‍🐰‍👨🏻',
+      '👨🏼‍🐰‍👨🏽',
+      '👨🏼‍🐰‍👨🏾',
+      '👨🏼‍🐰‍👨🏿',
+      '👨🏽‍🐰‍👨🏻',
+      '👨🏽‍🐰‍👨🏼',
+      '👨🏽‍🐰‍👨🏾',
+      '👨🏽‍🐰‍👨🏿',
+      '👨🏾‍🐰‍👨🏻',
+      '👨🏾‍🐰‍👨🏼',
+      '👨🏾‍🐰‍👨🏽',
+      '👨🏾‍🐰‍👨🏿',
+      '👨🏿‍🐰‍👨🏻',
+      '👨🏿‍🐰‍👨🏼',
+      '👨🏿‍🐰‍👨🏽',
+      '👨🏿‍🐰‍👨🏾',
+      '👩🏻‍🐰‍👩🏼',
+      '👩🏻‍🐰‍👩🏽',
+      '👩🏻‍🐰‍👩🏾',
+      '👩🏻‍🐰‍👩🏿',
+      '👩🏼‍🐰‍👩🏻',
+      '👩🏼‍🐰‍👩🏽',
+      '👩🏼‍🐰‍👩🏾',
+      '👩🏼‍🐰‍👩🏿',
+      '👩🏽‍🐰‍👩🏻',
+      '👩🏽‍🐰‍👩🏼',
+      '👩🏽‍🐰‍👩🏾',
+      '👩🏽‍🐰‍👩🏿',
+      '👩🏾‍🐰‍👩🏻',
+      '👩🏾‍🐰‍👩🏼',
+      '👩🏾‍🐰‍👩🏽',
+      '👩🏾‍🐰‍👩🏿',
+      '👩🏿‍🐰‍👩🏻',
+      '👩🏿‍🐰‍👩🏼',
+      '👩🏿‍🐰‍👩🏽',
+      '👩🏿‍🐰‍👩🏾',
+      '🧖',
+      '🧖🏻',
+      '🧖🏼',
+      '🧖🏽',
+      '🧖🏾',
+      '🧖🏿',
+      '🧖‍♂️',
+      '🧖🏻‍♂️',
+      '🧖🏼‍♂️',
+      '🧖🏽‍♂️',
+      '🧖🏾‍♂️',
+      '🧖🏿‍♂️',
+      '🧖‍♀️',
+      '🧖🏻‍♀️',
+      '🧖🏼‍♀️',
+      '🧖🏽‍♀️',
+      '🧖🏾‍♀️',
+      '🧖🏿‍♀️',
+      '🧗',
+      '🧗🏻',
+      '🧗🏼',
+      '🧗🏽',
+      '🧗🏾',
+      '🧗🏿',
+      '🧗‍♂️',
+      '🧗🏻‍♂️',
+      '🧗🏼‍♂️',
+      '🧗🏽‍♂️',
+      '🧗🏾‍♂️',
+      '🧗🏿‍♂️',
+      '🧗‍♀️',
+      '🧗🏻‍♀️',
+      '🧗🏼‍♀️',
+      '🧗🏽‍♀️',
+      '🧗🏾‍♀️',
+      '🧗🏿‍♀️',
+      '🤺',
+      '🏇',
+      '🏇🏻',
+      '🏇🏼',
+      '🏇🏽',
+      '🏇🏾',
+      '🏇🏿',
+      '⛷️',
+      '🏂',
+      '🏂🏻',
+      '🏂🏼',
+      '🏂🏽',
+      '🏂🏾',
+      '🏂🏿',
+      '🏌️',
+      '🏌🏻',
+      '🏌🏼',
+      '🏌🏽',
+      '🏌🏾',
+      '🏌🏿',
+      '🏌️‍♂️',
+      '🏌🏻‍♂️',
+      '🏌🏼‍♂️',
+      '🏌🏽‍♂️',
+      '🏌🏾‍♂️',
+      '🏌🏿‍♂️',
+      '🏌️‍♀️',
+      '🏌🏻‍♀️',
+      '🏌🏼‍♀️',
+      '🏌🏽‍♀️',
+      '🏌🏾‍♀️',
+      '🏌🏿‍♀️',
+      '🏄',
+      '🏄🏻',
+      '🏄🏼',
+      '🏄🏽',
+      '🏄🏾',
+      '🏄🏿',
+      '🏄‍♂️',
+      '🏄🏻‍♂️',
+      '🏄🏼‍♂️',
+      '🏄🏽‍♂️',
+      '🏄🏾‍♂️',
+      '🏄🏿‍♂️',
+      '🏄‍♀️',
+      '🏄🏻‍♀️',
+      '🏄🏼‍♀️',
+      '🏄🏽‍♀️',
+      '🏄🏾‍♀️',
+      '🏄🏿‍♀️',
+      '🚣',
+      '🚣🏻',
+      '🚣🏼',
+      '🚣🏽',
+      '🚣🏾',
+      '🚣🏿',
+      '🚣‍♂️',
+      '🚣🏻‍♂️',
+      '🚣🏼‍♂️',
+      '🚣🏽‍♂️',
+      '🚣🏾‍♂️',
+      '🚣🏿‍♂️',
+      '🚣‍♀️',
+      '🚣🏻‍♀️',
+      '🚣🏼‍♀️',
+      '🚣🏽‍♀️',
+      '🚣🏾‍♀️',
+      '🚣🏿‍♀️',
+      '🏊',
+      '🏊🏻',
+      '🏊🏼',
+      '🏊🏽',
+      '🏊🏾',
+      '🏊🏿',
+      '🏊‍♂️',
+      '🏊🏻‍♂️',
+      '🏊🏼‍♂️',
+      '🏊🏽‍♂️',
+      '🏊🏾‍♂️',
+      '🏊🏿‍♂️',
+      '🏊‍♀️',
+      '🏊🏻‍♀️',
+      '🏊🏼‍♀️',
+      '🏊🏽‍♀️',
+      '🏊🏾‍♀️',
+      '🏊🏿‍♀️',
+      '⛹️',
+      '⛹🏻',
+      '⛹🏼',
+      '⛹🏽',
+      '⛹🏾',
+      '⛹🏿',
+      '⛹️‍♂️',
+      '⛹🏻‍♂️',
+      '⛹🏼‍♂️',
+      '⛹🏽‍♂️',
+      '⛹🏾‍♂️',
+      '⛹🏿‍♂️',
+      '⛹️‍♀️',
+      '⛹🏻‍♀️',
+      '⛹🏼‍♀️',
+      '⛹🏽‍♀️',
+      '⛹🏾‍♀️',
+      '⛹🏿‍♀️',
+      '🏋️',
+      '🏋🏻',
+      '🏋🏼',
+      '🏋🏽',
+      '🏋🏾',
+      '🏋🏿',
+      '🏋️‍♂️',
+      '🏋🏻‍♂️',
+      '🏋🏼‍♂️',
+      '🏋🏽‍♂️',
+      '🏋🏾‍♂️',
+      '🏋🏿‍♂️',
+      '🏋️‍♀️',
+      '🏋🏻‍♀️',
+      '🏋🏼‍♀️',
+      '🏋🏽‍♀️',
+      '🏋🏾‍♀️',
+      '🏋🏿‍♀️',
+      '🚴',
+      '🚴🏻',
+      '🚴🏼',
+      '🚴🏽',
+      '🚴🏾',
+      '🚴🏿',
+      '🚴‍♂️',
+      '🚴🏻‍♂️',
+      '🚴🏼‍♂️',
+      '🚴🏽‍♂️',
+      '🚴🏾‍♂️',
+      '🚴🏿‍♂️',
+      '🚴‍♀️',
+      '🚴🏻‍♀️',
+      '🚴🏼‍♀️',
+      '🚴🏽‍♀️',
+      '🚴🏾‍♀️',
+      '🚴🏿‍♀️',
+      '🚵',
+      '🚵🏻',
+      '🚵🏼',
+      '🚵🏽',
+      '🚵🏾',
+      '🚵🏿',
+      '🚵‍♂️',
+      '🚵🏻‍♂️',
+      '🚵🏼‍♂️',
+      '🚵🏽‍♂️',
+      '🚵🏾‍♂️',
+      '🚵🏿‍♂️',
+      '🚵‍♀️',
+      '🚵🏻‍♀️',
+      '🚵🏼‍♀️',
+      '🚵🏽‍♀️',
+      '🚵🏾‍♀️',
+      '🚵🏿‍♀️',
+      '🤸',
+      '🤸🏻',
+      '🤸🏼',
+      '🤸🏽',
+      '🤸🏾',
+      '🤸🏿',
+      '🤸‍♂️',
+      '🤸🏻‍♂️',
+      '🤸🏼‍♂️',
+      '🤸🏽‍♂️',
+      '🤸🏾‍♂️',
+      '🤸🏿‍♂️',
+      '🤸‍♀️',
+      '🤸🏻‍♀️',
+      '🤸🏼‍♀️',
+      '🤸🏽‍♀️',
+      '🤸🏾‍♀️',
+      '🤸🏿‍♀️',
+      '🤼',
+      '🤼🏻',
+      '🤼🏼',
+      '🤼🏽',
+      '🤼🏾',
+      '🤼🏿',
+      '🤼‍♂️',
+      '🤼🏻‍♂️',
+      '🤼🏼‍♂️',
+      '🤼🏽‍♂️',
+      '🤼🏾‍♂️',
+      '🤼🏿‍♂️',
+      '🤼‍♀️',
+      '🤼🏻‍♀️',
+      '🤼🏼‍♀️',
+      '🤼🏽‍♀️',
+      '🤼🏾‍♀️',
+      '🤼🏿‍♀️',
+      '🧑🏻‍🫯‍🧑🏼',
+      '🧑🏻‍🫯‍🧑🏽',
+      '🧑🏻‍🫯‍🧑🏾',
+      '🧑🏻‍🫯‍🧑🏿',
+      '🧑🏼‍🫯‍🧑🏻',
+      '🧑🏼‍🫯‍🧑🏽',
+      '🧑🏼‍🫯‍🧑🏾',
+      '🧑🏼‍🫯‍🧑🏿',
+      '🧑🏽‍🫯‍🧑🏻',
+      '🧑🏽‍🫯‍🧑🏼',
+      '🧑🏽‍🫯‍🧑🏾',
+      '🧑🏽‍🫯‍🧑🏿',
+      '🧑🏾‍🫯‍🧑🏻',
+      '🧑🏾‍🫯‍🧑🏼',
+      '🧑🏾‍🫯‍🧑🏽',
+      '🧑🏾‍🫯‍🧑🏿',
+      '🧑🏿‍🫯‍🧑🏻',
+      '🧑🏿‍🫯‍🧑🏼',
+      '🧑🏿‍🫯‍🧑🏽',
+      '🧑🏿‍🫯‍🧑🏾',
+      '👨🏻‍🫯‍👨🏼',
+      '👨🏻‍🫯‍👨🏽',
+      '👨🏻‍🫯‍👨🏾',
+      '👨🏻‍🫯‍👨🏿',
+      '👨🏼‍🫯‍👨🏻',
+      '👨🏼‍🫯‍👨🏽',
+      '👨🏼‍🫯‍👨🏾',
+      '👨🏼‍🫯‍👨🏿',
+      '👨🏽‍🫯‍👨🏻',
+      '👨🏽‍🫯‍👨🏼',
+      '👨🏽‍🫯‍👨🏾',
+      '👨🏽‍🫯‍👨🏿',
+      '👨🏾‍🫯‍👨🏻',
+      '👨🏾‍🫯‍👨🏼',
+      '👨🏾‍🫯‍👨🏽',
+      '👨🏾‍🫯‍👨🏿',
+      '👨🏿‍🫯‍👨🏻',
+      '👨🏿‍🫯‍👨🏼',
+      '👨🏿‍🫯‍👨🏽',
+      '👨🏿‍🫯‍👨🏾',
+      '👩🏻‍🫯‍👩🏼',
+      '👩🏻‍🫯‍👩🏽',
+      '👩🏻‍🫯‍👩🏾',
+      '👩🏻‍🫯‍👩🏿',
+      '👩🏼‍🫯‍👩🏻',
+      '👩🏼‍🫯‍👩🏽',
+      '👩🏼‍🫯‍👩🏾',
+      '👩🏼‍🫯‍👩🏿',
+      '👩🏽‍🫯‍👩🏻',
+      '👩🏽‍🫯‍👩🏼',
+      '👩🏽‍🫯‍👩🏾',
+      '👩🏽‍🫯‍👩🏿',
+      '👩🏾‍🫯‍👩🏻',
+      '👩🏾‍🫯‍👩🏼',
+      '👩🏾‍🫯‍👩🏽',
+      '👩🏾‍🫯‍👩🏿',
+      '👩🏿‍🫯‍👩🏻',
+      '👩🏿‍🫯‍👩🏼',
+      '👩🏿‍🫯‍👩🏽',
+      '👩🏿‍🫯‍👩🏾',
+      '🤽',
+      '🤽🏻',
+      '🤽🏼',
+      '🤽🏽',
+      '🤽🏾',
+      '🤽🏿',
+      '🤽‍♂️',
+      '🤽🏻‍♂️',
+      '🤽🏼‍♂️',
+      '🤽🏽‍♂️',
+      '🤽🏾‍♂️',
+      '🤽🏿‍♂️',
+      '🤽‍♀️',
+      '🤽🏻‍♀️',
+      '🤽🏼‍♀️',
+      '🤽🏽‍♀️',
+      '🤽🏾‍♀️',
+      '🤽🏿‍♀️',
+      '🤾',
+      '🤾🏻',
+      '🤾🏼',
+      '🤾🏽',
+      '🤾🏾',
+      '🤾🏿',
+      '🤾‍♂️',
+      '🤾🏻‍♂️',
+      '🤾🏼‍♂️',
+      '🤾🏽‍♂️',
+      '🤾🏾‍♂️',
+      '🤾🏿‍♂️',
+      '🤾‍♀️',
+      '🤾🏻‍♀️',
+      '🤾🏼‍♀️',
+      '🤾🏽‍♀️',
+      '🤾🏾‍♀️',
+      '🤾🏿‍♀️',
+      '🤹',
+      '🤹🏻',
+      '🤹🏼',
+      '🤹🏽',
+      '🤹🏾',
+      '🤹🏿',
+      '🤹‍♂️',
+      '🤹🏻‍♂️',
+      '🤹🏼‍♂️',
+      '🤹🏽‍♂️',
+      '🤹🏾‍♂️',
+      '🤹🏿‍♂️',
+      '🤹‍♀️',
+      '🤹🏻‍♀️',
+      '🤹🏼‍♀️',
+      '🤹🏽‍♀️',
+      '🤹🏾‍♀️',
+      '🤹🏿‍♀️',
+      '🧘',
+      '🧘🏻',
+      '🧘🏼',
+      '🧘🏽',
+      '🧘🏾',
+      '🧘🏿',
+      '🧘‍♂️',
+      '🧘🏻‍♂️',
+      '🧘🏼‍♂️',
+      '🧘🏽‍♂️',
+      '🧘🏾‍♂️',
+      '🧘🏿‍♂️',
+      '🧘‍♀️',
+      '🧘🏻‍♀️',
+      '🧘🏼‍♀️',
+      '🧘🏽‍♀️',
+      '🧘🏾‍♀️',
+      '🧘🏿‍♀️',
+      '🛀',
+      '🛀🏻',
+      '🛀🏼',
+      '🛀🏽',
+      '🛀🏾',
+      '🛀🏿',
+      '🛌',
+      '🛌🏻',
+      '🛌🏼',
+      '🛌🏽',
+      '🛌🏾',
+      '🛌🏿',
+      '🧑‍🤝‍🧑',
+      '🧑🏻‍🤝‍🧑🏻',
+      '🧑🏻‍🤝‍🧑🏼',
+      '🧑🏻‍🤝‍🧑🏽',
+      '🧑🏻‍🤝‍🧑🏾',
+      '🧑🏻‍🤝‍🧑🏿',
+      '🧑🏼‍🤝‍🧑🏻',
+      '🧑🏼‍🤝‍🧑🏼',
+      '🧑🏼‍🤝‍🧑🏽',
+      '🧑🏼‍🤝‍🧑🏾',
+      '🧑🏼‍🤝‍🧑🏿',
+      '🧑🏽‍🤝‍🧑🏻',
+      '🧑🏽‍🤝‍🧑🏼',
+      '🧑🏽‍🤝‍🧑🏽',
+      '🧑🏽‍🤝‍🧑🏾',
+      '🧑🏽‍🤝‍🧑🏿',
+      '🧑🏾‍🤝‍🧑🏻',
+      '🧑🏾‍🤝‍🧑🏼',
+      '🧑🏾‍🤝‍🧑🏽',
+      '🧑🏾‍🤝‍🧑🏾',
+      '🧑🏾‍🤝‍🧑🏿',
+      '🧑🏿‍🤝‍🧑🏻',
+      '🧑🏿‍🤝‍🧑🏼',
+      '🧑🏿‍🤝‍🧑🏽',
+      '🧑🏿‍🤝‍🧑🏾',
+      '🧑🏿‍🤝‍🧑🏿',
+      '👭',
+      '👭🏻',
+      '👩🏻‍🤝‍👩🏼',
+      '👩🏻‍🤝‍👩🏽',
+      '👩🏻‍🤝‍👩🏾',
+      '👩🏻‍🤝‍👩🏿',
+      '👩🏼‍🤝‍👩🏻',
+      '👭🏼',
+      '👩🏼‍🤝‍👩🏽',
+      '👩🏼‍🤝‍👩🏾',
+      '👩🏼‍🤝‍👩🏿',
+      '👩🏽‍🤝‍👩🏻',
+      '👩🏽‍🤝‍👩🏼',
+      '👭🏽',
+      '👩🏽‍🤝‍👩🏾',
+      '👩🏽‍🤝‍👩🏿',
+      '👩🏾‍🤝‍👩🏻',
+      '👩🏾‍🤝‍👩🏼',
+      '👩🏾‍🤝‍👩🏽',
+      '👭🏾',
+      '👩🏾‍🤝‍👩🏿',
+      '👩🏿‍🤝‍👩🏻',
+      '👩🏿‍🤝‍👩🏼',
+      '👩🏿‍🤝‍👩🏽',
+      '👩🏿‍🤝‍👩🏾',
+      '👭🏿',
+      '👫',
+      '👫🏻',
+      '👩🏻‍🤝‍👨🏼',
+      '👩🏻‍🤝‍👨🏽',
+      '👩🏻‍🤝‍👨🏾',
+      '👩🏻‍🤝‍👨🏿',
+      '👩🏼‍🤝‍👨🏻',
+      '👫🏼',
+      '👩🏼‍🤝‍👨🏽',
+      '👩🏼‍🤝‍👨🏾',
+      '👩🏼‍🤝‍👨🏿',
+      '👩🏽‍🤝‍👨🏻',
+      '👩🏽‍🤝‍👨🏼',
+      '👫🏽',
+      '👩🏽‍🤝‍👨🏾',
+      '👩🏽‍🤝‍👨🏿',
+      '👩🏾‍🤝‍👨🏻',
+      '👩🏾‍🤝‍👨🏼',
+      '👩🏾‍🤝‍👨🏽',
+      '👫🏾',
+      '👩🏾‍🤝‍👨🏿',
+      '👩🏿‍🤝‍👨🏻',
+      '👩🏿‍🤝‍👨🏼',
+      '👩🏿‍🤝‍👨🏽',
+      '👩🏿‍🤝‍👨🏾',
+      '👫🏿',
+      '👬',
+      '👬🏻',
+      '👨🏻‍🤝‍👨🏼',
+      '👨🏻‍🤝‍👨🏽',
+      '👨🏻‍🤝‍👨🏾',
+      '👨🏻‍🤝‍👨🏿',
+      '👨🏼‍🤝‍👨🏻',
+      '👬🏼',
+      '👨🏼‍🤝‍👨🏽',
+      '👨🏼‍🤝‍👨🏾',
+      '👨🏼‍🤝‍👨🏿',
+      '👨🏽‍🤝‍👨🏻',
+      '👨🏽‍🤝‍👨🏼',
+      '👬🏽',
+      '👨🏽‍🤝‍👨🏾',
+      '👨🏽‍🤝‍👨🏿',
+      '👨🏾‍🤝‍👨🏻',
+      '👨🏾‍🤝‍👨🏼',
+      '👨🏾‍🤝‍👨🏽',
+      '👬🏾',
+      '👨🏾‍🤝‍👨🏿',
+      '👨🏿‍🤝‍👨🏻',
+      '👨🏿‍🤝‍👨🏼',
+      '👨🏿‍🤝‍👨🏽',
+      '👨🏿‍🤝‍👨🏾',
+      '👬🏿',
+      '💏',
+      '💏🏻',
+      '💏🏼',
+      '💏🏽',
+      '💏🏾',
+      '💏🏿',
+      '🧑🏻‍❤️‍💋‍🧑🏼',
+      '🧑🏻‍❤️‍💋‍🧑🏽',
+      '🧑🏻‍❤️‍💋‍🧑🏾',
+      '🧑🏻‍❤️‍💋‍🧑🏿',
+      '🧑🏼‍❤️‍💋‍🧑🏻',
+      '🧑🏼‍❤️‍💋‍🧑🏽',
+      '🧑🏼‍❤️‍💋‍🧑🏾',
+      '🧑🏼‍❤️‍💋‍🧑🏿',
+      '🧑🏽‍❤️‍💋‍🧑🏻',
+      '🧑🏽‍❤️‍💋‍🧑🏼',
+      '🧑🏽‍❤️‍💋‍🧑🏾',
+      '🧑🏽‍❤️‍💋‍🧑🏿',
+      '🧑🏾‍❤️‍💋‍🧑🏻',
+      '🧑🏾‍❤️‍💋‍🧑🏼',
+      '🧑🏾‍❤️‍💋‍🧑🏽',
+      '🧑🏾‍❤️‍💋‍🧑🏿',
+      '🧑🏿‍❤️‍💋‍🧑🏻',
+      '🧑🏿‍❤️‍💋‍🧑🏼',
+      '🧑🏿‍❤️‍💋‍🧑🏽',
+      '🧑🏿‍❤️‍💋‍🧑🏾',
+      '👩‍❤️‍💋‍👨',
+      '👩🏻‍❤️‍💋‍👨🏻',
+      '👩🏻‍❤️‍💋‍👨🏼',
+      '👩🏻‍❤️‍💋‍👨🏽',
+      '👩🏻‍❤️‍💋‍👨🏾',
+      '👩🏻‍❤️‍💋‍👨🏿',
+      '👩🏼‍❤️‍💋‍👨🏻',
+      '👩🏼‍❤️‍💋‍👨🏼',
+      '👩🏼‍❤️‍💋‍👨🏽',
+      '👩🏼‍❤️‍💋‍👨🏾',
+      '👩🏼‍❤️‍💋‍👨🏿',
+      '👩🏽‍❤️‍💋‍👨🏻',
+      '👩🏽‍❤️‍💋‍👨🏼',
+      '👩🏽‍❤️‍💋‍👨🏽',
+      '👩🏽‍❤️‍💋‍👨🏾',
+      '👩🏽‍❤️‍💋‍👨🏿',
+      '👩🏾‍❤️‍💋‍👨🏻',
+      '👩🏾‍❤️‍💋‍👨🏼',
+      '👩🏾‍❤️‍💋‍👨🏽',
+      '👩🏾‍❤️‍💋‍👨🏾',
+      '👩🏾‍❤️‍💋‍👨🏿',
+      '👩🏿‍❤️‍💋‍👨🏻',
+      '👩🏿‍❤️‍💋‍👨🏼',
+      '👩🏿‍❤️‍💋‍👨🏽',
+      '👩🏿‍❤️‍💋‍👨🏾',
+      '👩🏿‍❤️‍💋‍👨🏿',
+      '👨‍❤️‍💋‍👨',
+      '👨🏻‍❤️‍💋‍👨🏻',
+      '👨🏻‍❤️‍💋‍👨🏼',
+      '👨🏻‍❤️‍💋‍👨🏽',
+      '👨🏻‍❤️‍💋‍👨🏾',
+      '👨🏻‍❤️‍💋‍👨🏿',
+      '👨🏼‍❤️‍💋‍👨🏻',
+      '👨🏼‍❤️‍💋‍👨🏼',
+      '👨🏼‍❤️‍💋‍👨🏽',
+      '👨🏼‍❤️‍💋‍👨🏾',
+      '👨🏼‍❤️‍💋‍👨🏿',
+      '👨🏽‍❤️‍💋‍👨🏻',
+      '👨🏽‍❤️‍💋‍👨🏼',
+      '👨🏽‍❤️‍💋‍👨🏽',
+      '👨🏽‍❤️‍💋‍👨🏾',
+      '👨🏽‍❤️‍💋‍👨🏿',
+      '👨🏾‍❤️‍💋‍👨🏻',
+      '👨🏾‍❤️‍💋‍👨🏼',
+      '👨🏾‍❤️‍💋‍👨🏽',
+      '👨🏾‍❤️‍💋‍👨🏾',
+      '👨🏾‍❤️‍💋‍👨🏿',
+      '👨🏿‍❤️‍💋‍👨🏻',
+      '👨🏿‍❤️‍💋‍👨🏼',
+      '👨🏿‍❤️‍💋‍👨🏽',
+      '👨🏿‍❤️‍💋‍👨🏾',
+      '👨🏿‍❤️‍💋‍👨🏿',
+      '👩‍❤️‍💋‍👩',
+      '👩🏻‍❤️‍💋‍👩🏻',
+      '👩🏻‍❤️‍💋‍👩🏼',
+      '👩🏻‍❤️‍💋‍👩🏽',
+      '👩🏻‍❤️‍💋‍👩🏾',
+      '👩🏻‍❤️‍💋‍👩🏿',
+      '👩🏼‍❤️‍💋‍👩🏻',
+      '👩🏼‍❤️‍💋‍👩🏼',
+      '👩🏼‍❤️‍💋‍👩🏽',
+      '👩🏼‍❤️‍💋‍👩🏾',
+      '👩🏼‍❤️‍💋‍👩🏿',
+      '👩🏽‍❤️‍💋‍👩🏻',
+      '👩🏽‍❤️‍💋‍👩🏼',
+      '👩🏽‍❤️‍💋‍👩🏽',
+      '👩🏽‍❤️‍💋‍👩🏾',
+      '👩🏽‍❤️‍💋‍👩🏿',
+      '👩🏾‍❤️‍💋‍👩🏻',
+      '👩🏾‍❤️‍💋‍👩🏼',
+      '👩🏾‍❤️‍💋‍👩🏽',
+      '👩🏾‍❤️‍💋‍👩🏾',
+      '👩🏾‍❤️‍💋‍👩🏿',
+      '👩🏿‍❤️‍💋‍👩🏻',
+      '👩🏿‍❤️‍💋‍👩🏼',
+      '👩🏿‍❤️‍💋‍👩🏽',
+      '👩🏿‍❤️‍💋‍👩🏾',
+      '👩🏿‍❤️‍💋‍👩🏿',
+      '💑',
+      '💑🏻',
+      '💑🏼',
+      '💑🏽',
+      '💑🏾',
+      '💑🏿',
+      '🧑🏻‍❤️‍🧑🏼',
+      '🧑🏻‍❤️‍🧑🏽',
+      '🧑🏻‍❤️‍🧑🏾',
+      '🧑🏻‍❤️‍🧑🏿',
+      '🧑🏼‍❤️‍🧑🏻',
+      '🧑🏼‍❤️‍🧑🏽',
+      '🧑🏼‍❤️‍🧑🏾',
+      '🧑🏼‍❤️‍🧑🏿',
+      '🧑🏽‍❤️‍🧑🏻',
+      '🧑🏽‍❤️‍🧑🏼',
+      '🧑🏽‍❤️‍🧑🏾',
+      '🧑🏽‍❤️‍🧑🏿',
+      '🧑🏾‍❤️‍🧑🏻',
+      '🧑🏾‍❤️‍🧑🏼',
+      '🧑🏾‍❤️‍🧑🏽',
+      '🧑🏾‍❤️‍🧑🏿',
+      '🧑🏿‍❤️‍🧑🏻',
+      '🧑🏿‍❤️‍🧑🏼',
+      '🧑🏿‍❤️‍🧑🏽',
+      '🧑🏿‍❤️‍🧑🏾',
+      '👩‍❤️‍👨',
+      '👩🏻‍❤️‍👨🏻',
+      '👩🏻‍❤️‍👨🏼',
+      '👩🏻‍❤️‍👨🏽',
+      '👩🏻‍❤️‍👨🏾',
+      '👩🏻‍❤️‍👨🏿',
+      '👩🏼‍❤️‍👨🏻',
+      '👩🏼‍❤️‍👨🏼',
+      '👩🏼‍❤️‍👨🏽',
+      '👩🏼‍❤️‍👨🏾',
+      '👩🏼‍❤️‍👨🏿',
+      '👩🏽‍❤️‍👨🏻',
+      '👩🏽‍❤️‍👨🏼',
+      '👩🏽‍❤️‍👨🏽',
+      '👩🏽‍❤️‍👨🏾',
+      '👩🏽‍❤️‍👨🏿',
+      '👩🏾‍❤️‍👨🏻',
+      '👩🏾‍❤️‍👨🏼',
+      '👩🏾‍❤️‍👨🏽',
+      '👩🏾‍❤️‍👨🏾',
+      '👩🏾‍❤️‍👨🏿',
+      '👩🏿‍❤️‍👨🏻',
+      '👩🏿‍❤️‍👨🏼',
+      '👩🏿‍❤️‍👨🏽',
+      '👩🏿‍❤️‍👨🏾',
+      '👩🏿‍❤️‍👨🏿',
+      '👨‍❤️‍👨',
+      '👨🏻‍❤️‍👨🏻',
+      '👨🏻‍❤️‍👨🏼',
+      '👨🏻‍❤️‍👨🏽',
+      '👨🏻‍❤️‍👨🏾',
+      '👨🏻‍❤️‍👨🏿',
+      '👨🏼‍❤️‍👨🏻',
+      '👨🏼‍❤️‍👨🏼',
+      '👨🏼‍❤️‍👨🏽',
+      '👨🏼‍❤️‍👨🏾',
+      '👨🏼‍❤️‍👨🏿',
+      '👨🏽‍❤️‍👨🏻',
+      '👨🏽‍❤️‍👨🏼',
+      '👨🏽‍❤️‍👨🏽',
+      '👨🏽‍❤️‍👨🏾',
+      '👨🏽‍❤️‍👨🏿',
+      '👨🏾‍❤️‍👨🏻',
+      '👨🏾‍❤️‍👨🏼',
+      '👨🏾‍❤️‍👨🏽',
+      '👨🏾‍❤️‍👨🏾',
+      '👨🏾‍❤️‍👨🏿',
+      '👨🏿‍❤️‍👨🏻',
+      '👨🏿‍❤️‍👨🏼',
+      '👨🏿‍❤️‍👨🏽',
+      '👨🏿‍❤️‍👨🏾',
+      '👨🏿‍❤️‍👨🏿',
+      '👩‍❤️‍👩',
+      '👩🏻‍❤️‍👩🏻',
+      '👩🏻‍❤️‍👩🏼',
+      '👩🏻‍❤️‍👩🏽',
+      '👩🏻‍❤️‍👩🏾',
+      '👩🏻‍❤️‍👩🏿',
+      '👩🏼‍❤️‍👩🏻',
+      '👩🏼‍❤️‍👩🏼',
+      '👩🏼‍❤️‍👩🏽',
+      '👩🏼‍❤️‍👩🏾',
+      '👩🏼‍❤️‍👩🏿',
+      '👩🏽‍❤️‍👩🏻',
+      '👩🏽‍❤️‍👩🏼',
+      '👩🏽‍❤️‍👩🏽',
+      '👩🏽‍❤️‍👩🏾',
+      '👩🏽‍❤️‍👩🏿',
+      '👩🏾‍❤️‍👩🏻',
+      '👩🏾‍❤️‍👩🏼',
+      '👩🏾‍❤️‍👩🏽',
+      '👩🏾‍❤️‍👩🏾',
+      '👩🏾‍❤️‍👩🏿',
+      '👩🏿‍❤️‍👩🏻',
+      '👩🏿‍❤️‍👩🏼',
+      '👩🏿‍❤️‍👩🏽',
+      '👩🏿‍❤️‍👩🏾',
+      '👩🏿‍❤️‍👩🏿',
+      '👨‍👩‍👦',
+      '👨‍👩‍👧',
+      '👨‍👩‍👧‍👦',
+      '👨‍👩‍👦‍👦',
+      '👨‍👩‍👧‍👧',
+      '👨‍👨‍👦',
+      '👨‍👨‍👧',
+      '👨‍👨‍👧‍👦',
+      '👨‍👨‍👦‍👦',
+      '👨‍👨‍👧‍👧',
+      '👩‍👩‍👦',
+      '👩‍👩‍👧',
+      '👩‍👩‍👧‍👦',
+      '👩‍👩‍👦‍👦',
+      '👩‍👩‍👧‍👧',
+      '👨‍👦',
+      '👨‍👦‍👦',
+      '👨‍👧',
+      '👨‍👧‍👦',
+      '👨‍👧‍👧',
+      '👩‍👦',
+      '👩‍👦‍👦',
+      '👩‍👧',
+      '👩‍👧‍👦',
+      '👩‍👧‍👧',
+      '🗣️',
+      '👤',
+      '👥',
+      '🫂',
+      '👪',
+      '🧑‍🧑‍🧒',
+      '🧑‍🧑‍🧒‍🧒',
+      '🧑‍🧒',
+      '🧑‍🧒‍🧒',
+      '👣',
+      '🫆',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Corazones',
+    icon: '💖',
+    emojis: [
+      '💌',
+      '💘',
+      '💝',
+      '💖',
+      '💗',
+      '💓',
+      '💞',
+      '💕',
+      '💟',
+      '❣️',
+      '💔',
+      '❤️‍🔥',
+      '❤️‍🩹',
+      '❤️',
+      '🩷',
+      '🧡',
+      '💛',
+      '💚',
+      '💙',
+      '🩵',
+      '💜',
+      '🤎',
+      '🖤',
+      '🩶',
+      '🤍',
+      '💋',
+      '💯',
+      '💢',
+      '🫯',
+      '💥',
+      '💫',
+      '💦',
+      '💨',
+      '🕳️',
+      '💬',
+      '👁️‍🗨️',
+      '🗨️',
+      '🗯️',
+      '💭',
+      '💤',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Naturaleza',
+    icon: '🌿',
+    emojis: [
+      '🐵',
+      '🐒',
+      '🦍',
+      '🦧',
+      '🐶',
+      '🐕',
+      '🦮',
+      '🐕‍🦺',
+      '🐩',
+      '🐺',
+      '🦊',
+      '🦝',
+      '🐱',
+      '🐈',
+      '🐈‍⬛',
+      '🦁',
+      '🐯',
+      '🐅',
+      '🐆',
+      '🐴',
+      '🫎',
+      '🫏',
+      '🐎',
+      '🦄',
+      '🦓',
+      '🦌',
+      '🦬',
+      '🐮',
+      '🐂',
+      '🐃',
+      '🐄',
+      '🐷',
+      '🐖',
+      '🐗',
+      '🐽',
+      '🐏',
+      '🐑',
+      '🐐',
+      '🐪',
+      '🐫',
+      '🦙',
+      '🦒',
+      '🐘',
+      '🦣',
+      '🦏',
+      '🦛',
+      '🐭',
+      '🐁',
+      '🐀',
+      '🐹',
+      '🐰',
+      '🐇',
+      '🐿️',
+      '🦫',
+      '🦔',
+      '🦇',
+      '🐻',
+      '🐻‍❄️',
+      '🐨',
+      '🐼',
+      '🦥',
+      '🦦',
+      '🦨',
+      '🦘',
+      '🦡',
+      '🐾',
+      '🦃',
+      '🐔',
+      '🐓',
+      '🐣',
+      '🐤',
+      '🐥',
+      '🐦',
+      '🐧',
+      '🕊️',
+      '🦅',
+      '🦆',
+      '🦢',
+      '🦉',
+      '🦤',
+      '🪶',
+      '🦩',
+      '🦚',
+      '🦜',
+      '🪽',
+      '🐦‍⬛',
+      '🪿',
+      '🐦‍🔥',
+      '🐸',
+      '🐊',
+      '🐢',
+      '🦎',
+      '🐍',
+      '🐲',
+      '🐉',
+      '🦕',
+      '🦖',
+      '🐳',
+      '🐋',
+      '🐬',
+      '🫍',
+      '🦭',
+      '🐟',
+      '🐠',
+      '🐡',
+      '🦈',
+      '🐙',
+      '🐚',
+      '🪸',
+      '🪼',
+      '🦀',
+      '🦞',
+      '🦐',
+      '🦑',
+      '🦪',
+      '🐌',
+      '🦋',
+      '🐛',
+      '🐜',
+      '🐝',
+      '🪲',
+      '🐞',
+      '🦗',
+      '🪳',
+      '🕷️',
+      '🕸️',
+      '🦂',
+      '🦟',
+      '🪰',
+      '🪱',
+      '🦠',
+      '💐',
+      '🌸',
+      '💮',
+      '🪷',
+      '🏵️',
+      '🌹',
+      '🥀',
+      '🌺',
+      '🌻',
+      '🌼',
+      '🌷',
+      '🪻',
+      '🌱',
+      '🪴',
+      '🌲',
+      '🌳',
+      '🌴',
+      '🌵',
+      '🌾',
+      '🌿',
+      '☘️',
+      '🍀',
+      '🍁',
+      '🍂',
+      '🍃',
+      '🪹',
+      '🪺',
+      '🍄',
+      '🪾',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Comida',
+    icon: '🍕',
+    emojis: [
+      '🍇',
+      '🍈',
+      '🍉',
+      '🍊',
+      '🍋',
+      '🍋‍🟩',
+      '🍌',
+      '🍍',
+      '🥭',
+      '🍎',
+      '🍏',
+      '🍐',
+      '🍑',
+      '🍒',
+      '🍓',
+      '🫐',
+      '🥝',
+      '🍅',
+      '🫒',
+      '🥥',
+      '🥑',
+      '🍆',
+      '🥔',
+      '🥕',
+      '🌽',
+      '🌶️',
+      '🫑',
+      '🥒',
+      '🥬',
+      '🥦',
+      '🧄',
+      '🧅',
+      '🥜',
+      '🫘',
+      '🌰',
+      '🫚',
+      '🫛',
+      '🍄‍🟫',
+      '🫜',
+      '🍞',
+      '🥐',
+      '🥖',
+      '🫓',
+      '🥨',
+      '🥯',
+      '🥞',
+      '🧇',
+      '🧀',
+      '🍖',
+      '🍗',
+      '🥩',
+      '🥓',
+      '🍔',
+      '🍟',
+      '🍕',
+      '🌭',
+      '🥪',
+      '🌮',
+      '🌯',
+      '🫔',
+      '🥙',
+      '🧆',
+      '🥚',
+      '🍳',
+      '🥘',
+      '🍲',
+      '🫕',
+      '🥣',
+      '🥗',
+      '🍿',
+      '🧈',
+      '🧂',
+      '🥫',
+      '🍱',
+      '🍘',
+      '🍙',
+      '🍚',
+      '🍛',
+      '🍜',
+      '🍝',
+      '🍠',
+      '🍢',
+      '🍣',
+      '🍤',
+      '🍥',
+      '🥮',
+      '🍡',
+      '🥟',
+      '🥠',
+      '🥡',
+      '🍦',
+      '🍧',
+      '🍨',
+      '🍩',
+      '🍪',
+      '🎂',
+      '🍰',
+      '🧁',
+      '🥧',
+      '🍫',
+      '🍬',
+      '🍭',
+      '🍮',
+      '🍯',
+      '🍼',
+      '🥛',
+      '☕',
+      '🫖',
+      '🍵',
+      '🍶',
+      '🍾',
+      '🍷',
+      '🍸',
+      '🍹',
+      '🍺',
+      '🍻',
+      '🥂',
+      '🥃',
+      '🫗',
+      '🥤',
+      '🧋',
+      '🧃',
+      '🧉',
+      '🧊',
+      '🥢',
+      '🍽️',
+      '🍴',
+      '🥄',
+      '🔪',
+      '🫙',
+      '🏺',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Planes',
+    icon: '⚽',
+    emojis: [
+      '🎃',
+      '🎄',
+      '🎆',
+      '🎇',
+      '🧨',
+      '✨',
+      '🎈',
+      '🎉',
+      '🎊',
+      '🎋',
+      '🎍',
+      '🎎',
+      '🎏',
+      '🎐',
+      '🎑',
+      '🧧',
+      '🎀',
+      '🎁',
+      '🎗️',
+      '🎟️',
+      '🎫',
+      '🎖️',
+      '🏆',
+      '🏅',
+      '🥇',
+      '🥈',
+      '🥉',
+      '⚽',
+      '⚾',
+      '🥎',
+      '🏀',
+      '🏐',
+      '🏈',
+      '🏉',
+      '🎾',
+      '🥏',
+      '🎳',
+      '🏏',
+      '🏑',
+      '🏒',
+      '🥍',
+      '🏓',
+      '🏸',
+      '🥊',
+      '🥋',
+      '🥅',
+      '⛳',
+      '⛸️',
+      '🎣',
+      '🤿',
+      '🎽',
+      '🎿',
+      '🛷',
+      '🥌',
+      '🎯',
+      '🪀',
+      '🪁',
+      '🔫',
+      '🎱',
+      '🔮',
+      '🪄',
+      '🎮',
+      '🕹️',
+      '🎰',
+      '🎲',
+      '🧩',
+      '🧸',
+      '🪅',
+      '🪩',
+      '🪆',
+      '♠️',
+      '♥️',
+      '♦️',
+      '♣️',
+      '♟️',
+      '🃏',
+      '🀄',
+      '🎴',
+      '🎭',
+      '🖼️',
+      '🎨',
+      '🧵',
+      '🪡',
+      '🧶',
+      '🪢',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Viajes',
+    icon: '✈️',
+    emojis: [
+      '🌍',
+      '🌎',
+      '🌏',
+      '🌐',
+      '🗺️',
+      '🗾',
+      '🧭',
+      '🏔️',
+      '⛰️',
+      '🛘',
+      '🌋',
+      '🗻',
+      '🏕️',
+      '🏖️',
+      '🏜️',
+      '🏝️',
+      '🏞️',
+      '🏟️',
+      '🏛️',
+      '🏗️',
+      '🧱',
+      '🪨',
+      '🪵',
+      '🛖',
+      '🏘️',
+      '🏚️',
+      '🏠',
+      '🏡',
+      '🏢',
+      '🏣',
+      '🏤',
+      '🏥',
+      '🏦',
+      '🏨',
+      '🏩',
+      '🏪',
+      '🏫',
+      '🏬',
+      '🏭',
+      '🏯',
+      '🏰',
+      '💒',
+      '🗼',
+      '🗽',
+      '⛪',
+      '🕌',
+      '🛕',
+      '🕍',
+      '⛩️',
+      '🕋',
+      '⛲',
+      '⛺',
+      '🌁',
+      '🌃',
+      '🏙️',
+      '🌄',
+      '🌅',
+      '🌆',
+      '🌇',
+      '🌉',
+      '♨️',
+      '🎠',
+      '🛝',
+      '🎡',
+      '🎢',
+      '💈',
+      '🎪',
+      '🚂',
+      '🚃',
+      '🚄',
+      '🚅',
+      '🚆',
+      '🚇',
+      '🚈',
+      '🚉',
+      '🚊',
+      '🚝',
+      '🚞',
+      '🚋',
+      '🚌',
+      '🚍',
+      '🚎',
+      '🚐',
+      '🚑',
+      '🚒',
+      '🚓',
+      '🚔',
+      '🚕',
+      '🚖',
+      '🚗',
+      '🚘',
+      '🚙',
+      '🛻',
+      '🚚',
+      '🚛',
+      '🚜',
+      '🏎️',
+      '🏍️',
+      '🛵',
+      '🦽',
+      '🦼',
+      '🛺',
+      '🚲',
+      '🛴',
+      '🛹',
+      '🛼',
+      '🚏',
+      '🛣️',
+      '🛤️',
+      '🛢️',
+      '⛽',
+      '🛞',
+      '🚨',
+      '🚥',
+      '🚦',
+      '🛑',
+      '🚧',
+      '⚓',
+      '🛟',
+      '⛵',
+      '🛶',
+      '🚤',
+      '🛳️',
+      '⛴️',
+      '🛥️',
+      '🚢',
+      '✈️',
+      '🛩️',
+      '🛫',
+      '🛬',
+      '🪂',
+      '💺',
+      '🚁',
+      '🚟',
+      '🚠',
+      '🚡',
+      '🛰️',
+      '🚀',
+      '🛸',
+      '🛎️',
+      '🧳',
+      '⌛',
+      '⏳',
+      '⌚',
+      '⏰',
+      '⏱️',
+      '⏲️',
+      '🕰️',
+      '🕛',
+      '🕧',
+      '🕐',
+      '🕜',
+      '🕑',
+      '🕝',
+      '🕒',
+      '🕞',
+      '🕓',
+      '🕟',
+      '🕔',
+      '🕠',
+      '🕕',
+      '🕡',
+      '🕖',
+      '🕢',
+      '🕗',
+      '🕣',
+      '🕘',
+      '🕤',
+      '🕙',
+      '🕥',
+      '🕚',
+      '🕦',
+      '🌑',
+      '🌒',
+      '🌓',
+      '🌔',
+      '🌕',
+      '🌖',
+      '🌗',
+      '🌘',
+      '🌙',
+      '🌚',
+      '🌛',
+      '🌜',
+      '🌡️',
+      '☀️',
+      '🌝',
+      '🌞',
+      '🪐',
+      '⭐',
+      '🌟',
+      '🌠',
+      '🌌',
+      '☁️',
+      '⛅',
+      '⛈️',
+      '🌤️',
+      '🌥️',
+      '🌦️',
+      '🌧️',
+      '🌨️',
+      '🌩️',
+      '🌪️',
+      '🌫️',
+      '🌬️',
+      '🌀',
+      '🌈',
+      '🌂',
+      '☂️',
+      '☔',
+      '⛱️',
+      '⚡',
+      '❄️',
+      '☃️',
+      '⛄',
+      '☄️',
+      '🔥',
+      '💧',
+      '🌊',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Objetos',
+    icon: '💡',
+    emojis: [
+      '👓',
+      '🕶️',
+      '🥽',
+      '🥼',
+      '🦺',
+      '👔',
+      '👕',
+      '👖',
+      '🧣',
+      '🧤',
+      '🧥',
+      '🧦',
+      '👗',
+      '👘',
+      '🥻',
+      '🩱',
+      '🩲',
+      '🩳',
+      '👙',
+      '👚',
+      '🪭',
+      '👛',
+      '👜',
+      '👝',
+      '🛍️',
+      '🎒',
+      '🩴',
+      '👞',
+      '👟',
+      '🥾',
+      '🥿',
+      '👠',
+      '👡',
+      '🩰',
+      '👢',
+      '🪮',
+      '👑',
+      '👒',
+      '🎩',
+      '🎓',
+      '🧢',
+      '🪖',
+      '⛑️',
+      '📿',
+      '💄',
+      '💍',
+      '💎',
+      '🔇',
+      '🔈',
+      '🔉',
+      '🔊',
+      '📢',
+      '📣',
+      '📯',
+      '🔔',
+      '🔕',
+      '🎼',
+      '🎵',
+      '🎶',
+      '🎙️',
+      '🎚️',
+      '🎛️',
+      '🎤',
+      '🎧',
+      '📻',
+      '🎷',
+      '🎺',
+      '🪊',
+      '🪗',
+      '🎸',
+      '🎹',
+      '🎻',
+      '🪕',
+      '🥁',
+      '🪘',
+      '🪇',
+      '🪈',
+      '🪉',
+      '📱',
+      '📲',
+      '☎️',
+      '📞',
+      '📟',
+      '📠',
+      '🔋',
+      '🪫',
+      '🔌',
+      '💻',
+      '🖥️',
+      '🖨️',
+      '⌨️',
+      '🖱️',
+      '🖲️',
+      '💽',
+      '💾',
+      '💿',
+      '📀',
+      '🧮',
+      '🎥',
+      '🎞️',
+      '📽️',
+      '🎬',
+      '📺',
+      '📷',
+      '📸',
+      '📹',
+      '📼',
+      '🔍',
+      '🔎',
+      '🕯️',
+      '💡',
+      '🔦',
+      '🏮',
+      '🪔',
+      '📔',
+      '📕',
+      '📖',
+      '📗',
+      '📘',
+      '📙',
+      '📚',
+      '📓',
+      '📒',
+      '📃',
+      '📜',
+      '📄',
+      '📰',
+      '🗞️',
+      '📑',
+      '🔖',
+      '🏷️',
+      '🪙',
+      '💰',
+      '🪎',
+      '💴',
+      '💵',
+      '💶',
+      '💷',
+      '💸',
+      '💳',
+      '🧾',
+      '💹',
+      '✉️',
+      '📧',
+      '📨',
+      '📩',
+      '📤',
+      '📥',
+      '📦',
+      '📫',
+      '📪',
+      '📬',
+      '📭',
+      '📮',
+      '🗳️',
+      '✏️',
+      '✒️',
+      '🖋️',
+      '🖊️',
+      '🖌️',
+      '🖍️',
+      '📝',
+      '💼',
+      '📁',
+      '📂',
+      '🗂️',
+      '📅',
+      '📆',
+      '🗒️',
+      '🗓️',
+      '📇',
+      '📈',
+      '📉',
+      '📊',
+      '📋',
+      '📌',
+      '📍',
+      '📎',
+      '🖇️',
+      '📏',
+      '📐',
+      '✂️',
+      '🗃️',
+      '🗄️',
+      '🗑️',
+      '🔒',
+      '🔓',
+      '🔏',
+      '🔐',
+      '🔑',
+      '🗝️',
+      '🔨',
+      '🪓',
+      '⛏️',
+      '⚒️',
+      '🛠️',
+      '🗡️',
+      '⚔️',
+      '💣',
+      '🪃',
+      '🏹',
+      '🛡️',
+      '🪚',
+      '🔧',
+      '🪛',
+      '🔩',
+      '⚙️',
+      '🗜️',
+      '⚖️',
+      '🦯',
+      '🔗',
+      '⛓️‍💥',
+      '⛓️',
+      '🪝',
+      '🧰',
+      '🧲',
+      '🪜',
+      '🪏',
+      '⚗️',
+      '🧪',
+      '🧫',
+      '🧬',
+      '🔬',
+      '🔭',
+      '📡',
+      '💉',
+      '🩸',
+      '💊',
+      '🩹',
+      '🩼',
+      '🩺',
+      '🩻',
+      '🚪',
+      '🛗',
+      '🪞',
+      '🪟',
+      '🛏️',
+      '🛋️',
+      '🪑',
+      '🚽',
+      '🪠',
+      '🚿',
+      '🛁',
+      '🪤',
+      '🪒',
+      '🧴',
+      '🧷',
+      '🧹',
+      '🧺',
+      '🧻',
+      '🪣',
+      '🧼',
+      '🫧',
+      '🪥',
+      '🧽',
+      '🧯',
+      '🛒',
+      '🚬',
+      '⚰️',
+      '🪦',
+      '⚱️',
+      '🧿',
+      '🪬',
+      '🗿',
+      '🪧',
+      '🪪',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Símbolos',
+    icon: '✨',
+    emojis: [
+      '🏧',
+      '🚮',
+      '🚰',
+      '♿',
+      '🚹',
+      '🚺',
+      '🚻',
+      '🚼',
+      '🚾',
+      '🛂',
+      '🛃',
+      '🛄',
+      '🛅',
+      '⚠️',
+      '🚸',
+      '⛔',
+      '🚫',
+      '🚳',
+      '🚭',
+      '🚯',
+      '🚱',
+      '🚷',
+      '📵',
+      '🔞',
+      '☢️',
+      '☣️',
+      '⬆️',
+      '↗️',
+      '➡️',
+      '↘️',
+      '⬇️',
+      '↙️',
+      '⬅️',
+      '↖️',
+      '↕️',
+      '↔️',
+      '↩️',
+      '↪️',
+      '⤴️',
+      '⤵️',
+      '🔃',
+      '🔄',
+      '🔙',
+      '🔚',
+      '🔛',
+      '🔜',
+      '🔝',
+      '🛐',
+      '⚛️',
+      '🕉️',
+      '✡️',
+      '☸️',
+      '☯️',
+      '✝️',
+      '☦️',
+      '☪️',
+      '☮️',
+      '🕎',
+      '🔯',
+      '🪯',
+      '♈',
+      '♉',
+      '♊',
+      '♋',
+      '♌',
+      '♍',
+      '♎',
+      '♏',
+      '♐',
+      '♑',
+      '♒',
+      '♓',
+      '⛎',
+      '🔀',
+      '🔁',
+      '🔂',
+      '▶️',
+      '⏩',
+      '⏭️',
+      '⏯️',
+      '◀️',
+      '⏪',
+      '⏮️',
+      '🔼',
+      '⏫',
+      '🔽',
+      '⏬',
+      '⏸️',
+      '⏹️',
+      '⏺️',
+      '⏏️',
+      '🎦',
+      '🔅',
+      '🔆',
+      '📶',
+      '🛜',
+      '📳',
+      '📴',
+      '♀️',
+      '♂️',
+      '⚧️',
+      '✖️',
+      '➕',
+      '➖',
+      '➗',
+      '🟰',
+      '♾️',
+      '‼️',
+      '⁉️',
+      '❓',
+      '❔',
+      '❕',
+      '❗',
+      '〰️',
+      '💱',
+      '💲',
+      '⚕️',
+      '♻️',
+      '⚜️',
+      '🔱',
+      '📛',
+      '🔰',
+      '⭕',
+      '✅',
+      '☑️',
+      '✔️',
+      '❌',
+      '❎',
+      '➰',
+      '➿',
+      '〽️',
+      '✳️',
+      '✴️',
+      '❇️',
+      '©️',
+      '®️',
+      '™️',
+      '🫟',
+      '#️⃣',
+      '*️⃣',
+      '0️⃣',
+      '1️⃣',
+      '2️⃣',
+      '3️⃣',
+      '4️⃣',
+      '5️⃣',
+      '6️⃣',
+      '7️⃣',
+      '8️⃣',
+      '9️⃣',
+      '🔟',
+      '🔠',
+      '🔡',
+      '🔢',
+      '🔣',
+      '🔤',
+      '🅰️',
+      '🆎',
+      '🅱️',
+      '🆑',
+      '🆒',
+      '🆓',
+      'ℹ️',
+      '🆔',
+      'Ⓜ️',
+      '🆕',
+      '🆖',
+      '🅾️',
+      '🆗',
+      '🅿️',
+      '🆘',
+      '🆙',
+      '🆚',
+      '🈁',
+      '🈂️',
+      '🈷️',
+      '🈶',
+      '🈯',
+      '🉐',
+      '🈹',
+      '🈚',
+      '🈲',
+      '🉑',
+      '🈸',
+      '🈴',
+      '🈳',
+      '㊗️',
+      '㊙️',
+      '🈺',
+      '🈵',
+      '🔴',
+      '🟠',
+      '🟡',
+      '🟢',
+      '🔵',
+      '🟣',
+      '🟤',
+      '⚫',
+      '⚪',
+      '🟥',
+      '🟧',
+      '🟨',
+      '🟩',
+      '🟦',
+      '🟪',
+      '🟫',
+      '⬛',
+      '⬜',
+      '◼️',
+      '◻️',
+      '◾',
+      '◽',
+      '▪️',
+      '▫️',
+      '🔶',
+      '🔷',
+      '🔸',
+      '🔹',
+      '🔺',
+      '🔻',
+      '💠',
+      '🔘',
+      '🔳',
+      '🔲',
+    ],
+  ),
+  EmojiReactionSection(
+    label: 'Banderas',
+    icon: '🏳️',
+    emojis: [
+      '🏁',
+      '🚩',
+      '🎌',
+      '🏴',
+      '🏳️',
+      '🏳️‍🌈',
+      '🏳️‍⚧️',
+      '🏴‍☠️',
+      '🇦🇨',
+      '🇦🇩',
+      '🇦🇪',
+      '🇦🇫',
+      '🇦🇬',
+      '🇦🇮',
+      '🇦🇱',
+      '🇦🇲',
+      '🇦🇴',
+      '🇦🇶',
+      '🇦🇷',
+      '🇦🇸',
+      '🇦🇹',
+      '🇦🇺',
+      '🇦🇼',
+      '🇦🇽',
+      '🇦🇿',
+      '🇧🇦',
+      '🇧🇧',
+      '🇧🇩',
+      '🇧🇪',
+      '🇧🇫',
+      '🇧🇬',
+      '🇧🇭',
+      '🇧🇮',
+      '🇧🇯',
+      '🇧🇱',
+      '🇧🇲',
+      '🇧🇳',
+      '🇧🇴',
+      '🇧🇶',
+      '🇧🇷',
+      '🇧🇸',
+      '🇧🇹',
+      '🇧🇻',
+      '🇧🇼',
+      '🇧🇾',
+      '🇧🇿',
+      '🇨🇦',
+      '🇨🇨',
+      '🇨🇩',
+      '🇨🇫',
+      '🇨🇬',
+      '🇨🇭',
+      '🇨🇮',
+      '🇨🇰',
+      '🇨🇱',
+      '🇨🇲',
+      '🇨🇳',
+      '🇨🇴',
+      '🇨🇵',
+      '🇨🇶',
+      '🇨🇷',
+      '🇨🇺',
+      '🇨🇻',
+      '🇨🇼',
+      '🇨🇽',
+      '🇨🇾',
+      '🇨🇿',
+      '🇩🇪',
+      '🇩🇬',
+      '🇩🇯',
+      '🇩🇰',
+      '🇩🇲',
+      '🇩🇴',
+      '🇩🇿',
+      '🇪🇦',
+      '🇪🇨',
+      '🇪🇪',
+      '🇪🇬',
+      '🇪🇭',
+      '🇪🇷',
+      '🇪🇸',
+      '🇪🇹',
+      '🇪🇺',
+      '🇫🇮',
+      '🇫🇯',
+      '🇫🇰',
+      '🇫🇲',
+      '🇫🇴',
+      '🇫🇷',
+      '🇬🇦',
+      '🇬🇧',
+      '🇬🇩',
+      '🇬🇪',
+      '🇬🇫',
+      '🇬🇬',
+      '🇬🇭',
+      '🇬🇮',
+      '🇬🇱',
+      '🇬🇲',
+      '🇬🇳',
+      '🇬🇵',
+      '🇬🇶',
+      '🇬🇷',
+      '🇬🇸',
+      '🇬🇹',
+      '🇬🇺',
+      '🇬🇼',
+      '🇬🇾',
+      '🇭🇰',
+      '🇭🇲',
+      '🇭🇳',
+      '🇭🇷',
+      '🇭🇹',
+      '🇭🇺',
+      '🇮🇨',
+      '🇮🇩',
+      '🇮🇪',
+      '🇮🇱',
+      '🇮🇲',
+      '🇮🇳',
+      '🇮🇴',
+      '🇮🇶',
+      '🇮🇷',
+      '🇮🇸',
+      '🇮🇹',
+      '🇯🇪',
+      '🇯🇲',
+      '🇯🇴',
+      '🇯🇵',
+      '🇰🇪',
+      '🇰🇬',
+      '🇰🇭',
+      '🇰🇮',
+      '🇰🇲',
+      '🇰🇳',
+      '🇰🇵',
+      '🇰🇷',
+      '🇰🇼',
+      '🇰🇾',
+      '🇰🇿',
+      '🇱🇦',
+      '🇱🇧',
+      '🇱🇨',
+      '🇱🇮',
+      '🇱🇰',
+      '🇱🇷',
+      '🇱🇸',
+      '🇱🇹',
+      '🇱🇺',
+      '🇱🇻',
+      '🇱🇾',
+      '🇲🇦',
+      '🇲🇨',
+      '🇲🇩',
+      '🇲🇪',
+      '🇲🇫',
+      '🇲🇬',
+      '🇲🇭',
+      '🇲🇰',
+      '🇲🇱',
+      '🇲🇲',
+      '🇲🇳',
+      '🇲🇴',
+      '🇲🇵',
+      '🇲🇶',
+      '🇲🇷',
+      '🇲🇸',
+      '🇲🇹',
+      '🇲🇺',
+      '🇲🇻',
+      '🇲🇼',
+      '🇲🇽',
+      '🇲🇾',
+      '🇲🇿',
+      '🇳🇦',
+      '🇳🇨',
+      '🇳🇪',
+      '🇳🇫',
+      '🇳🇬',
+      '🇳🇮',
+      '🇳🇱',
+      '🇳🇴',
+      '🇳🇵',
+      '🇳🇷',
+      '🇳🇺',
+      '🇳🇿',
+      '🇴🇲',
+      '🇵🇦',
+      '🇵🇪',
+      '🇵🇫',
+      '🇵🇬',
+      '🇵🇭',
+      '🇵🇰',
+      '🇵🇱',
+      '🇵🇲',
+      '🇵🇳',
+      '🇵🇷',
+      '🇵🇸',
+      '🇵🇹',
+      '🇵🇼',
+      '🇵🇾',
+      '🇶🇦',
+      '🇷🇪',
+      '🇷🇴',
+      '🇷🇸',
+      '🇷🇺',
+      '🇷🇼',
+      '🇸🇦',
+      '🇸🇧',
+      '🇸🇨',
+      '🇸🇩',
+      '🇸🇪',
+      '🇸🇬',
+      '🇸🇭',
+      '🇸🇮',
+      '🇸🇯',
+      '🇸🇰',
+      '🇸🇱',
+      '🇸🇲',
+      '🇸🇳',
+      '🇸🇴',
+      '🇸🇷',
+      '🇸🇸',
+      '🇸🇹',
+      '🇸🇻',
+      '🇸🇽',
+      '🇸🇾',
+      '🇸🇿',
+      '🇹🇦',
+      '🇹🇨',
+      '🇹🇩',
+      '🇹🇫',
+      '🇹🇬',
+      '🇹🇭',
+      '🇹🇯',
+      '🇹🇰',
+      '🇹🇱',
+      '🇹🇲',
+      '🇹🇳',
+      '🇹🇴',
+      '🇹🇷',
+      '🇹🇹',
+      '🇹🇻',
+      '🇹🇼',
+      '🇹🇿',
+      '🇺🇦',
+      '🇺🇬',
+      '🇺🇲',
+      '🇺🇳',
+      '🇺🇸',
+      '🇺🇾',
+      '🇺🇿',
+      '🇻🇦',
+      '🇻🇨',
+      '🇻🇪',
+      '🇻🇬',
+      '🇻🇮',
+      '🇻🇳',
+      '🇻🇺',
+      '🇼🇫',
+      '🇼🇸',
+      '🇽🇰',
+      '🇾🇪',
+      '🇾🇹',
+      '🇿🇦',
+      '🇿🇲',
+      '🇿🇼',
+      '🏴󠁧󠁢󠁥󠁮󠁧󠁿',
+      '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
+      '🏴󠁧󠁢󠁷󠁬󠁳󠁿',
+    ],
+  ),
 ];
+
+final List<String> kSundayReactionEmojis = kSundayReactionEmojiCategorySections
+    .expand((section) => section.emojis)
+    .toSet()
+    .toList(growable: false);
+
+final List<EmojiReactionSection> kSundayReactionEmojiSections = [
+  EmojiReactionSection(
+    label: 'Todos',
+    icon: '😀',
+    emojis: kSundayReactionEmojis,
+  ),
+  ...kSundayReactionEmojiCategorySections,
+];
+
+final List<String> kGroupEmojiOptions = kSundayReactionEmojis;
+final List<EmojiReactionSection> kGroupEmojiSections =
+    kSundayReactionEmojiSections;
 
 const int kMaxGroupMembers = 30;
 
@@ -758,10 +5785,11 @@ const List<Color> kGroupColorOptions = [
   Color(0xFF5AAAD0),
 ];
 
-const List<String> kGroupEmojiOptions = [
-  '👥', '🏠', '🌞', '📸', '💼', '🎓', '✈️', '⚽', '🎮', '🎉',
-  '🐶', '🐱', '🍕', '☕', '🏖️', '❤️', '🔥', '⭐', '👑', '🫶',
-];
+String? nonEmptyStringOrNull(Object? value) {
+  if (value is! String) return null;
+  final trimmed = value.trim();
+  return trimmed.isEmpty ? null : trimmed;
+}
 
 Color groupColorFromValue(Object? value) {
   if (value is int) return Color(value);
@@ -772,11 +5800,78 @@ Color groupColorFromValue(Object? value) {
   return ssOrange;
 }
 
+bool _isEmojiBaseCodePoint(int value) {
+  return value == 0x00A9 ||
+      value == 0x00AE ||
+      value == 0x203C ||
+      value == 0x2049 ||
+      value == 0x2122 ||
+      value == 0x2139 ||
+      value == 0x3030 ||
+      value == 0x303D ||
+      value == 0x3297 ||
+      value == 0x3299 ||
+      value >= 0x1F000 && value <= 0x1FAFF ||
+      value >= 0x2194 && value <= 0x21AA ||
+      value >= 0x231A && value <= 0x231B ||
+      value == 0x2328 ||
+      value == 0x23CF ||
+      value >= 0x23E9 && value <= 0x23F3 ||
+      value >= 0x23F8 && value <= 0x23FA ||
+      value == 0x24C2 ||
+      value >= 0x25AA && value <= 0x25AB ||
+      value == 0x25B6 ||
+      value == 0x25C0 ||
+      value >= 0x25FB && value <= 0x25FE ||
+      value >= 0x2600 && value <= 0x27BF ||
+      value >= 0x2934 && value <= 0x2935 ||
+      value >= 0x2B05 && value <= 0x2B55;
+}
+
+bool _isEmojiSequenceCodePoint(int value) {
+  return _isEmojiBaseCodePoint(value) ||
+      value == 0x200D ||
+      value == 0x20E3 ||
+      value == 0xFE0E ||
+      value == 0xFE0F ||
+      value >= 0x0030 && value <= 0x0039 ||
+      value >= 0xE0020 && value <= 0xE007F ||
+      value == 0x0023 ||
+      value == 0x002A;
+}
+
+bool _isKeycapEmojiSequence(List<int> codePoints) {
+  if (codePoints.length < 2 || !codePoints.contains(0x20E3)) return false;
+  final first = codePoints.first;
+  final validFirst =
+      first >= 0x0030 && first <= 0x0039 || first == 0x0023 || first == 0x002A;
+
+  return validFirst &&
+      codePoints.every(
+        (value) => value == first || value == 0xFE0F || value == 0x20E3,
+      );
+}
+
+bool esEmojiReaccion(String value) {
+  final emoji = value.trim();
+  if (emoji.isEmpty || emoji.length > 32) return false;
+
+  final segments = emoji.characters.toList(growable: false);
+  if (segments.length != 1 || segments.first != emoji) return false;
+
+  final codePoints = emoji.runes.toList(growable: false);
+  final hasEmojiBase = codePoints.any(_isEmojiBaseCodePoint);
+  final isKeycap = _isKeycapEmojiSequence(codePoints);
+
+  return (hasEmojiBase || isKeycap) &&
+      codePoints.every(_isEmojiSequenceCodePoint);
+}
+
 String normalizarEmojiReaccion(String emoji) {
   final trimmed = emoji.trim();
   if (trimmed.isEmpty) return '';
   final first = trimmed.characters.first;
-  return kSundayReactionEmojis.contains(first) ? first : '';
+  return esEmojiReaccion(first) ? first : '';
 }
 
 Map<String, bool> resolvedNotificationSettings(Map<String, dynamic>? userData) {
@@ -797,6 +5892,80 @@ Map<String, bool> resolvedNotificationSettings(Map<String, dynamic>? userData) {
 
 bool notificationGlobalEnabledFromData(Map<String, dynamic>? userData) {
   return resolvedNotificationSettings(userData)['globalEnabled'] ?? true;
+}
+
+bool foregroundDeliveryOptionEnabled(RemoteMessage message, String key) {
+  return message.data[key]?.toString() != 'false';
+}
+
+Map<String, String> foregroundNotificationPayload(RemoteMessage message) {
+  final payload = <String, String>{};
+
+  message.data.forEach((key, value) {
+    payload[key] = value?.toString() ?? '';
+  });
+
+  final messageId = message.messageId;
+  if (messageId != null && messageId.isNotEmpty) {
+    payload['messageId'] = messageId;
+  }
+
+  return payload;
+}
+
+RemoteMessage? remoteMessageFromForegroundPayload(String payload) {
+  try {
+    final decoded = jsonDecode(payload);
+    if (decoded is! Map) return null;
+
+    final data = <String, dynamic>{};
+    String? messageId;
+
+    decoded.forEach((key, value) {
+      final stringKey = key.toString();
+      final stringValue = value?.toString() ?? '';
+
+      if (stringKey == 'messageId') {
+        messageId = stringValue.isEmpty ? null : stringValue;
+      } else {
+        data[stringKey] = stringValue;
+      }
+    });
+
+    return RemoteMessage(data: data, messageId: messageId);
+  } catch (error) {
+    logDebug('No se pudo leer la notificación foreground: $error');
+    return null;
+  }
+}
+
+Future<void> mostrarNotificacionForegroundAndroid(RemoteMessage message) async {
+  if (!Platform.isAndroid) return;
+  final type = message.data['type']?.toString();
+  if (!kForegroundLocalNotificationTypes.contains(type)) return;
+
+  final title = message.notification?.title?.trim();
+  final body = message.notification?.body?.trim();
+
+  if ((title == null || title.isEmpty) && (body == null || body.isEmpty)) {
+    return;
+  }
+
+  try {
+    await foregroundNotificationChannel.invokeMethod<void>('show', {
+      'title': title == null || title.isEmpty ? 'Sunday Selfie' : title,
+      'body': body ?? '',
+      'payload': jsonEncode(foregroundNotificationPayload(message)),
+      'messageId': message.messageId ?? '',
+      'soundEnabled': foregroundDeliveryOptionEnabled(message, 'soundEnabled'),
+      'vibrationEnabled': foregroundDeliveryOptionEnabled(
+        message,
+        'vibrationEnabled',
+      ),
+    });
+  } catch (error) {
+    logDebug('No se pudo mostrar la notificación foreground: $error');
+  }
 }
 
 Future<void> actualizarEstadoTokensNotificacion({
@@ -879,8 +6048,16 @@ Future<void> registrarTokenNotificaciones(User user) async {
         settings.authorizationStatus == AuthorizationStatus.provisional;
 
     if (!autorizado) {
-      debugPrint('Notificaciones no autorizadas por el usuario.');
+      logDebug('Notificaciones no autorizadas por el usuario.');
       return;
+    }
+
+    if (Platform.isIOS || Platform.isMacOS) {
+      await messaging.setForegroundNotificationPresentationOptions(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
     }
 
     await messaging.setAutoInitEnabled(true);
@@ -895,7 +6072,7 @@ Future<void> registrarTokenNotificaciones(User user) async {
       await guardarTokenNotificaciones(user: user, token: newToken);
     });
   } catch (error) {
-    debugPrint('No se pudo registrar el token FCM: $error');
+    logDebug('No se pudo registrar el token FCM: $error');
   }
 }
 
@@ -903,10 +6080,7 @@ class CreatedGroupInfo {
   final String groupId;
   final String inviteCode;
 
-  const CreatedGroupInfo({
-    required this.groupId,
-    required this.inviteCode,
-  });
+  const CreatedGroupInfo({required this.groupId, required this.inviteCode});
 }
 
 Future<CreatedGroupInfo> crearGrupoMinimo({
@@ -922,7 +6096,9 @@ Future<CreatedGroupInfo> crearGrupoMinimo({
 
   final firestore = FirebaseFirestore.instance;
   final cleanEmoji = groupEmoji?.trim();
-  final resolvedEmoji = cleanEmoji == null || cleanEmoji.isEmpty ? null : cleanEmoji;
+  final resolvedEmoji = cleanEmoji == null || cleanEmoji.isEmpty
+      ? null
+      : cleanEmoji;
   final resolvedColorValue =
       groupColorValue ?? kGroupColorOptions.first.toARGB32();
 
@@ -971,7 +6147,7 @@ Future<CreatedGroupInfo> crearGrupoMinimo({
         'lastActivityAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
     } catch (error) {
-      debugPrint('Grupo creado sin foto porque falló la subida: $error');
+      logDebug('Grupo creado sin foto porque falló la subida: $error');
     }
   }
 
@@ -980,7 +6156,9 @@ Future<CreatedGroupInfo> crearGrupoMinimo({
 
 String crearEnlaceInvitacion(String inviteCode) {
   final code = inviteCode.trim();
-  return code.isEmpty ? 'https://sundayselfie.app' : 'https://sundayselfie.app/j/$code';
+  return code.isEmpty
+      ? 'https://sundayselfie.app'
+      : 'https://sundayselfie.app/j/$code';
 }
 
 String normalizarCodigoInvitacion(String value) {
@@ -999,7 +6177,8 @@ String normalizarEntradaInvitacion(String entrada) {
   value = value.replaceAll('\n', '').replaceAll('\t', '').trim();
 
   final uri = Uri.tryParse(value);
-  final queryCode = uri?.queryParameters['code'] ?? uri?.queryParameters['invite'];
+  final queryCode =
+      uri?.queryParameters['code'] ?? uri?.queryParameters['invite'];
   if (queryCode != null && queryCode.trim().isNotEmpty) {
     return normalizarCodigoInvitacion(queryCode);
   }
@@ -1009,7 +6188,9 @@ String normalizarEntradaInvitacion(String entrada) {
     caseSensitive: false,
   ).firstMatch(value);
   if (joinMatch != null) {
-    return normalizarCodigoInvitacion(Uri.decodeComponent(joinMatch.group(2) ?? ''));
+    return normalizarCodigoInvitacion(
+      Uri.decodeComponent(joinMatch.group(2) ?? ''),
+    );
   }
 
   final tempMatch = RegExp(
@@ -1021,6 +6202,24 @@ String normalizarEntradaInvitacion(String entrada) {
   }
 
   return normalizarCodigoInvitacion(value);
+}
+
+String? obtenerInvitacionDesdeDeepLink(Uri uri) {
+  final host = uri.host.toLowerCase();
+  final isSundaySelfieDomain =
+      host == 'sundayselfie.app' || host == 'www.sundayselfie.app';
+
+  if (!isSundaySelfieDomain) return null;
+
+  final pathSegments = uri.pathSegments;
+  final hasInvitePath =
+      pathSegments.length >= 2 &&
+      ['j', 'join', 'invite'].contains(pathSegments.first.toLowerCase());
+
+  if (!hasInvitePath) return null;
+
+  final invitation = normalizarEntradaInvitacion(uri.toString());
+  return invitation.isEmpty ? null : invitation;
 }
 
 String? obtenerGroupIdDesdeCodigo(String codigo) {
@@ -1061,7 +6260,7 @@ Future<String?> resolverGroupIdDesdeInvitacion(String codigo) async {
       return groupId.trim();
     }
   } catch (error) {
-    debugPrint('No se pudo resolver la invitación: $error');
+    logDebug('No se pudo resolver la invitación: $error');
   }
 
   return null;
@@ -1084,10 +6283,17 @@ int calcularAnioISO(DateTime fecha) {
   return jueves.year;
 }
 
-String obtenerWeekKeyActual() {
-  final ahora = DateTime.now();
+String obtenerWeekKeyActual({DateTime? now}) {
+  final ahora = now ?? DateTime.now();
   final isoYear = calcularAnioISO(ahora);
   final isoWeek = calcularNumeroSemanaISO(ahora).toString().padLeft(2, '0');
+
+  return '$isoYear-W$isoWeek';
+}
+
+String obtenerWeekKeyDesdeFecha(DateTime fecha) {
+  final isoYear = calcularAnioISO(fecha);
+  final isoWeek = calcularNumeroSemanaISO(fecha).toString().padLeft(2, '0');
 
   return '$isoYear-W$isoWeek';
 }
@@ -1098,14 +6304,130 @@ String obtenerEtiquetaSemana(String weekKey) {
   return 'Semana ${parts[1]} / ${parts[0]}';
 }
 
-bool esDomingo() {
-  return DateTime.now().weekday == DateTime.sunday;
+String obtenerEtiquetaSemanaCorta(String weekKey) {
+  final parts = weekKey.split('-W');
+  if (parts.length != 2) return weekKey;
+  return 'Semana ${parts[1]}';
+}
+
+List<String> construirItemsSelectorSemanas(Iterable<String> weekKeys) {
+  final items = <String>[];
+  String? previousYear;
+
+  for (final key in weekKeys) {
+    final parts = key.split('-W');
+    final year = parts.isNotEmpty ? parts.first : '';
+    if (previousYear != null && year.isNotEmpty && year != previousYear) {
+      items.add('year:$year');
+    }
+    items.add('week:$key');
+    previousYear = year;
+  }
+
+  return items;
+}
+
+bool esDomingo({DateTime? now}) {
+  return (now ?? DateTime.now()).weekday == DateTime.sunday;
+}
+
+bool debeMostrarMiembroSinPublicar({required bool posted, DateTime? now}) {
+  return !posted && esDomingo(now: now);
+}
+
+bool esLunes({DateTime? now}) {
+  return (now ?? DateTime.now()).weekday == DateTime.monday;
+}
+
+String obtenerWeekKeyDomingoAnterior({DateTime? now}) {
+  return obtenerWeekKeyAnterior(obtenerWeekKeyActual(now: now));
+}
+
+bool puedeSubirSelfieLunesConRetraso(String weekKey, {DateTime? now}) {
+  final current = now ?? DateTime.now();
+  return esLunes(now: current) &&
+      weekKey == obtenerWeekKeyDomingoAnterior(now: current);
+}
+
+bool sundaySelfieSiguePendiente(String weekKey, {DateTime? now}) {
+  final current = now ?? DateTime.now();
+  final isCurrentSunday =
+      esDomingo(now: current) && weekKey == obtenerWeekKeyActual(now: current);
+
+  return isCurrentSunday ||
+      puedeSubirSelfieLunesConRetraso(weekKey, now: current);
+}
+
+String missingSundaySelfieStatusLabel(String weekKey, {DateTime? now}) {
+  return sundaySelfieSiguePendiente(weekKey, now: now)
+      ? 'Sunday Selfie pendiente'
+      : 'Sunday Selfie no publicado';
+}
+
+DateTime cierreDomingoAnterior({DateTime? now}) {
+  final current = now ?? DateTime.now();
+  final today = DateTime(current.year, current.month, current.day);
+  return today.subtract(const Duration(milliseconds: 1));
+}
+
+bool miembroPuedeSubirSelfieLunesConRetraso(
+  String weekKey,
+  dynamic joinedAt, {
+  DateTime? now,
+}) {
+  if (!puedeSubirSelfieLunesConRetraso(weekKey, now: now)) return false;
+
+  final joined = timestampToDate(joinedAt);
+  if (joined == null) return false;
+
+  return !joined.isAfter(cierreDomingoAnterior(now: now));
 }
 
 int diasHastaDomingo() {
   final weekday = DateTime.now().weekday;
   if (weekday == DateTime.sunday) return 0;
   return DateTime.sunday - weekday;
+}
+
+int? _weekKeyOrderValue(String weekKey) {
+  final parts = weekKey.split('-W');
+  if (parts.length != 2) return null;
+
+  final isoYear = int.tryParse(parts[0]);
+  final isoWeek = int.tryParse(parts[1]);
+  if (isoYear == null || isoWeek == null) return null;
+
+  return isoYear * 100 + isoWeek;
+}
+
+List<String> obtenerWeekKeysDomingosVisibles(
+  Iterable<String> weekKeys, {
+  DateTime? now,
+}) {
+  final current = now ?? DateTime.now();
+  final currentWeekKey = obtenerWeekKeyActual(now: current);
+  final currentWeekOrder = _weekKeyOrderValue(currentWeekKey);
+  final includeCurrentSunday = esDomingo(now: current);
+  final visibleWeekKeys = <String>{};
+
+  visibleWeekKeys.add(obtenerWeekKeyVisibleMasReciente(now: current));
+
+  for (final rawWeekKey in weekKeys) {
+    final weekKey = rawWeekKey.trim();
+    if (weekKey.isEmpty) continue;
+
+    final weekOrder = _weekKeyOrderValue(weekKey);
+    if (weekOrder != null && currentWeekOrder != null) {
+      if (weekOrder > currentWeekOrder) continue;
+      if (!includeCurrentSunday && weekOrder == currentWeekOrder) continue;
+    } else if (!includeCurrentSunday && weekKey == currentWeekKey) {
+      continue;
+    }
+
+    visibleWeekKeys.add(weekKey);
+  }
+
+  return visibleWeekKeys.toList();
 }
 
 enum SundayWindowPhase { waiting, open, closed }
@@ -1169,8 +6491,16 @@ SundayWindowState obtenerSundayWindowState({DateTime? now}) {
   final sunday = today.add(Duration(days: daysToSunday));
 
   final openAt = DateTime(sunday.year, sunday.month, sunday.day, 0, 0);
-  final closeAt = DateTime(sunday.year, sunday.month, sunday.day, 23, 59, 59, 999);
-  final weekKey = obtenerWeekKeyActual();
+  final closeAt = DateTime(
+    sunday.year,
+    sunday.month,
+    sunday.day,
+    23,
+    59,
+    59,
+    999,
+  );
+  final weekKey = obtenerWeekKeyActual(now: current);
 
   SundayWindowPhase phase;
 
@@ -1267,6 +6597,12 @@ int comparableTimestampMillis(dynamic value) {
   return 0;
 }
 
+int intFromValue(dynamic value, {int fallback = 0}) {
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  return int.tryParse('$value') ?? fallback;
+}
+
 int semanasActivasDesdeCreatedAt(dynamic createdAt) {
   DateTime? created;
 
@@ -1300,6 +6636,24 @@ DateTime lunesDeSemanaISO(int isoYear, int isoWeek) {
   return firstIsoMonday.add(Duration(days: (isoWeek - 1) * 7));
 }
 
+DateTime? lunesDesdeWeekKey(String weekKey) {
+  final parts = weekKey.split('-W');
+  if (parts.length != 2) return null;
+
+  final isoYear = int.tryParse(parts[0]);
+  final isoWeek = int.tryParse(parts[1]);
+  if (isoYear == null || isoWeek == null) return null;
+
+  return lunesDeSemanaISO(isoYear, isoWeek);
+}
+
+DateTime? domingoDesdeWeekKey(String weekKey) {
+  final monday = lunesDesdeWeekKey(weekKey);
+  if (monday == null) return null;
+
+  return monday.add(const Duration(days: 6));
+}
+
 String obtenerWeekKeyAnterior(String weekKey) {
   final parts = weekKey.split('-W');
   if (parts.length != 2) return weekKey;
@@ -1320,13 +6674,110 @@ String obtenerWeekKeyAnterior(String weekKey) {
   return '$previousYear-W$previousWeek';
 }
 
+String obtenerWeekKeySiguiente(String weekKey) {
+  final monday = lunesDesdeWeekKey(weekKey);
+  if (monday == null) return weekKey;
+
+  return obtenerWeekKeyDesdeFecha(monday.add(const Duration(days: 7)));
+}
+
+String obtenerWeekKeyVisibleMasReciente({DateTime? now}) {
+  final current = now ?? DateTime.now();
+  final currentWeekKey = obtenerWeekKeyActual(now: current);
+
+  if (esDomingo(now: current)) return currentWeekKey;
+
+  return obtenerWeekKeyAnterior(currentWeekKey);
+}
+
+String obtenerWeekKeyInicioRachaPublicacion({DateTime? now}) {
+  return obtenerWeekKeyVisibleMasReciente(now: now);
+}
+
+String resolverWeekKeySeleccionadaGrupo({
+  required Iterable<String> weekKeys,
+  required String selectedWeekKey,
+  DateTime? now,
+}) {
+  final availableWeekKeys = weekKeys.toList(growable: false);
+  if (availableWeekKeys.isEmpty) return '';
+
+  final cleanSelectedWeekKey = selectedWeekKey.trim();
+  if (cleanSelectedWeekKey.isNotEmpty &&
+      availableWeekKeys.contains(cleanSelectedWeekKey)) {
+    return cleanSelectedWeekKey;
+  }
+
+  final latestVisibleWeekKey = obtenerWeekKeyVisibleMasReciente(now: now);
+  if (availableWeekKeys.contains(latestVisibleWeekKey)) {
+    return latestVisibleWeekKey;
+  }
+
+  return availableWeekKeys.first;
+}
+
+List<String> ordenarWeekKeysDescendentes(Iterable<String> weekKeys) {
+  final uniqueWeekKeys = weekKeys
+      .map((weekKey) => weekKey.trim())
+      .where((weekKey) => weekKey.isNotEmpty)
+      .toSet()
+      .toList();
+
+  uniqueWeekKeys.sort((a, b) {
+    final aOrder = _weekKeyOrderValue(a) ?? 0;
+    final bOrder = _weekKeyOrderValue(b) ?? 0;
+    return bOrder.compareTo(aOrder);
+  });
+
+  return uniqueWeekKeys;
+}
+
+List<String> obtenerWeekKeysCalendarioGrupo({
+  required dynamic groupCreatedAt,
+  required Iterable<String> existingWeekKeys,
+  DateTime? now,
+}) {
+  final current = now ?? DateTime.now();
+  final created = timestampToDate(groupCreatedAt);
+
+  if (created == null) {
+    return ordenarWeekKeysDescendentes(
+      obtenerWeekKeysDomingosVisibles(existingWeekKeys, now: current),
+    );
+  }
+
+  final firstWeekKey = obtenerWeekKeyDesdeFecha(created);
+  final latestWeekKey = obtenerWeekKeyVisibleMasReciente(now: current);
+  final firstMonday = lunesDesdeWeekKey(firstWeekKey);
+  final latestMonday = lunesDesdeWeekKey(latestWeekKey);
+
+  if (firstMonday == null || latestMonday == null) {
+    return ordenarWeekKeysDescendentes(
+      obtenerWeekKeysDomingosVisibles(existingWeekKeys, now: current),
+    );
+  }
+
+  if (firstMonday.isAfter(latestMonday)) return const [];
+
+  final weekKeys = <String>[];
+  var cursor = firstMonday;
+
+  while (!cursor.isAfter(latestMonday) && weekKeys.length < 9999) {
+    weekKeys.add(obtenerWeekKeyDesdeFecha(cursor));
+    cursor = cursor.add(const Duration(days: 7));
+  }
+
+  return weekKeys.reversed.toList();
+}
+
 Future<int> calcularRachaPublicacionUsuarioEnGrupo({
   required String groupId,
   required String uid,
   int maxWeeks = 104,
+  DateTime? now,
 }) async {
   final firestore = FirebaseFirestore.instance;
-  var weekKey = obtenerWeekKeyActual();
+  var weekKey = obtenerWeekKeyInicioRachaPublicacion(now: now);
   var streak = 0;
 
   for (var i = 0; i < maxWeeks; i += 1) {
@@ -1350,87 +6801,98 @@ Future<int> calcularRachaPublicacionUsuarioEnGrupo({
   return streak;
 }
 
+class GroupStreakStats {
+  final int current;
+  final int record;
+
+  const GroupStreakStats({required this.current, required this.record});
+
+  static const zero = GroupStreakStats(current: 0, record: 0);
+}
+
+GroupStreakStats calcularEstadisticasRachaCompletaGrupo({
+  required Iterable<String> weekKeys,
+  required Map<String, int> postCountsByWeek,
+  required int memberCount,
+}) {
+  if (memberCount <= 0) return GroupStreakStats.zero;
+
+  final orderedWeekKeys = ordenarWeekKeysDescendentes(weekKeys);
+  if (orderedWeekKeys.isEmpty) return GroupStreakStats.zero;
+
+  var current = 0;
+  var currentOpen = true;
+  var running = 0;
+  var record = 0;
+
+  for (final weekKey in orderedWeekKeys) {
+    final complete = (postCountsByWeek[weekKey] ?? 0) >= memberCount;
+
+    if (complete) {
+      running += 1;
+      if (currentOpen) current += 1;
+      if (running > record) record = running;
+    } else {
+      running = 0;
+      currentOpen = false;
+    }
+  }
+
+  return GroupStreakStats(current: current, record: record);
+}
+
+Future<GroupStreakStats> calcularEstadisticasRachaCompletaGrupoFirestore({
+  required String groupId,
+  DateTime? now,
+}) async {
+  final firestore = FirebaseFirestore.instance;
+  final groupDoc = await firestore.collection('groups').doc(groupId).get();
+  final groupData = groupDoc.data();
+
+  if (!groupDoc.exists || groupData == null || groupData['deleted'] == true) {
+    return GroupStreakStats.zero;
+  }
+
+  final memberCount = intFromValue(groupData['memberCount']);
+  final weeksSnapshot = await firestore
+      .collection('groups')
+      .doc(groupId)
+      .collection('weeks')
+      .get();
+  final postCountsByWeek = {
+    for (final doc in weeksSnapshot.docs)
+      doc.id: intFromValue(doc.data()['postCount']),
+  };
+  final weekKeys = obtenerWeekKeysCalendarioGrupo(
+    groupCreatedAt: groupData['createdAt'],
+    existingWeekKeys: weeksSnapshot.docs.map((doc) => doc.id),
+    now: now,
+  );
+
+  return calcularEstadisticasRachaCompletaGrupo(
+    weekKeys: weekKeys,
+    postCountsByWeek: postCountsByWeek,
+    memberCount: memberCount,
+  );
+}
+
 Future<void> solicitarEntradaAGrupo({
-  required User user,
   required String groupId,
   String? inviteInput,
 }) async {
-  final firestore = FirebaseFirestore.instance;
-
-  final groupRef = firestore.collection('groups').doc(groupId);
-  final groupDoc = await groupRef.get();
-
-  if (!groupDoc.exists) {
-    throw Exception('No se ha encontrado ningún grupo con esa invitación');
-  }
-
-  final groupData = groupDoc.data();
-  if (groupData?['deleted'] == true) {
-    throw Exception('Este grupo ya no está disponible');
-  }
-
-  final rawMemberCount = groupData?['memberCount'] ?? 0;
-  final memberCount = rawMemberCount is int
-      ? rawMemberCount
-      : int.tryParse('$rawMemberCount') ?? 0;
-
-  if (memberCount >= kMaxGroupMembers) {
-    throw Exception('Este grupo ya tiene el límite de $kMaxGroupMembers miembros');
-  }
-
-  final memberRef = groupRef.collection('members').doc(user.uid);
-  final memberDoc = await memberRef.get();
-
-  if (memberDoc.exists) {
-    throw Exception('Ya perteneces a este grupo');
-  }
-
-  final blockedUserDoc = await groupRef.collection('blockedUsers').doc(user.uid).get();
-
-  if (blockedUserDoc.exists) {
-    throw Exception('Fuiste expulsado de este grupo y no puedes volver a solicitar entrada');
-  }
-
-  final userGroupRef = firestore
-      .collection('users')
-      .doc(user.uid)
-      .collection('groups')
-      .doc(groupId);
-
-  final userGroupDoc = await userGroupRef.get();
-
-  if (userGroupDoc.exists) {
-    throw Exception('Ya perteneces a este grupo');
-  }
-
-  final joinRequestRef = groupRef.collection('joinRequests').doc(user.uid);
-
-  final existingRequest = await joinRequestRef.get();
-
-  if (existingRequest.exists) {
-    throw Exception('Ya has enviado una solicitud');
-  }
-
-  final userDoc = await firestore.collection('users').doc(user.uid).get();
-  final userData = userDoc.data();
-
-  final baseName = formatUserDisplayName(userData?['baseName'] ?? 'Usuario');
-  final basePhotoUrl = userData?['basePhotoUrl'];
   final inviteCodeUsed = normalizarEntradaInvitacion(inviteInput ?? '');
 
   if (inviteCodeUsed.isEmpty) {
     throw Exception('Invitación no válida');
   }
 
-  await joinRequestRef.set({
-    'uid': user.uid,
-    'baseName': baseName,
-    'basePhotoUrl': basePhotoUrl,
-    'status': 'pending',
-    'inviteCodeUsed': inviteCodeUsed,
-    'requestedAt': FieldValue.serverTimestamp(),
-    'updatedAt': FieldValue.serverTimestamp(),
-  });
+  try {
+    await FirebaseFunctions.instance
+        .httpsCallable('solicitarEntradaGrupo')
+        .call<void>({'groupId': groupId, 'inviteCodeUsed': inviteCodeUsed});
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo enviar la solicitud');
+  }
 }
 
 Future<void> aceptarSolicitudEntrada({
@@ -1438,12 +6900,11 @@ Future<void> aceptarSolicitudEntrada({
   required String requestUid,
 }) async {
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable('aceptarSolicitud');
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'aceptarSolicitud',
+    );
 
-    await callable.call<void>({
-      'groupId': groupId,
-      'requestUid': requestUid,
-    });
+    await callable.call<void>({'groupId': groupId, 'requestUid': requestUid});
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo aceptar la solicitud');
   }
@@ -1454,12 +6915,11 @@ Future<void> rechazarSolicitudEntrada({
   required String requestUid,
 }) async {
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable('rechazarSolicitud');
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'rechazarSolicitud',
+    );
 
-    await callable.call<void>({
-      'groupId': groupId,
-      'requestUid': requestUid,
-    });
+    await callable.call<void>({'groupId': groupId, 'requestUid': requestUid});
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo rechazar la solicitud');
   }
@@ -1470,13 +6930,11 @@ Future<void> hacerAdministradorMiembro({
   required String targetUid,
 }) async {
   try {
-    final callable =
-        FirebaseFunctions.instance.httpsCallable('promoverAdministrador');
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'promoverAdministrador',
+    );
 
-    await callable.call<void>({
-      'groupId': groupId,
-      'targetUid': targetUid,
-    });
+    await callable.call<void>({'groupId': groupId, 'targetUid': targetUid});
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo hacer administrador');
   }
@@ -1487,12 +6945,11 @@ Future<void> expulsarMiembroGrupo({
   required String targetUid,
 }) async {
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable('expulsarMiembro');
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'expulsarMiembro',
+    );
 
-    await callable.call<void>({
-      'groupId': groupId,
-      'targetUid': targetUid,
-    });
+    await callable.call<void>({'groupId': groupId, 'targetUid': targetUid});
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo expulsar al miembro');
   }
@@ -1503,12 +6960,11 @@ Future<void> permitirReingresoGrupo({
   required String targetUid,
 }) async {
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable('permitirReingreso');
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'permitirReingreso',
+    );
 
-    await callable.call<void>({
-      'groupId': groupId,
-      'targetUid': targetUid,
-    });
+    await callable.call<void>({'groupId': groupId, 'targetUid': targetUid});
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo permitir el reingreso');
   }
@@ -1535,7 +6991,9 @@ Future<void> actualizarNombreGrupo({
   await firestore.runTransaction((transaction) async {
     final currentMemberDoc = await transaction.get(currentMemberRef);
     if (currentMemberDoc.data()?['role'] != 'admin') {
-      throw Exception('Solo un administrador puede cambiar el nombre del grupo');
+      throw Exception(
+        'Solo un administrador puede cambiar el nombre del grupo',
+      );
     }
 
     transaction.update(groupRef, {
@@ -1565,22 +7023,54 @@ Future<void> actualizarNombreGrupo({
           .collection('groups')
           .doc(groupId);
 
-      batch.set(
-        userGroupRef,
-        {
-          'displayNameSnapshot': trimmedName,
-          'lastActivityAt': FieldValue.serverTimestamp(),
-        },
-        SetOptions(merge: true),
-      );
+      batch.set(userGroupRef, {
+        'displayNameSnapshot': trimmedName,
+        'lastActivityAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
       batchCount += 1;
       await commitIfNeeded();
     }
 
     await commitIfNeeded(force: true);
   } catch (error) {
-    debugPrint('No se pudo propagar el nombre del grupo: $error');
+    logDebug('No se pudo propagar el nombre del grupo: $error');
   }
+}
+
+Future<void> actualizarNombreEnGrupo({
+  required String groupId,
+  required String newName,
+}) async {
+  final currentUser = FirebaseAuth.instance.currentUser;
+  if (currentUser == null) {
+    throw Exception('No hay usuario autenticado');
+  }
+
+  final trimmedName = newName.trim();
+  if (trimmedName.isEmpty) {
+    throw Exception('El nombre no puede estar vacío');
+  }
+
+  if (trimmedName.characters.length > 80) {
+    throw Exception('El nombre no puede superar 80 caracteres');
+  }
+
+  final memberRef = FirebaseFirestore.instance
+      .collection('groups')
+      .doc(groupId)
+      .collection('members')
+      .doc(currentUser.uid);
+  final memberDoc = await memberRef.get();
+
+  if (!memberDoc.exists) {
+    throw Exception('No perteneces a este grupo');
+  }
+
+  await memberRef.set({
+    'effectiveName': trimmedName,
+    'groupNameOverride': trimmedName,
+    'profileSyncedAt': FieldValue.serverTimestamp(),
+  }, SetOptions(merge: true));
 }
 
 Future<String> actualizarFotoGrupo({
@@ -1599,7 +7089,9 @@ Future<String> actualizarFotoGrupo({
   final memberDoc = await memberRef.get();
 
   if (memberDoc.data()?['role'] != 'admin') {
-    throw Exception('Solo los administradores pueden cambiar la foto del grupo');
+    throw Exception(
+      'Solo los administradores pueden cambiar la foto del grupo',
+    );
   }
 
   final timestamp = DateTime.now().millisecondsSinceEpoch;
@@ -1647,21 +7139,17 @@ Future<String> actualizarFotoGrupo({
           .collection('groups')
           .doc(groupId);
 
-      batch.set(
-        userGroupRef,
-        {
-          'groupPhotoUrlSnapshot': downloadUrl,
-          'lastActivityAt': FieldValue.serverTimestamp(),
-        },
-        SetOptions(merge: true),
-      );
+      batch.set(userGroupRef, {
+        'groupPhotoUrlSnapshot': downloadUrl,
+        'lastActivityAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
       batchCount += 1;
       await commitIfNeeded();
     }
 
     await commitIfNeeded(force: true);
   } catch (error) {
-    debugPrint('No se pudo propagar la foto del grupo: $error');
+    logDebug('No se pudo propagar la foto del grupo: $error');
   }
 
   if (markActivity) {
@@ -1673,11 +7161,11 @@ Future<String> actualizarFotoGrupo({
 
 Future<void> regenerarInvitacionGrupo({required String groupId}) async {
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable('regenerarInvitacion');
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'regenerarInvitacion',
+    );
 
-    await callable.call<void>({
-      'groupId': groupId,
-    });
+    await callable.call<void>({'groupId': groupId});
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo regenerar la invitación');
   }
@@ -1687,66 +7175,150 @@ Future<void> abandonarGrupo({required String groupId}) async {
   try {
     final callable = FirebaseFunctions.instance.httpsCallable('abandonarGrupo');
 
-    await callable.call<void>({
-      'groupId': groupId,
-    });
+    await callable.call<void>({'groupId': groupId});
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo abandonar el grupo');
   }
 }
 
+Future<void> eliminarGrupoDeLaApp({required String groupId}) async {
+  final currentUser = FirebaseAuth.instance.currentUser;
+  if (currentUser == null) {
+    throw Exception('No hay usuario autenticado');
+  }
+
+  await FirebaseFirestore.instance
+      .collection('users')
+      .doc(currentUser.uid)
+      .collection('groups')
+      .doc(groupId)
+      .delete();
+}
 
 Future<void> publicarSelfieReal({
   required String groupId,
   required User user,
   required XFile foto,
+  String? weekKey,
+  bool rewardedAdWatched = false,
 }) async {
+  final currentWeekKey = obtenerWeekKeyActual();
+  final targetWeekKey = weekKey ?? currentWeekKey;
   final window = obtenerSundayWindowState();
+  final isRegularSundayUpload =
+      targetWeekKey == currentWeekKey && window.canUpload;
+  final isLateMondayUpload =
+      rewardedAdWatched && puedeSubirSelfieLunesConRetraso(targetWeekKey);
 
-  if (!window.canUpload) {
+  if (!isRegularSundayUpload && !isLateMondayUpload) {
     throw Exception('La ventana de subida está cerrada');
   }
 
   final firestore = FirebaseFirestore.instance;
   final storage = FirebaseStorage.instance;
-  final weekKey = obtenerWeekKeyActual();
 
   final weekRef = firestore
       .collection('groups')
       .doc(groupId)
       .collection('weeks')
-      .doc(weekKey);
+      .doc(targetWeekKey);
   final postRef = weekRef.collection('posts').doc(user.uid);
   final existingPost = await postRef.get();
 
   if (existingPost.exists) {
-    throw Exception('Ya has publicado tu selfie de este domingo');
+    throw Exception('Ya has publicado tu selfie de esta semana');
   }
 
-  final storagePath = 'groups/$groupId/weeks/$weekKey/${user.uid}.jpg';
+  await validarFotoSelfie(foto);
+
+  final storagePath = 'groups/$groupId/weeks/$targetWeekKey/${user.uid}.jpg';
+  final thumbnailStoragePath =
+      'groups/$groupId/weeks/$targetWeekKey/thumbs/${user.uid}.jpg';
   final storageRef = storage.ref().child(storagePath);
+  final thumbnailStorageRef = storage.ref().child(thumbnailStoragePath);
+  final uploadFile = await _prepararArchivoSelfieParaSubidaTemporal(
+    foto: foto,
+    groupId: groupId,
+    weekKey: targetWeekKey,
+    uid: user.uid,
+  );
 
   try {
     await storageRef.putFile(
-      File(foto.path),
+      uploadFile,
       SettableMetadata(
         contentType: 'image/jpeg',
-        customMetadata: {'groupId': groupId, 'weekKey': weekKey, 'uid': user.uid},
+        customMetadata: {
+          'groupId': groupId,
+          'weekKey': targetWeekKey,
+          'uid': user.uid,
+          if (isLateMondayUpload) 'lateUpload': 'true',
+          if (isLateMondayUpload) 'rewardedAdWatched': 'true',
+        },
       ),
     );
   } on FirebaseException catch (uploadError) {
     try {
       await storageRef.getMetadata();
     } catch (_) {
-      throw uploadError;
+      logDebug('No se pudo subir la selfie a Storage: $uploadError');
+      throw Exception('No se pudo subir la selfie. Inténtalo de nuevo.');
+    }
+  } finally {
+    if (uploadFile.path != foto.path && await uploadFile.exists()) {
+      try {
+        await uploadFile.delete();
+      } catch (error) {
+        logDebug('No se pudo borrar la selfie temporal optimizada: $error');
+      }
+    }
+  }
+
+  File? thumbnailFile;
+  try {
+    thumbnailFile = await crearMiniaturaSelfieTemporal(
+      foto: foto,
+      groupId: groupId,
+      weekKey: targetWeekKey,
+      uid: user.uid,
+    );
+    if (thumbnailFile != null) {
+      await thumbnailStorageRef.putFile(
+        thumbnailFile,
+        SettableMetadata(
+          contentType: 'image/jpeg',
+          customMetadata: {
+            'groupId': groupId,
+            'weekKey': targetWeekKey,
+            'uid': user.uid,
+            'kind': 'selfieThumb',
+            if (isLateMondayUpload) 'lateUpload': 'true',
+            if (isLateMondayUpload) 'rewardedAdWatched': 'true',
+          },
+        ),
+      );
+    }
+  } catch (error) {
+    logDebug('No se pudo preparar la miniatura de la selfie: $error');
+  } finally {
+    if (thumbnailFile != null && await thumbnailFile.exists()) {
+      try {
+        await thumbnailFile.delete();
+      } catch (error) {
+        logDebug('No se pudo borrar la miniatura temporal: $error');
+      }
     }
   }
 
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable('registrarSelfie');
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'registrarSelfie',
+    );
 
     await callable.call<void>({
       'groupId': groupId,
+      if (targetWeekKey != currentWeekKey) 'weekKey': targetWeekKey,
+      if (isLateMondayUpload) 'rewardedAdWatched': true,
     });
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo registrar la selfie');
@@ -1780,10 +7352,10 @@ Future<void> reaccionarASelfie({
   }
 }
 
-
 Future<void> enviarZumbidoSelfie({
   required String groupId,
   required String targetUid,
+  bool rewardedAdWatched = false,
 }) async {
   try {
     final callable = FirebaseFunctions.instance.httpsCallable(
@@ -1793,9 +7365,685 @@ Future<void> enviarZumbidoSelfie({
     await callable.call<void>({
       'groupId': groupId,
       'targetUid': targetUid,
+      if (rewardedAdWatched) 'rewardedAdWatched': true,
     });
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo enviar el zumbido');
+  }
+}
+
+String? rewardedBuzzAdUnitId() {
+  return rewardedAdUnitId();
+}
+
+String? rewardedAdUnitId() {
+  if (kIsWeb) return null;
+  if (Platform.isAndroid) return kRewardedBuzzAdUnitAndroid;
+  if (Platform.isIOS) return kRewardedBuzzAdUnitIos;
+  return null;
+}
+
+Future<bool> confirmarAnuncioZumbidoExtra(BuildContext context) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) {
+      return AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+        title: const Text('Enviar otro zumbido'),
+        content: const Text(
+          'Cada miembro del grupo solo puede recibir un zumbido por domingo y por grupo. Para poder enviar otro zumbido se debe ver un anuncio.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Salir'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Continuar'),
+          ),
+        ],
+      );
+    },
+  );
+
+  return confirmed == true;
+}
+
+Future<bool> mostrarAnuncioRecompensadoZumbido() async {
+  return mostrarAnuncioRecompensado();
+}
+
+Future<bool> mostrarAnuncioRecompensado() async {
+  final adUnitId = rewardedAdUnitId();
+  if (adUnitId == null) {
+    throw Exception('Los anuncios no están disponibles en esta plataforma');
+  }
+
+  final loadCompleter = Completer<RewardedAd>();
+  RewardedAd.load(
+    adUnitId: adUnitId,
+    request: const AdRequest(),
+    rewardedAdLoadCallback: RewardedAdLoadCallback(
+      onAdLoaded: (ad) {
+        if (!loadCompleter.isCompleted) loadCompleter.complete(ad);
+      },
+      onAdFailedToLoad: (error) {
+        if (!loadCompleter.isCompleted) {
+          loadCompleter.completeError(
+            Exception('No se pudo cargar el anuncio'),
+          );
+        }
+      },
+    ),
+  );
+
+  final ad = await loadCompleter.future;
+  final rewardCompleter = Completer<bool>();
+  var rewardEarned = false;
+
+  ad.fullScreenContentCallback = FullScreenContentCallback(
+    onAdDismissedFullScreenContent: (dismissedAd) {
+      dismissedAd.dispose();
+      if (!rewardCompleter.isCompleted) {
+        rewardCompleter.complete(rewardEarned);
+      }
+    },
+    onAdFailedToShowFullScreenContent: (failedAd, error) {
+      failedAd.dispose();
+      if (!rewardCompleter.isCompleted) {
+        rewardCompleter.completeError(
+          Exception('No se pudo mostrar el anuncio'),
+        );
+      }
+    },
+  );
+  ad.setImmersiveMode(true);
+  ad.show(
+    onUserEarnedReward: (shownAd, reward) {
+      rewardEarned = true;
+    },
+  );
+
+  return rewardCompleter.future;
+}
+
+Future<bool> confirmarAnuncioFotoPerfil(BuildContext context) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) {
+      return AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+        title: const Text('Reemplazar foto de perfil'),
+        content: const Text(
+          'Para usar esta selfie como foto de perfil tienes que ver un anuncio.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancelar'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Ver anuncio'),
+          ),
+        ],
+      );
+    },
+  );
+
+  return confirmed == true;
+}
+
+class _MontageAdConfirmationDialog extends StatefulWidget {
+  final String title;
+  final String message;
+  final String confirmText;
+  final String accion;
+
+  const _MontageAdConfirmationDialog({
+    required this.title,
+    required this.message,
+    required this.confirmText,
+    required this.accion,
+  });
+
+  @override
+  State<_MontageAdConfirmationDialog> createState() =>
+      _MontageAdConfirmationDialogState();
+}
+
+class _MontageAdConfirmationDialogState
+    extends State<_MontageAdConfirmationDialog> {
+  bool loadingAd = false;
+  bool adWatched = false;
+  String? statusMessage;
+
+  Future<void> _watchAd() async {
+    if (loadingAd || adWatched) return;
+
+    setState(() {
+      loadingAd = true;
+      statusMessage = 'Cargando anuncio...';
+    });
+
+    try {
+      final rewardEarned = await mostrarAnuncioRecompensado();
+      if (!mounted) return;
+
+      if (rewardEarned) {
+        setState(() {
+          adWatched = true;
+          loadingAd = false;
+          statusMessage =
+              'Anuncio completado. Preparando montaje para ${widget.accion}...';
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+        if (mounted) Navigator.pop(context, true);
+        return;
+      }
+
+      setState(() {
+        loadingAd = false;
+        statusMessage = 'Completa el anuncio para ${widget.accion} el montaje.';
+      });
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        loadingAd = false;
+        statusMessage =
+            'No se pudo cargar el anuncio. Inténtalo de nuevo en unos segundos.';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final statusIcon = loadingAd
+        ? Icons.hourglass_top_rounded
+        : adWatched
+        ? Icons.check_rounded
+        : Icons.play_circle_outline_rounded;
+    final statusColor = adWatched ? ssOrangeDark : ssText2;
+
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 28),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(22, 22, 22, 18),
+        decoration: BoxDecoration(
+          color: ssBg,
+          borderRadius: BorderRadius.circular(28),
+          border: Border.all(color: ssBorder, width: 1.2),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.10),
+              blurRadius: 28,
+              offset: const Offset(0, 14),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: ssOrangeLight,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: ssOrangeMid, width: 1.2),
+                  ),
+                  child: Icon(statusIcon, color: ssOrangeDark, size: 25),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    widget.title,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: ssTitle,
+                      fontSize: 21,
+                      height: 1.05,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Text(
+              widget.message,
+              style: const TextStyle(
+                color: ssText2,
+                fontSize: 15,
+                height: 1.35,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            if (statusMessage != null) ...[
+              const SizedBox(height: 14),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 13,
+                  vertical: 11,
+                ),
+                decoration: BoxDecoration(
+                  color: adWatched ? ssOrangeLight : ssSeparator,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: adWatched ? ssOrangeMid : ssBorder),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(statusIcon, color: statusColor, size: 18),
+                    const SizedBox(width: 9),
+                    Expanded(
+                      child: Text(
+                        statusMessage!,
+                        style: TextStyle(
+                          color: statusColor,
+                          fontSize: 13.5,
+                          height: 1.28,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            const SizedBox(height: 22),
+            Row(
+              children: [
+                Expanded(
+                  child: _SundayAdDialogButton(
+                    text: 'Cancelar',
+                    onTap: loadingAd
+                        ? null
+                        : () => Navigator.pop(context, false),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: _SundayAdDialogButton(
+                    text: loadingAd
+                        ? 'Cargando'
+                        : adWatched
+                        ? 'Listo'
+                        : widget.confirmText,
+                    primary: true,
+                    onTap: loadingAd || adWatched ? null : _watchAd,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SundayAdDialogButton extends StatelessWidget {
+  final String text;
+  final VoidCallback? onTap;
+  final bool primary;
+
+  const _SundayAdDialogButton({
+    required this.text,
+    required this.onTap,
+    this.primary = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final borderRadius = BorderRadius.circular(16);
+    final enabled = onTap != null;
+
+    return Material(
+      color: !enabled
+          ? ssSeparator
+          : primary
+          ? ssOrange
+          : ssOrangeLight,
+      borderRadius: borderRadius,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: SizedBox(
+          height: 48,
+          child: Center(
+            child: Text(
+              text,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: !enabled
+                    ? ssText3
+                    : primary
+                    ? Colors.white
+                    : ssOrangeDark,
+                fontSize: 14.5,
+                fontWeight: FontWeight.w900,
+                height: 1,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Future<bool> confirmarAnuncioMontaje(
+  BuildContext context, {
+  required String accion,
+}) async {
+  final confirmed = await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) {
+      return _MontageAdConfirmationDialog(
+        title: '${accion[0].toUpperCase()}${accion.substring(1)} montaje',
+        message: 'Para poder $accion el montaje es necesario ver un anuncio.',
+        confirmText: 'Ver anuncio',
+        accion: accion,
+      );
+    },
+  );
+
+  return confirmed == true;
+}
+
+Future<bool> prepararCambioFotoPerfilConAnuncio(BuildContext context) async {
+  final confirmed = await confirmarAnuncioFotoPerfil(context);
+  if (!confirmed || !context.mounted) return false;
+
+  showSundaySnack(context, 'Cargando anuncio...');
+  final rewardEarned = await mostrarAnuncioRecompensado();
+  if (!context.mounted) return rewardEarned;
+
+  if (rewardEarned) {
+    showSundaySnack(context, 'Anuncio completado. Actualizando foto...');
+  } else {
+    showSundaySnack(
+      context,
+      'Completa el anuncio para reemplazar la foto de perfil',
+    );
+  }
+
+  return rewardEarned;
+}
+
+Future<bool> prepararZumbidoExtraConAnuncio(BuildContext context) async {
+  final confirmed = await confirmarAnuncioZumbidoExtra(context);
+  if (!confirmed || !context.mounted) return false;
+
+  showSundaySnack(context, 'Cargando anuncio...');
+  final rewardEarned = await mostrarAnuncioRecompensadoZumbido();
+  if (!context.mounted) return rewardEarned;
+
+  if (rewardEarned) {
+    showSundaySnack(
+      context,
+      'Anuncio completado. Ya puedes enviar el zumbido.',
+    );
+  } else {
+    showSundaySnack(context, 'Completa el anuncio para enviar otro zumbido');
+  }
+
+  return rewardEarned;
+}
+
+Future<bool> prepararMontajeConAnuncio(
+  BuildContext context, {
+  required String accion,
+}) async {
+  final unlocked = await confirmarAnuncioMontaje(context, accion: accion);
+  if (!context.mounted) return unlocked;
+
+  if (unlocked) {
+    showSundaySnack(context, 'Anuncio completado. Preparando montaje...');
+  }
+
+  return unlocked;
+}
+
+Future<bool> prepararSelfieConRetrasoConAnuncio(BuildContext context) async {
+  final unlocked = await showDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => const LateSelfieUploadDialog(),
+  );
+
+  return unlocked == true;
+}
+
+class LateSelfieUploadDialog extends StatefulWidget {
+  const LateSelfieUploadDialog({super.key});
+
+  @override
+  State<LateSelfieUploadDialog> createState() => _LateSelfieUploadDialogState();
+}
+
+class _LateSelfieUploadDialogState extends State<LateSelfieUploadDialog> {
+  bool loadingAd = false;
+  bool adWatched = false;
+  String? message;
+
+  Future<void> _watchAd() async {
+    if (loadingAd || adWatched) return;
+
+    setState(() {
+      loadingAd = true;
+      message = 'Cargando anuncio...';
+    });
+
+    try {
+      final rewardEarned = await mostrarAnuncioRecompensado();
+      if (!mounted) return;
+
+      setState(() {
+        adWatched = rewardEarned;
+        loadingAd = false;
+        message = rewardEarned
+            ? 'Anuncio completado. Ya puedes subir tu Sunday Selfie.'
+            : 'Completa el anuncio para subir con un día de retraso.';
+      });
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        loadingAd = false;
+        message = 'No se pudo completar el anuncio: $error';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final statusIcon = loadingAd
+        ? Icons.hourglass_top_rounded
+        : adWatched
+        ? Icons.check_rounded
+        : Icons.lock_clock_rounded;
+    final statusColor = adWatched ? ssOrangeDark : ssText2;
+
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 380),
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(24, 24, 24, 22),
+          decoration: BoxDecoration(
+            color: ssSurface,
+            borderRadius: BorderRadius.circular(28),
+            border: Border.all(color: ssOrangeMid, width: 1.4),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.16),
+                blurRadius: 34,
+                offset: const Offset(0, 16),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Center(
+                child: Container(
+                  width: 58,
+                  height: 58,
+                  decoration: BoxDecoration(
+                    color: ssOrangeLight,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: ssOrangeMid),
+                  ),
+                  child: Icon(statusIcon, color: ssOrangeDark, size: 30),
+                ),
+              ),
+              const SizedBox(height: 18),
+              const Text(
+                'Subir con un día de retraso',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: ssText,
+                  fontSize: 23,
+                  height: 1.12,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              const SizedBox(height: 14),
+              const Text(
+                'Para poder subir el Sunday Selfie el lunes hay que ver un anuncio.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: ssText2,
+                  fontSize: 15,
+                  height: 1.42,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              if (message != null) ...[
+                const SizedBox(height: 16),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: adWatched ? ssOrangeLight : ssSeparator,
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(
+                      color: adWatched ? ssOrangeMid : ssBorder,
+                    ),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Icon(statusIcon, color: statusColor, size: 19),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          message!,
+                          style: TextStyle(
+                            color: statusColor,
+                            fontSize: 14,
+                            height: 1.35,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+              const SizedBox(height: 22),
+              TextButton.icon(
+                onPressed: loadingAd
+                    ? null
+                    : () => Navigator.pop(context, false),
+                icon: const Icon(Icons.close_rounded, size: 19),
+                label: const Text('Cancelar'),
+                style: TextButton.styleFrom(
+                  foregroundColor: ssOrangeDark,
+                  disabledForegroundColor: ssText3,
+                  textStyle: const TextStyle(fontWeight: FontWeight.w800),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: loadingAd || adWatched ? null : _watchAd,
+                icon: loadingAd
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          color: ssOrange,
+                          strokeWidth: 2.2,
+                        ),
+                      )
+                    : Icon(
+                        adWatched
+                            ? Icons.check_rounded
+                            : Icons.play_circle_outline_rounded,
+                        size: 19,
+                      ),
+                label: Text(
+                  adWatched
+                      ? 'Anuncio visto'
+                      : loadingAd
+                      ? 'Cargando anuncio'
+                      : 'Ver anuncio',
+                ),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: ssOrangeDark,
+                  disabledForegroundColor: ssText3,
+                  side: BorderSide(color: adWatched ? ssBorder : ssOrangeMid),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  padding: const EdgeInsets.symmetric(vertical: 13),
+                  textStyle: const TextStyle(fontWeight: FontWeight.w900),
+                ),
+              ),
+              const SizedBox(height: 10),
+              ElevatedButton.icon(
+                onPressed: loadingAd || !adWatched
+                    ? null
+                    : () => Navigator.pop(context, true),
+                icon: const Icon(Icons.photo_camera_rounded, size: 19),
+                label: const Text('Subir Sunday Selfie'),
+                style: ElevatedButton.styleFrom(
+                  elevation: 0,
+                  backgroundColor: ssOrange,
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor: ssSeparator,
+                  disabledForegroundColor: ssText3,
+                  shadowColor: Colors.transparent,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  textStyle: const TextStyle(fontWeight: FontWeight.w900),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -1829,6 +8077,24 @@ Future<void> reportarSelfie({
     });
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo enviar el reporte');
+  }
+}
+
+Future<void> borrarSelfie({
+  required String groupId,
+  required String weekKey,
+  required String postUid,
+}) async {
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable('borrarSelfie');
+
+    await callable.call<void>({
+      'groupId': groupId,
+      'weekKey': weekKey,
+      'postUid': postUid,
+    });
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo borrar la selfie');
   }
 }
 
@@ -1885,7 +8151,8 @@ class ModerationReport {
       reason: (data['reason'] ?? 'otro').toString(),
       status: (data['status'] ?? 'pending').toString(),
       authorName: formatUserDisplayName(data['authorName'] ?? 'Usuario'),
-      authorPhotoUrl: rawAuthorPhoto is String && rawAuthorPhoto.trim().isNotEmpty
+      authorPhotoUrl:
+          rawAuthorPhoto is String && rawAuthorPhoto.trim().isNotEmpty
           ? rawAuthorPhoto.trim()
           : null,
       imageUrl: rawImageUrl,
@@ -1905,9 +8172,7 @@ Future<List<ModerationReport>> listarReportesGrupo({
     final callable = FirebaseFunctions.instance.httpsCallable(
       'listarReportesGrupo',
     );
-    final result = await callable.call<dynamic>({
-      'groupId': groupId,
-    });
+    final result = await callable.call<dynamic>({'groupId': groupId});
     final data = result.data;
 
     if (data is! Map) {
@@ -1919,9 +8184,7 @@ Future<List<ModerationReport>> listarReportesGrupo({
 
     return rawReports
         .whereType<Map>()
-        .map((raw) => ModerationReport.fromData(
-              Map<String, dynamic>.from(raw),
-            ))
+        .map((raw) => ModerationReport.fromData(Map<String, dynamic>.from(raw)))
         .toList();
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudieron cargar los reportes');
@@ -1938,12 +8201,11 @@ Future<void> resolverReporteGrupo({
   }
 
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable('resolverReporte');
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'resolverReporte',
+    );
 
-    await callable.call<void>({
-      'reportId': reportId,
-      'decision': decision,
-    });
+    await callable.call<void>({'reportId': reportId, 'decision': decision});
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo resolver el reporte');
   }
@@ -1953,19 +8215,68 @@ Future<void> borrarCuentaSundaySelfie() async {
   try {
     final callable = FirebaseFunctions.instance.httpsCallable('borrarCuenta');
 
-    await callable.call<void>({
-      'confirmation': 'BORRAR',
-    });
+    await callable.call<void>({'confirmation': 'BORRAR'});
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo borrar la cuenta');
   }
 }
 
+Future<void> enviarSugerenciaUsuario({
+  required User user,
+  required String authorName,
+  required String text,
+}) async {
+  final cleanText = text.trim();
+  if (cleanText.length < 5) {
+    throw Exception('Escribe un poco más para enviar la sugerencia');
+  }
+  if (cleanText.length > 1000) {
+    throw Exception('La sugerencia no puede superar 1000 caracteres');
+  }
+
+  final cleanAuthorName = formatUserDisplayName(authorName).trim();
+  final safeAuthorName = cleanAuthorName.length > 80
+      ? cleanAuthorName.substring(0, 80)
+      : cleanAuthorName;
+  final cleanEmail = user.email?.trim();
+  final safeEmail =
+      cleanEmail != null && cleanEmail.isNotEmpty && cleanEmail.length <= 320
+      ? cleanEmail
+      : null;
+
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'enviarSugerencia',
+    );
+    final payload = <String, Object>{
+      'authorName': safeAuthorName.isEmpty ? 'Usuario' : safeAuthorName,
+      'text': cleanText,
+    };
+
+    if (safeEmail != null) payload['authorEmail'] = safeEmail;
+
+    final result = await callable.call<dynamic>(payload);
+    final resultData = result.data;
+    final emailStatus = resultData is Map
+        ? resultData['emailStatus']?.toString()
+        : null;
+
+    if (emailStatus == 'failed' || emailStatus == 'not_configured') {
+      throw Exception(
+        'La sugerencia se guardó, pero el correo no quedó configurado',
+      );
+    }
+  } on FirebaseFunctionsException catch (error) {
+    throw Exception(error.message ?? 'No se pudo enviar la sugerencia');
+  }
+}
 
 Future<void> enviarMensajeChatSemana({
   required String groupId,
   required String weekKey,
   required String text,
+  String? gifUrl,
+  String? gifLabel,
 }) async {
   final currentUser = FirebaseAuth.instance.currentUser;
 
@@ -1974,13 +8285,22 @@ Future<void> enviarMensajeChatSemana({
   }
 
   final cleanText = text.trim();
+  final cleanGifUrl = gifUrl?.trim() ?? '';
+  final cleanGifLabel = gifLabel?.trim() ?? '';
 
-  if (cleanText.isEmpty) {
-    throw Exception('Escribe un mensaje');
+  if (cleanText.isEmpty && cleanGifUrl.isEmpty) {
+    throw Exception('Escribe un mensaje o elige un GIF');
   }
 
   if (cleanText.characters.length > 500) {
     throw Exception('El mensaje no puede superar 500 caracteres');
+  }
+
+  if (cleanGifUrl.isNotEmpty) {
+    final uri = Uri.tryParse(cleanGifUrl);
+    if (uri == null || !uri.hasScheme || uri.host.isEmpty) {
+      throw Exception('El GIF no es válido');
+    }
   }
 
   if (!esDomingo() || weekKey != obtenerWeekKeyActual()) {
@@ -2032,6 +8352,11 @@ Future<void> enviarMensajeChatSemana({
       'authorName': authorName,
       'authorPhotoUrl': authorPhotoUrl,
       'text': cleanText,
+      'type': cleanGifUrl.isEmpty
+          ? 'text'
+          : (cleanText.isEmpty ? 'gif' : 'mixed'),
+      'gifUrl': cleanGifUrl.isEmpty ? null : cleanGifUrl,
+      'gifLabel': cleanGifLabel.isEmpty ? null : cleanGifLabel,
       'weekKey': weekKey,
       'createdAt': FieldValue.serverTimestamp(),
     });
@@ -2040,6 +8365,47 @@ Future<void> enviarMensajeChatSemana({
   await marcarActividadGrupo(groupId: groupId);
 }
 
+Future<void> marcarChatSemanaLeido({
+  required String groupId,
+  required String weekKey,
+}) async {
+  final currentUser = FirebaseAuth.instance.currentUser;
+
+  if (currentUser == null || weekKey.isEmpty) return;
+
+  await FirebaseFirestore.instance
+      .collection('users')
+      .doc(currentUser.uid)
+      .collection('groups')
+      .doc(groupId)
+      .set({
+        'groupId': groupId,
+        'chatReads': {
+          weekKey: {'lastReadAt': FieldValue.serverTimestamp()},
+        },
+      }, SetOptions(merge: true));
+}
+
+Future<void> marcarGrupoSemanaVisto({
+  required String groupId,
+  required String weekKey,
+}) async {
+  final currentUser = FirebaseAuth.instance.currentUser;
+
+  if (currentUser == null || weekKey.isEmpty) return;
+
+  await FirebaseFirestore.instance
+      .collection('users')
+      .doc(currentUser.uid)
+      .collection('groups')
+      .doc(groupId)
+      .set({
+        'groupId': groupId,
+        'groupViews': {
+          weekKey: {'lastViewedAt': FieldValue.serverTimestamp()},
+        },
+      }, SetOptions(merge: true));
+}
 
 class StreakRankingEntry {
   final String uid;
@@ -2104,6 +8470,7 @@ Future<List<XFile>> descargarSelfiesGrupo({
   required String groupName,
   required bool allWeeks,
   String? weekKey,
+  List<String>? weekKeys,
 }) async {
   final firestore = FirebaseFirestore.instance;
   final sanitizedGroupName = groupName
@@ -2113,7 +8480,15 @@ Future<List<XFile>> descargarSelfiesGrupo({
 
   final weekIds = <String>[];
 
-  if (allWeeks) {
+  final explicitWeekKeys = weekKeys
+      ?.map((key) => key.trim())
+      .where((key) => key.isNotEmpty)
+      .toSet()
+      .toList();
+
+  if (explicitWeekKeys != null && explicitWeekKeys.isNotEmpty) {
+    weekIds.addAll(explicitWeekKeys);
+  } else if (allWeeks) {
     final weeksSnapshot = await firestore
         .collection('groups')
         .doc(groupId)
@@ -2140,13 +8515,15 @@ Future<List<XFile>> descargarSelfiesGrupo({
 
       for (final postDoc in postsSnapshot.docs) {
         final data = postDoc.data();
-        final imageUrl = (data['imageUrl'] ?? data['thumbUrl'] ?? '').toString();
+        final imageUrl = (data['imageUrl'] ?? data['thumbUrl'] ?? '')
+            .toString();
         if (imageUrl.trim().isEmpty) continue;
 
-        final authorName = formatUserDisplayName(data['authorName'] ?? postDoc.id)
-            .replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_')
-            .replaceAll(RegExp(r'_+'), '_')
-            .trim();
+        final authorName =
+            formatUserDisplayName(data['authorName'] ?? postDoc.id)
+                .replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_')
+                .replaceAll(RegExp(r'_+'), '_')
+                .trim();
         final uri = Uri.tryParse(imageUrl);
         if (uri == null) continue;
 
@@ -2155,7 +8532,8 @@ Future<List<XFile>> descargarSelfiesGrupo({
         if (response.statusCode < 200 || response.statusCode >= 300) continue;
 
         final bytes = await consolidateHttpClientResponseBytes(response);
-        final fileName = '${sanitizedGroupName.isEmpty ? 'grupo' : sanitizedGroupName}_${currentWeekKey}_${authorName.isEmpty ? postDoc.id : authorName}.jpg';
+        final fileName =
+            '${sanitizedGroupName.isEmpty ? 'grupo' : sanitizedGroupName}_${currentWeekKey}_${authorName.isEmpty ? postDoc.id : authorName}.jpg';
         final file = File('${Directory.systemTemp.path}/$fileName');
         await file.writeAsBytes(bytes, flush: true);
         files.add(XFile(file.path, mimeType: 'image/jpeg', name: fileName));
@@ -2166,6 +8544,69 @@ Future<List<XFile>> descargarSelfiesGrupo({
   }
 
   return files;
+}
+
+String sanitizarParteNombreArchivo(String value, String fallback) {
+  final sanitized = value
+      .replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_')
+      .replaceAll(RegExp(r'_+'), '_')
+      .trim();
+  return sanitized.isEmpty ? fallback : sanitized;
+}
+
+String extensionImagenParaMimeType(String mimeType) {
+  switch (mimeType.toLowerCase()) {
+    case 'image/png':
+      return 'png';
+    case 'image/webp':
+      return 'webp';
+    case 'image/heic':
+      return 'heic';
+    case 'image/heif':
+      return 'heif';
+    default:
+      return 'jpg';
+  }
+}
+
+Future<XFile> descargarSelfieIndividual({
+  required String imageUrl,
+  required String groupName,
+  required String weekKey,
+  required String authorName,
+}) async {
+  final trimmedUrl = imageUrl.trim();
+  if (trimmedUrl.isEmpty) {
+    throw Exception('Esta selfie no tiene una imagen disponible');
+  }
+
+  final uri = Uri.tryParse(trimmedUrl);
+  if (uri == null || !uri.hasScheme) {
+    throw Exception('No se pudo preparar la descarga');
+  }
+
+  final httpClient = HttpClient();
+  try {
+    final request = await httpClient.getUrl(uri);
+    final response = await request.close();
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('No se pudo descargar la selfie');
+    }
+
+    final bytes = await consolidateHttpClientResponseBytes(response);
+    final mimeType = response.headers.contentType?.mimeType ?? 'image/jpeg';
+    final extension = extensionImagenParaMimeType(mimeType);
+    final safeGroupName = sanitizarParteNombreArchivo(groupName, 'grupo');
+    final safeWeekKey = sanitizarParteNombreArchivo(weekKey, 'semana');
+    final safeAuthorName = sanitizarParteNombreArchivo(authorName, 'selfie');
+    final fileName =
+        'selfie_${safeGroupName}_${safeWeekKey}_$safeAuthorName.$extension';
+    final file = File('${Directory.systemTemp.path}/$fileName');
+    await file.writeAsBytes(bytes, flush: true);
+    return XFile(file.path, mimeType: mimeType, name: fileName);
+  } finally {
+    httpClient.close(force: true);
+  }
 }
 
 Future<void> compartirArchivosDescargados({
@@ -2188,6 +8629,59 @@ Future<void> compartirArchivosDescargados({
       sharePositionOrigin: const Rect.fromLTWH(0, 0, 1, 1),
     ),
   );
+}
+
+Future<int> guardarArchivosDescargadosEnTelefono({
+  required List<XFile> files,
+}) async {
+  if (files.isEmpty) return 0;
+
+  if (!Platform.isAndroid && !Platform.isIOS) {
+    throw UnsupportedError(
+      'La descarga directa solo está disponible en teléfono',
+    );
+  }
+
+  final savedCount = await mediaSaverChannel.invokeMethod<int>(
+    'saveImagesToGallery',
+    {
+      'files': files
+          .map(
+            (file) => {
+              'path': file.path,
+              'name': file.name,
+              'mimeType': file.mimeType ?? 'image/jpeg',
+            },
+          )
+          .toList(),
+    },
+  );
+
+  return savedCount ?? 0;
+}
+
+String mensajeErrorGuardandoArchivos(Object error) {
+  if (error is PlatformException) {
+    switch (error.code) {
+      case 'photo-permission-denied':
+        return 'Activa el permiso de Fotos para guardar las selfies';
+      case 'no-files-saved':
+        return 'No se pudieron guardar las selfies en el teléfono';
+      case 'save-failed':
+        return 'No se pudieron guardar las selfies en el teléfono';
+      case 'invalid-arguments':
+        return 'No se pudo preparar la descarga';
+    }
+
+    final message = error.message?.trim();
+    if (message != null && message.isNotEmpty) return message;
+  }
+
+  if (error is UnsupportedError) {
+    return error.message ?? 'La descarga directa no está disponible aquí';
+  }
+
+  return 'Error guardando selfies: $error';
 }
 
 void showReactionUsersSheet({
@@ -2245,7 +8739,9 @@ void showReactionUsersSheet({
               const SizedBox(height: 14),
               ...users.map((doc) {
                 final data = doc.data();
-                final name = formatUserDisplayName(data['authorName'] ?? 'Usuario');
+                final name = formatUserDisplayName(
+                  data['authorName'] ?? 'Usuario',
+                );
                 final photoUrl = data['authorPhotoUrl'] as String?;
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 7),
@@ -2280,36 +8776,161 @@ void showReactionUsersSheet({
   );
 }
 
-class MyApp extends StatelessWidget {
+class MyApp extends StatefulWidget {
   const MyApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'Sunday Selfie',
-      theme: ThemeData(
-        useMaterial3: true,
-        scaffoldBackgroundColor: ssBg,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: ssOrange,
-          brightness: Brightness.light,
-        ),
-        textTheme: GoogleFonts.dmSansTextTheme(),
+  State<MyApp> createState() => _MyAppState();
+}
+
+class _MyAppState extends State<MyApp> {
+  final AppLinks _appLinks = AppLinks();
+  late final SundayClock _sundayClock;
+  StreamSubscription<Uri>? _linkSubscription;
+  StreamSubscription<User?>? _authSubscription;
+  String? _pendingInviteInput;
+  String? _lastOpenedInviteInput;
+  bool _pendingInviteFrameScheduled = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _sundayClock = SundayClock();
+    _linkSubscription = _appLinks.uriLinkStream.listen(
+      _handleIncomingLink,
+      onError: (error) {
+        logDebug('No se pudo leer el enlace de invitación: $error');
+      },
+    );
+    unawaited(_handleInitialLink());
+    _authSubscription = FirebaseAuth.instance.authStateChanges().listen((user) {
+      if (user != null) {
+        _openPendingInvite(user);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _linkSubscription?.cancel();
+    _authSubscription?.cancel();
+    _sundayClock.dispose();
+    super.dispose();
+  }
+
+  Future<void> _handleInitialLink() async {
+    try {
+      final uri = await _appLinks.getInitialLink();
+      if (uri == null) return;
+      await _handleIncomingLink(uri);
+    } catch (error) {
+      logDebug('No se pudo leer el enlace inicial de invitación: $error');
+    }
+  }
+
+  Future<void> _handleIncomingLink(Uri uri) async {
+    final inviteInput = obtenerInvitacionDesdeDeepLink(uri);
+    if (inviteInput == null) return;
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      _pendingInviteInput = inviteInput;
+      _lastOpenedInviteInput = null;
+      return;
+    }
+
+    await _openInvite(user: user, inviteInput: inviteInput);
+  }
+
+  void _openPendingInvite(User user) {
+    final inviteInput = _pendingInviteInput;
+    if (inviteInput == null) return;
+
+    _pendingInviteInput = null;
+    unawaited(_openInvite(user: user, inviteInput: inviteInput));
+  }
+
+  void _schedulePendingInviteOpen() {
+    if (_pendingInviteFrameScheduled) return;
+    _pendingInviteFrameScheduled = true;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _pendingInviteFrameScheduled = false;
+      if (!mounted) return;
+
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        _openPendingInvite(user);
+      }
+    });
+  }
+
+  Future<void> _openInvite({
+    required User user,
+    required String inviteInput,
+  }) async {
+    if (_lastOpenedInviteInput == inviteInput) return;
+    _lastOpenedInviteInput = inviteInput;
+
+    final navigator = sundayNavigatorKey.currentState;
+    if (navigator == null) {
+      _pendingInviteInput = inviteInput;
+      _lastOpenedInviteInput = null;
+      _schedulePendingInviteOpen();
+      return;
+    }
+
+    final groupId = await resolverGroupIdDesdeInvitacion(inviteInput);
+    if (groupId == null) {
+      _showRootSnack('Invitación no válida');
+      return;
+    }
+
+    navigator.push(
+      MaterialPageRoute(
+        builder: (_) =>
+            JoinGroupScreen(user: user, initialInviteInput: inviteInput),
       ),
-      home: StreamBuilder<User?>(
-        stream: FirebaseAuth.instance.authStateChanges(),
-        builder: (context, authSnapshot) {
-          if (authSnapshot.connectionState == ConnectionState.waiting) {
-            return const LoadingScreen();
-          }
+    );
+  }
 
-          if (authSnapshot.hasData) {
-            return AuthenticatedUserGate(user: authSnapshot.data!);
-          }
+  void _showRootSnack(String message) {
+    final context = sundayNavigatorKey.currentContext;
+    if (context == null) return;
+    showSundaySnack(context, message);
+  }
 
-          return const LoginScreen();
-        },
+  @override
+  Widget build(BuildContext context) {
+    return SundayClockScope(
+      clock: _sundayClock,
+      child: MaterialApp(
+        navigatorKey: sundayNavigatorKey,
+        debugShowCheckedModeBanner: false,
+        title: 'Sunday Selfie',
+        theme: ThemeData(
+          useMaterial3: true,
+          scaffoldBackgroundColor: ssBg,
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: ssOrange,
+            brightness: Brightness.light,
+          ),
+          textTheme: GoogleFonts.dmSansTextTheme(),
+        ),
+        home: StreamBuilder<User?>(
+          stream: FirebaseAuth.instance.authStateChanges(),
+          builder: (context, authSnapshot) {
+            if (authSnapshot.connectionState == ConnectionState.waiting) {
+              return const LoadingScreen();
+            }
+
+            if (authSnapshot.hasData) {
+              return AuthenticatedUserGate(user: authSnapshot.data!);
+            }
+
+            return const LoginScreen();
+          },
+        ),
       ),
     );
   }
@@ -2326,11 +8947,18 @@ class AuthenticatedUserGate extends StatefulWidget {
 
 class _AuthenticatedUserGateState extends State<AuthenticatedUserGate> {
   late Future<void> initialUserFuture;
+  late Stream<DocumentSnapshot<Map<String, dynamic>>> userStream;
+  late Widget authenticatedShell;
 
   @override
   void initState() {
     super.initState();
     initialUserFuture = crearUsuarioSiNoExiste(widget.user);
+    userStream = FirebaseFirestore.instance
+        .collection('users')
+        .doc(widget.user.uid)
+        .snapshots();
+    authenticatedShell = SundayShell(user: widget.user);
   }
 
   @override
@@ -2338,6 +8966,11 @@ class _AuthenticatedUserGateState extends State<AuthenticatedUserGate> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.user.uid != widget.user.uid) {
       initialUserFuture = crearUsuarioSiNoExiste(widget.user);
+      userStream = FirebaseFirestore.instance
+          .collection('users')
+          .doc(widget.user.uid)
+          .snapshots();
+      authenticatedShell = SundayShell(user: widget.user);
     }
   }
 
@@ -2361,12 +8994,8 @@ class _AuthenticatedUserGateState extends State<AuthenticatedUserGate> {
           );
         }
 
-        final userRef = FirebaseFirestore.instance
-            .collection('users')
-            .doc(widget.user.uid);
-
         return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-          stream: userRef.snapshots(),
+          stream: userStream,
           builder: (context, userSnapshot) {
             if (userSnapshot.connectionState == ConnectionState.waiting) {
               return const LoadingScreen();
@@ -2378,7 +9007,7 @@ class _AuthenticatedUserGateState extends State<AuthenticatedUserGate> {
               return OnboardingNameScreen(user: widget.user);
             }
 
-            return SundayShell(user: widget.user);
+            return authenticatedShell;
           },
         );
       },
@@ -2455,6 +9084,15 @@ class OnboardingNameScreen extends StatefulWidget {
 
 class _OnboardingNameScreenState extends State<OnboardingNameScreen> {
   final TextEditingController nameController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    final initialName = widget.user.displayName?.trim();
+    if (initialName != null && initialName.isNotEmpty) {
+      nameController.text = formatUserDisplayName(initialName);
+    }
+  }
 
   @override
   void dispose() {
@@ -2559,7 +9197,6 @@ class OnboardingPhotoScreen extends StatefulWidget {
 
 class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
   XFile? selectedPhoto;
-  bool filterApplied = false;
   bool saving = false;
 
   Future<void> _choosePhotoSource() async {
@@ -2575,15 +9212,17 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
       final photo = await Navigator.push<XFile>(
         context,
         MaterialPageRoute(
-          builder: (_) => const CameraCaptureScreen(groupName: 'Foto de perfil'),
+          builder: (_) =>
+              const CameraCaptureScreen(groupName: 'Foto de perfil'),
         ),
       );
 
       if (!mounted || photo == null) return;
+      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
+      if (!mounted || !validPhoto) return;
 
       setState(() {
         selectedPhoto = photo;
-        filterApplied = false;
       });
       return;
     }
@@ -2597,24 +9236,16 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
       );
 
       if (!mounted || photo == null) return;
+      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
+      if (!mounted || !validPhoto) return;
 
       setState(() {
         selectedPhoto = photo;
-        filterApplied = false;
       });
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'No se pudo abrir la galería: $error');
     }
-  }
-
-  void _applyFilter() {
-    if (selectedPhoto == null) {
-      showSundaySnack(context, 'Primero añade una foto de perfil');
-      return;
-    }
-
-    setState(() => filterApplied = true);
   }
 
   Future<void> _finish() async {
@@ -2625,10 +9256,8 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
       return;
     }
 
-    if (!filterApplied) {
-      showSundaySnack(context, 'Aplica el filtro Sunday Selfie para continuar');
-      return;
-    }
+    final validPhoto = await validarFotoSelfieParaSubida(context, photo);
+    if (!mounted || !validPhoto) return;
 
     if (saving) return;
 
@@ -2643,6 +9272,9 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
 
       if (!mounted) return;
       Navigator.popUntil(context, (route) => route.isFirst);
+    } on SelfiePhotoValidationException catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, error.message);
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'Error guardando perfil: $error');
@@ -2688,7 +9320,6 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
                     child: OnboardingProfilePhotoPreview(
                       photo: selectedPhoto,
                       name: widget.name,
-                      filterApplied: filterApplied,
                       onTap: saving ? null : _choosePhotoSource,
                     ),
                   ),
@@ -2700,62 +9331,12 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
                       subtitle: 'Elige una imagen de galería o hazla ahora',
                       onTap: saving ? null : _choosePhotoSource,
                     )
-                  else if (!filterApplied)
-                    SundayDashedActionCard(
-                      icon: Icons.auto_awesome_rounded,
-                      title: 'Aplicar filtro Sunday Selfie',
-                      subtitle: 'Toca para añadir el filtro a tu foto',
-                      onTap: saving ? null : _applyFilter,
-                    )
                   else
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 14,
-                      ),
-                      decoration: BoxDecoration(
-                        color: ssOrangeLight,
-                        borderRadius: BorderRadius.circular(14),
-                        border: Border.all(color: ssOrangeMid, width: 1.5),
-                      ),
-                      child: const Row(
-                        children: [
-                          CircleAvatar(
-                            radius: 20,
-                            backgroundColor: ssOrange,
-                            child: Icon(
-                              Icons.check_rounded,
-                              color: Colors.white,
-                              size: 24,
-                            ),
-                          ),
-                          SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'Filtro Sunday Selfie aplicado',
-                                  style: TextStyle(
-                                    color: ssOrangeDark,
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                                SizedBox(height: 2),
-                                Text(
-                                  'Tu perfil está listo para empezar',
-                                  style: TextStyle(
-                                    color: ssText2,
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
+                    SundayDashedActionCard(
+                      icon: Icons.photo_library_outlined,
+                      title: 'Cambiar foto de perfil',
+                      subtitle: 'Elige otra imagen o haz una nueva',
+                      onTap: saving ? null : _choosePhotoSource,
                     ),
                 ],
               ),
@@ -2874,14 +9455,12 @@ class SundayTextField extends StatelessWidget {
 class OnboardingProfilePhotoPreview extends StatelessWidget {
   final XFile? photo;
   final String name;
-  final bool filterApplied;
   final VoidCallback? onTap;
 
   const OnboardingProfilePhotoPreview({
     super.key,
     required this.photo,
     required this.name,
-    required this.filterApplied,
     required this.onTap,
   });
 
@@ -2909,20 +9488,32 @@ class OnboardingProfilePhotoPreview extends StatelessWidget {
                 ),
               ],
             ),
-            child: Center(
+            child: ClipOval(
               child: hasPhoto
-                  ? Text(
-                      initialsFromName(name),
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 38,
-                        fontWeight: FontWeight.w800,
+                  ? Image.file(
+                      File(photo!.path),
+                      width: 120,
+                      height: 120,
+                      fit: BoxFit.cover,
+                      alignment: Alignment.center,
+                      filterQuality: FilterQuality.high,
+                      errorBuilder: (_, _, _) => Center(
+                        child: Text(
+                          initialsFromName(name),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 38,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
                       ),
                     )
-                  : const Icon(
-                      Icons.person_outline_rounded,
-                      color: ssText3,
-                      size: 44,
+                  : const Center(
+                      child: Icon(
+                        Icons.person_outline_rounded,
+                        color: ssText3,
+                        size: 44,
+                      ),
                     ),
             ),
           ),
@@ -3148,14 +9739,18 @@ class ProfilePhotoSourceSheet extends StatelessWidget {
                     icon: Icons.photo_library_outlined,
                     title: 'Galería',
                     subtitle: 'Elige una foto guardada',
-                    onTap: () => Navigator.pop(context, image_picker.ImageSource.gallery),
+                    onTap: () => Navigator.pop(
+                      context,
+                      image_picker.ImageSource.gallery,
+                    ),
                   ),
                   const Divider(height: 1, color: ssSeparator),
                   ProfilePhotoSourceRow(
                     icon: Icons.photo_camera_outlined,
                     title: 'Cámara',
                     subtitle: 'Haz una foto ahora',
-                    onTap: () => Navigator.pop(context, image_picker.ImageSource.camera),
+                    onTap: () =>
+                        Navigator.pop(context, image_picker.ImageSource.camera),
                   ),
                 ],
               ),
@@ -3165,10 +9760,7 @@ class ProfilePhotoSourceSheet extends StatelessWidget {
               child: const Center(
                 child: Text(
                   'Cancelar',
-                  style: TextStyle(
-                    color: ssText2,
-                    fontWeight: FontWeight.w800,
-                  ),
+                  style: TextStyle(color: ssText2, fontWeight: FontWeight.w800),
                 ),
               ),
             ),
@@ -3253,7 +9845,7 @@ class LoadingScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return const Scaffold(
       backgroundColor: ssBg,
-      body: Center(child: CircularProgressIndicator(color: ssOrange)),
+      body: Center(child: SundaySelfieLogoMark(size: 126)),
     );
   }
 }
@@ -3266,13 +9858,15 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  bool signingIn = false;
+  String? signingInProvider;
   bool googleSignInInitialized = false;
+
+  bool get signingIn => signingInProvider != null;
 
   Future<void> _signInWithGoogle() async {
     if (signingIn) return;
 
-    setState(() => signingIn = true);
+    setState(() => signingInProvider = 'google');
 
     try {
       if (!googleSignInInitialized) {
@@ -3282,8 +9876,8 @@ class _LoginScreenState extends State<LoginScreen> {
         googleSignInInitialized = true;
       }
 
-      final GoogleSignInAccount googleUser =
-          await GoogleSignIn.instance.authenticate();
+      final GoogleSignInAccount googleUser = await GoogleSignIn.instance
+          .authenticate();
       final GoogleSignInAuthentication googleAuth = googleUser.authentication;
 
       final credential = GoogleAuthProvider.credential(
@@ -3293,47 +9887,109 @@ class _LoginScreenState extends State<LoginScreen> {
       await FirebaseAuth.instance.signInWithCredential(credential);
     } on FirebaseAuthException catch (error) {
       if (!mounted) return;
-      showSundaySnack(context, _firebaseAuthLoginMessage(error));
+      showSundaySnack(
+        context,
+        _firebaseAuthLoginMessage(error, providerName: 'Google'),
+      );
     } catch (error) {
       if (!mounted) return;
-      final rawError = error.toString().toLowerCase();
 
-      if (rawError.contains('cancel') || rawError.contains('abort')) {
+      if (_loginWasCancelled(error)) {
         showSundaySnack(context, 'Inicio de sesión cancelado');
       } else {
-        showSundaySnack(context, 'No se pudo iniciar sesión con Google: $error');
+        showSundaySnack(
+          context,
+          'No se pudo iniciar sesión con Google: $error',
+        );
       }
     } finally {
       if (mounted) {
-        setState(() => signingIn = false);
+        setState(() => signingInProvider = null);
       }
     }
   }
 
-  String _firebaseAuthLoginMessage(FirebaseAuthException error) {
+  Future<void> _signInWithApple() async {
+    if (signingIn) return;
+
+    setState(() => signingInProvider = 'apple');
+
+    try {
+      final appleProvider = AppleAuthProvider()
+        ..addScope('email')
+        ..addScope('name');
+
+      if (kIsWeb) {
+        await FirebaseAuth.instance.signInWithPopup(appleProvider);
+      } else {
+        await FirebaseAuth.instance.signInWithProvider(appleProvider);
+      }
+    } on FirebaseAuthException catch (error) {
+      if (!mounted) return;
+
+      if (_loginWasCancelled(error)) {
+        showSundaySnack(context, 'Inicio de sesión cancelado');
+      } else {
+        showSundaySnack(
+          context,
+          _firebaseAuthLoginMessage(error, providerName: 'Apple'),
+        );
+      }
+    } catch (error) {
+      if (!mounted) return;
+
+      if (_loginWasCancelled(error)) {
+        showSundaySnack(context, 'Inicio de sesión cancelado');
+      } else {
+        showSundaySnack(context, 'No se pudo iniciar sesión con Apple: $error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => signingInProvider = null);
+      }
+    }
+  }
+
+  bool _loginWasCancelled(Object error) {
+    final rawError = error.toString().toLowerCase();
+    if (rawError.contains('cancel') || rawError.contains('abort')) {
+      return true;
+    }
+
+    return error is FirebaseAuthException &&
+        {
+          'cancelled-popup-request',
+          'popup-closed-by-user',
+          'web-context-cancelled',
+        }.contains(error.code);
+  }
+
+  String _firebaseAuthLoginMessage(
+    FirebaseAuthException error, {
+    required String providerName,
+  }) {
     switch (error.code) {
       case 'network-request-failed':
         return 'No hay conexión con Firebase. Revisa internet, DNS privado o VPN.';
       case 'operation-not-allowed':
-        return 'Google todavía no está activado como método de acceso en Firebase.';
+        return '$providerName todavía no está activado como método de acceso en Firebase.';
       case 'account-exists-with-different-credential':
         return 'Ya existe una cuenta con otro método de acceso.';
       case 'invalid-credential':
-        return 'La credencial de Google no es válida. Revisa la configuración SHA en Firebase.';
+        return providerName == 'Google'
+            ? 'La credencial de Google no es válida. Revisa la configuración SHA en Firebase.'
+            : 'La credencial de Apple no es válida. Revisa la configuración de Apple en Firebase.';
       default:
         return 'Error de acceso: ${error.message ?? error.code}';
     }
   }
 
-  void _showApplePending() {
-    showSundaySnack(
-      context,
-      'Apple estará disponible cuando configuremos Apple Developer.',
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
+    final isSigningIn = signingIn;
+    final isSigningInWithGoogle = signingInProvider == 'google';
+    final isSigningInWithApple = signingInProvider == 'apple';
+
     return Scaffold(
       backgroundColor: ssBg,
       body: SafeArea(
@@ -3397,10 +10053,10 @@ class _LoginScreenState extends State<LoginScreen> {
                                 horizontal: 12,
                               ),
                             ),
-                            onPressed: signingIn ? null : _signInWithGoogle,
+                            onPressed: isSigningIn ? null : _signInWithGoogle,
                             child: Row(
                               children: [
-                                if (signingIn)
+                                if (isSigningInWithGoogle)
                                   const SizedBox(
                                     width: 20,
                                     height: 20,
@@ -3414,7 +10070,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                 const SizedBox(width: 12),
                                 Expanded(
                                   child: Text(
-                                    signingIn
+                                    isSigningInWithGoogle
                                         ? 'Conectando...'
                                         : 'Continuar con Google',
                                     textAlign: TextAlign.center,
@@ -3448,28 +10104,39 @@ class _LoginScreenState extends State<LoginScreen> {
                                 horizontal: 12,
                               ),
                             ),
-                            onPressed: signingIn ? null : _showApplePending,
-                            child: const Row(
+                            onPressed: isSigningIn ? null : _signInWithApple,
+                            child: Row(
                               children: [
-                                Icon(
-                                  Icons.apple_rounded,
-                                  color: Colors.white,
-                                  size: 22,
-                                ),
-                                SizedBox(width: 12),
+                                if (isSigningInWithApple)
+                                  const SizedBox(
+                                    width: 22,
+                                    height: 22,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                else
+                                  const Icon(
+                                    Icons.apple_rounded,
+                                    color: Colors.white,
+                                    size: 22,
+                                  ),
+                                const SizedBox(width: 12),
                                 Expanded(
                                   child: Text(
-                                    'Continuar con Apple',
+                                    isSigningInWithApple
+                                        ? 'Conectando...'
+                                        : 'Continuar con Apple',
                                     textAlign: TextAlign.center,
-                                    style: TextStyle(
+                                    style: const TextStyle(
                                       fontSize: 15,
                                       fontWeight: FontWeight.w500,
                                       color: Colors.white,
-                                      letterSpacing: 0.2,
                                     ),
                                   ),
                                 ),
-                                SizedBox(width: 20),
+                                const SizedBox(width: 22),
                               ],
                             ),
                           ),
@@ -3543,11 +10210,7 @@ class SundayShell extends StatefulWidget {
   final User user;
   final int initialIndex;
 
-  const SundayShell({
-    super.key,
-    required this.user,
-    this.initialIndex = 0,
-  });
+  const SundayShell({super.key, required this.user, this.initialIndex = 0});
 
   @override
   State<SundayShell> createState() => _SundayShellState();
@@ -3555,6 +10218,9 @@ class SundayShell extends StatefulWidget {
 
 class _SundayShellState extends State<SundayShell> {
   late int selectedIndex;
+  late List<Widget> pages;
+  DateTime? pagesCalendarDay;
+  StreamSubscription<RemoteMessage>? foregroundNotificationSubscription;
   StreamSubscription<RemoteMessage>? notificationOpenSubscription;
   String? lastHandledNotificationKey;
 
@@ -3562,25 +10228,83 @@ class _SundayShellState extends State<SundayShell> {
   void initState() {
     super.initState();
     selectedIndex = widget.initialIndex.clamp(0, 4).toInt();
+    pages = buildPages(widget.user);
+    pagesCalendarDay = inicioDiaLocal(DateTime.now());
     registrarTokenNotificaciones(widget.user);
     setupNotificationNavigation();
+  }
+
+  List<Widget> buildPages(User user) {
+    return [
+      HomeScreen(user: user),
+      MySelfiesScreen(user: user),
+      CameraTabScreen(user: user),
+      MontageScreen(user: user),
+      ProfileScreen(user: user),
+    ];
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    SundayClockScope.watch(context);
+
+    final today = inicioDiaLocal(DateTime.now());
+    if (pagesCalendarDay != today) {
+      pagesCalendarDay = today;
+      pages = buildPages(widget.user);
+    }
   }
 
   @override
   void didUpdateWidget(covariant SundayShell oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.user.uid != widget.user.uid) {
+      pages = buildPages(widget.user);
+      pagesCalendarDay = inicioDiaLocal(DateTime.now());
       registrarTokenNotificaciones(widget.user);
     }
   }
 
   @override
   void dispose() {
+    foregroundNotificationSubscription?.cancel();
     notificationOpenSubscription?.cancel();
+    if (Platform.isAndroid) {
+      foregroundNotificationChannel.setMethodCallHandler(null);
+    }
     super.dispose();
   }
 
   void setupNotificationNavigation() {
+    if (Platform.isAndroid) {
+      foregroundNotificationChannel.setMethodCallHandler((call) async {
+        if (call.method != 'notificationTap') return;
+        final payload = call.arguments;
+        if (payload is String) {
+          handleForegroundNotificationTap(payload);
+        }
+      });
+
+      foregroundNotificationChannel
+          .invokeMethod<String>('getLaunchPayload')
+          .then((payload) {
+            if (!mounted || payload == null || payload.isEmpty) return;
+            handleForegroundNotificationTap(payload);
+          })
+          .catchError((error) {
+            logDebug(
+              'No se pudo leer la notificación foreground inicial: $error',
+            );
+          });
+    }
+
+    foregroundNotificationSubscription = FirebaseMessaging.onMessage.listen((
+      message,
+    ) {
+      unawaited(mostrarNotificacionForegroundAndroid(message));
+    });
+
     FirebaseMessaging.instance.getInitialMessage().then((message) {
       if (!mounted || message == null) return;
       handleNotificationNavigation(message);
@@ -3589,6 +10313,12 @@ class _SundayShellState extends State<SundayShell> {
     notificationOpenSubscription = FirebaseMessaging.onMessageOpenedApp.listen(
       handleNotificationNavigation,
     );
+  }
+
+  void handleForegroundNotificationTap(String payload) {
+    final message = remoteMessageFromForegroundPayload(payload);
+    if (message == null) return;
+    handleNotificationNavigation(message);
   }
 
   String notificationMessageKey(RemoteMessage message) {
@@ -3604,6 +10334,8 @@ class _SundayShellState extends State<SundayShell> {
           data['postUid'],
           data['senderUid'],
           data['reactorUid'],
+          data['requestUid'],
+          data['memberUid'],
         ].join('|');
   }
 
@@ -3621,13 +10353,29 @@ class _SundayShellState extends State<SundayShell> {
     final target = data['target']?.toString();
     final groupId = data['groupId']?.toString();
 
-    debugPrint('Notificación abierta: $data');
+    logDebug('Notificación abierta: type=$type target=$target');
 
     if (target == 'group' &&
-        {'new_selfie', 'friend_reminder', 'reaction'}.contains(type) &&
+        {
+          'new_selfie',
+          'friend_reminder',
+          'reaction',
+          'new_member',
+          'join_request',
+          'join_accepted',
+          'weekly_summary',
+          'chat_message',
+        }.contains(type) &&
         groupId != null &&
         groupId.isNotEmpty) {
-      openGroupFromNotification(groupId);
+      unawaited(
+        openGroupFromNotification(
+          groupId: groupId,
+          type: type,
+          weekKey: data['weekKey']?.toString(),
+          postUid: (data['postUid'] ?? data['authorUid'])?.toString(),
+        ),
+      );
       return;
     }
 
@@ -3637,7 +10385,26 @@ class _SundayShellState extends State<SundayShell> {
     }
   }
 
-  void openGroupFromNotification(String groupId) {
+  Future<void> openGroupFromNotification({
+    required String groupId,
+    String? type,
+    String? weekKey,
+    String? postUid,
+  }) async {
+    final validationMessage = await validateNotificationGroupDestination(
+      groupId: groupId,
+      type: type,
+      weekKey: weekKey,
+      postUid: postUid,
+    );
+
+    if (!mounted) return;
+
+    if (validationMessage != null) {
+      showSundaySnack(context, validationMessage);
+      return;
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
 
@@ -3645,6 +10412,65 @@ class _SundayShellState extends State<SundayShell> {
         context,
       ).push(MaterialPageRoute(builder: (_) => GroupScreen(groupId: groupId)));
     });
+  }
+
+  Future<String?> validateNotificationGroupDestination({
+    required String groupId,
+    String? type,
+    String? weekKey,
+    String? postUid,
+  }) async {
+    final cleanGroupId = groupId.trim();
+    if (cleanGroupId.isEmpty) return 'La notificación ya no está disponible';
+
+    final firestore = FirebaseFirestore.instance;
+    final groupRef = firestore.collection('groups').doc(cleanGroupId);
+
+    try {
+      final groupDoc = await groupRef.get();
+      final groupData = groupDoc.data();
+
+      if (!groupDoc.exists || groupData?['deleted'] == true) {
+        return 'Este grupo ya no está disponible';
+      }
+
+      final memberDoc = await groupRef
+          .collection('members')
+          .doc(widget.user.uid)
+          .get();
+
+      if (!memberDoc.exists) {
+        return 'Ya no perteneces a este grupo';
+      }
+
+      if ((type == 'new_selfie' || type == 'reaction') &&
+          weekKey != null &&
+          weekKey.trim().isNotEmpty &&
+          postUid != null &&
+          postUid.trim().isNotEmpty) {
+        final postDoc = await groupRef
+            .collection('weeks')
+            .doc(weekKey.trim())
+            .collection('posts')
+            .doc(postUid.trim())
+            .get();
+
+        if (!postDoc.exists) {
+          return 'Ese selfie ya no está disponible';
+        }
+      }
+    } on FirebaseException catch (error) {
+      if (error.code == 'permission-denied') {
+        return 'Ya no tienes acceso a este contenido';
+      }
+      logDebug('No se pudo validar la notificación: $error');
+      return 'No se pudo abrir la notificación';
+    } catch (error) {
+      logDebug('No se pudo validar la notificación: $error');
+      return 'No se pudo abrir la notificación';
+    }
+
+    return null;
   }
 
   void openHomeFromNotification() {
@@ -3659,20 +10485,9 @@ class _SundayShellState extends State<SundayShell> {
 
   @override
   Widget build(BuildContext context) {
-    final pages = [
-      HomeScreen(user: widget.user),
-      MySelfiesScreen(user: widget.user),
-      CameraTabScreen(user: widget.user),
-      MontageScreen(user: widget.user),
-      ProfileScreen(user: widget.user),
-    ];
-
     return Scaffold(
       backgroundColor: ssBg,
-      body: IndexedStack(
-        index: selectedIndex,
-        children: pages,
-      ),
+      body: IndexedStack(index: selectedIndex, children: pages),
       bottomNavigationBar: SundayTabBar(
         selectedIndex: selectedIndex,
         onSelected: (index) => setState(() => selectedIndex = index),
@@ -3717,26 +10532,34 @@ class SundayTabBar extends StatelessWidget {
                 children: List.generate(items.length, (index) {
                   final active = selectedIndex == index;
                   return Expanded(
-                    child: InkWell(
-                      onTap: () => onSelected(index),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            items[index].$1,
-                            size: 22,
-                            color: active ? ssOrange : ssText3,
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            items[index].$2,
-                            style: TextStyle(
-                              fontSize: 9,
-                              fontWeight: FontWeight.w500,
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        splashFactory: NoSplash.splashFactory,
+                        splashColor: Colors.transparent,
+                        highlightColor: Colors.transparent,
+                        hoverColor: Colors.transparent,
+                        focusColor: Colors.transparent,
+                        onTap: () => onSelected(index),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              items[index].$1,
+                              size: 22,
                               color: active ? ssOrange : ssText3,
                             ),
-                          ),
-                        ],
+                            const SizedBox(height: 2),
+                            Text(
+                              items[index].$2,
+                              style: TextStyle(
+                                fontSize: 9,
+                                fontWeight: FontWeight.w500,
+                                color: active ? ssOrange : ssText3,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   );
@@ -3764,6 +10587,29 @@ class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController codeController = TextEditingController();
   bool creating = false;
   bool joining = false;
+  late Stream<QuerySnapshot<Map<String, dynamic>>> userGroupsStream;
+
+  @override
+  void initState() {
+    super.initState();
+    userGroupsStream = FirebaseFirestore.instance
+        .collection('users')
+        .doc(widget.user.uid)
+        .collection('groups')
+        .snapshots();
+  }
+
+  @override
+  void didUpdateWidget(covariant HomeScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.user.uid != widget.user.uid) {
+      userGroupsStream = FirebaseFirestore.instance
+          .collection('users')
+          .doc(widget.user.uid)
+          .collection('groups')
+          .snapshots();
+    }
+  }
 
   @override
   void dispose() {
@@ -3802,15 +10648,6 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                 ),
                 const SizedBox(height: 22),
-                const Text(
-                  '¿Qué quieres hacer?',
-                  style: TextStyle(
-                    fontSize: 19,
-                    fontWeight: FontWeight.w900,
-                    color: ssText,
-                  ),
-                ),
-                const SizedBox(height: 20),
                 SundayActionCard(
                   icon: Icons.add_rounded,
                   title: 'Crear un grupo nuevo',
@@ -3829,7 +10666,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 const SizedBox(height: 12),
                 SundayActionCard(
                   icon: Icons.link_rounded,
-                  title: 'Unirme con enlace',
+                  title: 'Unirme con código',
                   subtitle:
                       'Introduce el código que te ha pasado un administrador.',
                   onTap: () {
@@ -3853,204 +10690,298 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final userRef = FirebaseFirestore.instance
-        .collection('users')
-        .doc(widget.user.uid);
-    final userGroupsRef = userRef.collection('groups');
+    return Scaffold(
+      backgroundColor: ssBg,
+      body: SafeArea(
+        child: Column(
+          children: [
+            const AppHeader(),
+            Expanded(
+              child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                stream: userGroupsStream,
+                builder: (context, groupsSnapshot) {
+                  if (groupsSnapshot.connectionState ==
+                      ConnectionState.waiting) {
+                    return const Center(
+                      child: CircularProgressIndicator(color: ssOrange),
+                    );
+                  }
 
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: userRef.snapshots(),
-      builder: (context, _) {
-        return Scaffold(
-          backgroundColor: ssBg,
-          body: SafeArea(
-            child: Column(
-              children: [
-                const AppHeader(),
-                Expanded(
-                  child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                    stream: userGroupsRef.snapshots(),
-                    builder: (context, groupsSnapshot) {
-                      if (groupsSnapshot.connectionState ==
-                          ConnectionState.waiting) {
-                        return const Center(
-                          child: CircularProgressIndicator(color: ssOrange),
-                        );
-                      }
+                  if (groupsSnapshot.hasError) {
+                    return Center(
+                      child: Text(
+                        'Error cargando grupos: ${groupsSnapshot.error}',
+                      ),
+                    );
+                  }
 
-                      if (groupsSnapshot.hasError) {
-                        return Center(
-                          child: Text(
-                            'Error cargando grupos: ${groupsSnapshot.error}',
-                          ),
-                        );
-                      }
+                  final groupDocs = [...(groupsSnapshot.data?.docs ?? [])]
+                    ..sort((a, b) {
+                      final aData = a.data();
+                      final bData = b.data();
+                      final aValue = comparableTimestampMillis(
+                        aData['lastActivityAt'] ?? aData['joinedAt'],
+                      );
+                      final bValue = comparableTimestampMillis(
+                        bData['lastActivityAt'] ?? bData['joinedAt'],
+                      );
+                      return bValue.compareTo(aValue);
+                    });
 
-                      final groupDocs = [
-                        ...(groupsSnapshot.data?.docs ?? []),
-                      ]..sort((a, b) {
-                          final aData = a.data();
-                          final bData = b.data();
-                          final aValue = comparableTimestampMillis(
-                            aData['lastActivityAt'] ?? aData['joinedAt'],
-                          );
-                          final bValue = comparableTimestampMillis(
-                            bData['lastActivityAt'] ?? bData['joinedAt'],
-                          );
-                          return bValue.compareTo(aValue);
-                        });
+                  return ListView(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 18),
+                    children: [
+                      const SundayBanner(),
+                      const SizedBox(height: 21),
+                      LayoutBuilder(
+                        builder: (context, constraints) {
+                          final compact = constraints.maxWidth < 350;
 
-                      return ListView(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 18),
-                        children: [
-                          const SundayBanner(),
-                          const SizedBox(height: 21),
-                          LayoutBuilder(
-                            builder: (context, constraints) {
-                              final compact = constraints.maxWidth < 350;
-
-                              return Row(
-                                crossAxisAlignment: CrossAxisAlignment.center,
-                                children: [
-                                  Expanded(
-                                    child: Text(
-                                      'Mis grupos',
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                        color: ssTitle,
-                                        fontSize: compact ? 20 : 22,
-                                        fontWeight: FontWeight.w800,
-                                        height: 1,
-                                      ),
-                                    ),
+                          return Row(
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  'Mis grupos',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: ssTitle,
+                                    fontSize: compact ? 20 : 22,
+                                    fontWeight: FontWeight.w800,
+                                    height: 1,
                                   ),
-                                  const SizedBox(width: 8),
-                                  SmallPillButton(
-                                    text: '+ Nuevo grupo',
-                                    onTap: _showCreateJoinSheet,
-                                  ),
-                                ],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              SmallPillButton(
+                                text: '+ Nuevo grupo',
+                                onTap: _showCreateJoinSheet,
+                              ),
+                            ],
+                          );
+                        },
+                      ),
+                      const SizedBox(height: 16),
+                      if (groupDocs.isEmpty) ...[
+                        EmptyGroupsCard(onTap: _showCreateJoinSheet),
+                        const SizedBox(height: 8),
+                        InviteHintCard(onTap: _showCreateJoinSheet),
+                      ] else ...[
+                        ...groupDocs.map(
+                          (doc) => RealGroupCard(
+                            key: ValueKey('home_group_${doc.id}'),
+                            userGroupDoc: doc,
+                            currentUid: widget.user.uid,
+                            onTap: () {
+                              final data = doc.data();
+                              final groupId = (data['groupId'] ?? doc.id)
+                                  .toString();
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => GroupScreen(groupId: groupId),
+                                ),
                               );
                             },
                           ),
-                          const SizedBox(height: 16),
-                          if (groupDocs.isEmpty) ...[
-                            EmptyGroupsCard(
-                              onTap: _showCreateJoinSheet,
-                            ),
-                            const SizedBox(height: 8),
-                            InviteHintCard(
-                              onTap: _showCreateJoinSheet,
-                            ),
-                          ] else ...[
-                            ...groupDocs.map(
-                              (doc) => RealGroupCard(
-                                userGroupDoc: doc,
-                                onTap: () {
-                                  final data = doc.data();
-                                  final groupId = (data['groupId'] ?? doc.id).toString();
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) =>
-                                          GroupScreen(groupId: groupId),
-                                    ),
-                                  );
-                                },
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            InviteHintCard(
-                              onTap: _showCreateJoinSheet,
-                            ),
-                          ],
-                        ],
-                      );
-                    },
-                  ),
-                ),
-              ],
+                        ),
+                        const SizedBox(height: 2),
+                        InviteHintCard(onTap: _showCreateJoinSheet),
+                      ],
+                    ],
+                  );
+                },
+              ),
             ),
-          ),
-        );
-      },
+          ],
+        ),
+      ),
     );
   }
 }
 
-class RealGroupCard extends StatelessWidget {
+class RealGroupCard extends StatefulWidget {
   final QueryDocumentSnapshot<Map<String, dynamic>> userGroupDoc;
+  final String currentUid;
   final VoidCallback onTap;
 
   const RealGroupCard({
     super.key,
     required this.userGroupDoc,
+    required this.currentUid,
     required this.onTap,
   });
 
   @override
-  Widget build(BuildContext context) {
-    final data = userGroupDoc.data();
-    final groupId = (data['groupId'] ?? userGroupDoc.id).toString();
-    final snapshotName = data['displayNameSnapshot'] ?? 'Grupo';
-    final weekKey = obtenerWeekKeyActual();
-    final currentUid = FirebaseAuth.instance.currentUser?.uid;
+  State<RealGroupCard> createState() => _RealGroupCardState();
+}
 
+class _RealGroupCardState extends State<RealGroupCard> {
+  late String groupId;
+  late Stream<DocumentSnapshot<Map<String, dynamic>>> groupStream;
+  late Stream<QuerySnapshot<Map<String, dynamic>>> postsStream;
+  String? postsStreamWeekKey;
+
+  @override
+  void initState() {
+    super.initState();
+    configureStreams();
+  }
+
+  @override
+  void didUpdateWidget(covariant RealGroupCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final oldData = oldWidget.userGroupDoc.data();
+    final newData = widget.userGroupDoc.data();
+    final oldGroupId = (oldData['groupId'] ?? oldWidget.userGroupDoc.id)
+        .toString();
+    final newGroupId = (newData['groupId'] ?? widget.userGroupDoc.id)
+        .toString();
+
+    if (oldGroupId != newGroupId ||
+        postsStreamWeekKey != obtenerWeekKeyVisibleMasReciente()) {
+      configureStreams();
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    SundayClockScope.watch(context);
+
+    if (postsStreamWeekKey != obtenerWeekKeyVisibleMasReciente()) {
+      configureStreams();
+    }
+  }
+
+  void configureStreams() {
+    final data = widget.userGroupDoc.data();
+    groupId = (data['groupId'] ?? widget.userGroupDoc.id).toString();
+    final weekKey = obtenerWeekKeyVisibleMasReciente();
+    postsStreamWeekKey = weekKey;
     final groupRef = FirebaseFirestore.instance
         .collection('groups')
         .doc(groupId);
-    final postsRef = groupRef
+    groupStream = groupRef.snapshots();
+    postsStream = groupRef
         .collection('weeks')
         .doc(weekKey)
-        .collection('posts');
+        .collection('posts')
+        .snapshots();
+  }
+
+  DateTime? _storedWeekTimestamp({
+    required Map<String, dynamic> data,
+    required String collectionKey,
+    required String weekKey,
+    required String field,
+  }) {
+    final collection = data[collectionKey];
+    if (collection is! Map) return null;
+
+    final weekState = collection[weekKey];
+    if (weekState is! Map) return null;
+
+    return timestampToDate(weekState[field]);
+  }
+
+  int _newSelfiesCount({
+    required List<QueryDocumentSnapshot<Map<String, dynamic>>> posts,
+    required DateTime? lastViewedAt,
+  }) {
+    if (posts.isEmpty) return 0;
+
+    var count = 0;
+    for (final post in posts) {
+      if (post.id == widget.currentUid) continue;
+      if (lastViewedAt == null) {
+        count += 1;
+        continue;
+      }
+
+      final data = post.data();
+      final postedAt =
+          timestampToDate(data['updatedAt']) ??
+          timestampToDate(data['createdAt']);
+      if (postedAt != null && postedAt.isAfter(lastViewedAt)) {
+        count += 1;
+      }
+    }
+
+    return count;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final data = widget.userGroupDoc.data();
+    final snapshotName = data['displayNameSnapshot'] ?? 'Grupo';
 
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: groupRef.snapshots(),
+      stream: groupStream,
       builder: (context, groupSnapshot) {
         final groupData = groupSnapshot.data?.data();
         final name = groupData?['name'] ?? snapshotName;
-        final memberCountRaw = groupData?['memberCount'] ?? 0;
-        final memberCount = memberCountRaw is int
-            ? memberCountRaw
-            : int.tryParse('$memberCountRaw') ?? 0;
+        final memberCount = intFromValue(groupData?['memberCount']);
         final deleted = groupData?['deleted'] == true;
-        final activeWeeks = semanasActivasDesdeCreatedAt(
-          groupData?['createdAt'],
-        );
 
         if (deleted) return const SizedBox.shrink();
 
         return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-          stream: postsRef.snapshots(),
+          stream: postsStream,
           builder: (context, postsSnapshot) {
             final postDocs = postsSnapshot.data?.docs ?? [];
+            for (final postDoc in postDocs) {
+              prefetchPostPhotoCache(postDoc.data());
+            }
             final postedCount = postDocs.length;
+            final memberCountLabel = formatMemberCount(memberCount);
+            final activeWeeks = semanasActivasDesdeCreatedAt(
+              groupData?['createdAt'],
+            );
+            final activityLabel = esDomingo()
+                ? '$postedCount/$memberCount han publicado'
+                : formatActiveWeeksLabel(activeWeeks);
+
+            final weekKey =
+                postsStreamWeekKey ?? obtenerWeekKeyVisibleMasReciente();
+            final lastViewedAt =
+                _storedWeekTimestamp(
+                  data: data,
+                  collectionKey: 'groupViews',
+                  weekKey: weekKey,
+                  field: 'lastViewedAt',
+                ) ??
+                timestampToDate(data['joinedAt']);
+            final pendingCount = _newSelfiesCount(
+              posts: postDocs,
+              lastViewedAt: lastViewedAt,
+            );
 
             return SundayCard(
-              onTap: onTap,
+              onTap: widget.onTap,
               margin: const EdgeInsets.only(bottom: 12),
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
+              child: Stack(
+                clipBehavior: Clip.none,
                 children: [
-                  GroupIcon(
-                    name: name.toString(),
-                    photoUrl: groupData?['photoUrl'] as String?,
-                    emoji: groupData?['emoji'] as String?,
-                    colorValue: groupData?['colorValue'],
-                  ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
+                  Padding(
+                    padding: const EdgeInsets.only(right: 44),
+                    child: Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Row(
-                          crossAxisAlignment: CrossAxisAlignment.baseline,
-                          textBaseline: TextBaseline.alphabetic,
-                          children: [
-                            Expanded(
-                              child: Text(
+                        GroupIcon(
+                          name: name.toString(),
+                          photoUrl: groupData?['photoUrl'] as String?,
+                          emoji: groupData?['emoji'] as String?,
+                          colorValue: groupData?['colorValue'],
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
                                 formatGroupDisplayName(name),
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
@@ -4061,48 +10992,51 @@ class RealGroupCard extends StatelessWidget {
                                   height: 1.35,
                                 ),
                               ),
-                            ),
-                            Text(
-                              '$activeWeeks sem. activo',
-                              style: const TextStyle(
-                                color: ssText3,
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
+                              const SizedBox(height: 2),
+                              LayoutBuilder(
+                                builder: (context, constraints) {
+                                  return SizedBox(
+                                    width: constraints.maxWidth,
+                                    child: FittedBox(
+                                      fit: BoxFit.scaleDown,
+                                      alignment: Alignment.centerLeft,
+                                      child: Text(
+                                        '$memberCountLabel · $activityLabel',
+                                        maxLines: 1,
+                                        softWrap: false,
+                                        style: const TextStyle(
+                                          color: ssText2,
+                                          fontSize: 12.8,
+                                          fontWeight: FontWeight.w600,
+                                          height: 1.35,
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
                               ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          '$memberCount miembros · $postedCount/$memberCount han publicado',
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: ssText2,
-                            fontSize: 12.8,
-                            fontWeight: FontWeight.w600,
-                            height: 1.35,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: GroupMembersAvatarStrip(
+                              const SizedBox(height: 8),
+                              GroupMembersAvatarStrip(
                                 groupId: groupId,
                                 memberCount: memberCount,
                               ),
-                            ),
-                            const SizedBox(width: 8),
-                            if (currentUid != null)
-                              GroupStreakMedal(
-                                groupId: groupId,
-                                uid: currentUid,
-                              ),
-                          ],
+                            ],
+                          ),
                         ),
                       ],
                     ),
+                  ),
+                  Positioned(
+                    right: -6,
+                    top: -8,
+                    child: GroupCardNotificationBadge(
+                      pendingCount: pendingCount,
+                    ),
+                  ),
+                  Positioned(
+                    right: -6,
+                    bottom: -6,
+                    child: GroupStreakMedal(groupId: groupId),
                   ),
                 ],
               ),
@@ -4110,6 +11044,46 @@ class RealGroupCard extends StatelessWidget {
           },
         );
       },
+    );
+  }
+}
+
+class GroupCardNotificationBadge extends StatelessWidget {
+  final int pendingCount;
+
+  const GroupCardNotificationBadge({super.key, required this.pendingCount});
+
+  @override
+  Widget build(BuildContext context) {
+    final hasPending = pendingCount > 0;
+
+    if (!hasPending) return const SizedBox.shrink();
+
+    return Container(
+      constraints: const BoxConstraints(minWidth: 20, minHeight: 20),
+      padding: const EdgeInsets.symmetric(horizontal: 5),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: ssOrange,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: ssBg, width: 2),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.075),
+            blurRadius: 9,
+            offset: const Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Text(
+        pendingCount > 9 ? '9+' : '$pendingCount',
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 10,
+          fontWeight: FontWeight.w900,
+          height: 1,
+        ),
+      ),
     );
   }
 }
@@ -4163,6 +11137,7 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
     final emoji = await showModalBottomSheet<String>(
       context: context,
       backgroundColor: Colors.transparent,
+      isScrollControlled: true,
       builder: (_) => GroupEmojiPickerSheet(selectedEmoji: selectedGroupEmoji),
     );
 
@@ -4264,24 +11239,26 @@ class _CreateGroupScreenState extends State<CreateGroupScreen> {
                       textInputAction: TextInputAction.done,
                       onSubmitted: (_) => _createGroup(),
                     ),
-                    const SizedBox(height: 24),
-                    const GroupCreationSectionLabel('COLOR'),
-                    const SizedBox(height: 12),
-                    Wrap(
-                      spacing: 18,
-                      runSpacing: 16,
-                      children: kGroupColorOptions.map((color) {
-                        final selected =
-                            selectedGroupColorValue == color.toARGB32();
-                        return GroupColorDot(
-                          color: color,
-                          selected: selected,
-                          onTap: () => setState(
-                            () => selectedGroupColorValue = color.toARGB32(),
-                          ),
-                        );
-                      }).toList(),
-                    ),
+                    if (selectedGroupPhoto == null) ...[
+                      const SizedBox(height: 24),
+                      const GroupCreationSectionLabel('COLOR'),
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 18,
+                        runSpacing: 16,
+                        children: kGroupColorOptions.map((color) {
+                          final selected =
+                              selectedGroupColorValue == color.toARGB32();
+                          return GroupColorDot(
+                            color: color,
+                            selected: selected,
+                            onTap: () => setState(
+                              () => selectedGroupColorValue = color.toARGB32(),
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ],
                     const SizedBox(height: 28),
                     const TimezoneInfoCard(),
                   ],
@@ -4358,10 +11335,18 @@ class CreateGroupAvatarPicker extends StatelessWidget {
             width: 106,
             height: 106,
             decoration: BoxDecoration(
-              color: hasPhoto ? Colors.white : color.withValues(alpha: 0.16),
+              color: hasPhoto ? null : color.withValues(alpha: 0.16),
               borderRadius: BorderRadius.circular(28),
-              border: Border.all(color: ssOrangeMid, width: 1.8),
+              border: hasPhoto
+                  ? null
+                  : Border.all(color: ssOrangeMid, width: 1.8),
             ),
+            foregroundDecoration: hasPhoto
+                ? BoxDecoration(
+                    borderRadius: BorderRadius.circular(28),
+                    border: Border.all(color: ssOrangeMid, width: 1.8),
+                  )
+                : null,
             clipBehavior: Clip.antiAlias,
             alignment: Alignment.center,
             child: hasPhoto
@@ -4370,7 +11355,12 @@ class CreateGroupAvatarPicker extends StatelessWidget {
                     width: 106,
                     height: 106,
                     fit: BoxFit.cover,
+                    alignment: Alignment.center,
                     filterQuality: FilterQuality.high,
+                    errorBuilder: (_, _, _) => Text(
+                      resolvedEmoji,
+                      style: const TextStyle(fontSize: 34, height: 1),
+                    ),
                   )
                 : Text(
                     resolvedEmoji,
@@ -4435,7 +11425,11 @@ class CreateGroupSourceButton extends StatelessWidget {
               if (emoji != null)
                 Text(emoji!, style: const TextStyle(fontSize: 18))
               else
-                Icon(icon ?? Icons.image_outlined, color: ssOrangeDark, size: 20),
+                Icon(
+                  icon ?? Icons.image_outlined,
+                  color: ssOrangeDark,
+                  size: 20,
+                ),
               const SizedBox(width: 10),
               Text(
                 label,
@@ -4492,23 +11486,53 @@ class GroupColorDot extends StatelessWidget {
   }
 }
 
-class GroupEmojiPickerSheet extends StatelessWidget {
+class GroupEmojiPickerSheet extends StatefulWidget {
   final String? selectedEmoji;
 
   const GroupEmojiPickerSheet({super.key, this.selectedEmoji});
 
   @override
+  State<GroupEmojiPickerSheet> createState() => _GroupEmojiPickerSheetState();
+}
+
+class _GroupEmojiPickerSheetState extends State<GroupEmojiPickerSheet> {
+  late int selectedSectionIndex;
+
+  @override
+  void initState() {
+    super.initState();
+    selectedSectionIndex = _sectionIndexForEmoji(widget.selectedEmoji);
+  }
+
+  int _sectionIndexForEmoji(String? emoji) {
+    final cleanEmoji = normalizarEmojiReaccion(emoji ?? '');
+    if (cleanEmoji.isEmpty) return 0;
+
+    for (var index = 0; index < kGroupEmojiSections.length; index++) {
+      if (kGroupEmojiSections[index].emojis.contains(cleanEmoji)) {
+        return index;
+      }
+    }
+
+    return 0;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final height = math.min(MediaQuery.sizeOf(context).height * 0.76, 640.0);
+    final section = kGroupEmojiSections[selectedSectionIndex];
+    final selectedEmoji = normalizarEmojiReaccion(widget.selectedEmoji ?? '');
+
     return SafeArea(
       top: false,
       child: Container(
+        height: height,
         padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
         decoration: const BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
         ),
         child: Column(
-          mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Center(
@@ -4531,28 +11555,100 @@ class GroupEmojiPickerSheet extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 16),
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: kGroupEmojiOptions.map((emoji) {
-                final selected = emoji == selectedEmoji;
-                return GestureDetector(
-                  onTap: () => Navigator.pop(context, emoji),
-                  child: Container(
-                    width: 46,
-                    height: 46,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      color: selected ? ssOrangeLight : ssBg,
-                      borderRadius: BorderRadius.circular(14),
-                      border: Border.all(
-                        color: selected ? ssOrangeMid : ssBorder,
+            SizedBox(
+              height: 46,
+              child: ListView.separated(
+                physics: const BouncingScrollPhysics(),
+                scrollDirection: Axis.horizontal,
+                itemCount: kGroupEmojiSections.length,
+                separatorBuilder: (_, _) => const SizedBox(width: 8),
+                itemBuilder: (context, index) {
+                  final option = kGroupEmojiSections[index];
+                  final selected = index == selectedSectionIndex;
+
+                  return Tooltip(
+                    message: option.label,
+                    child: InkWell(
+                      onTap: () => setState(() {
+                        selectedSectionIndex = index;
+                      }),
+                      borderRadius: BorderRadius.circular(15),
+                      child: Container(
+                        width: 44,
+                        height: 44,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: selected ? ssOrangeLight : ssBg,
+                          borderRadius: BorderRadius.circular(15),
+                          border: Border.all(
+                            color: selected ? ssOrange : ssBorder,
+                            width: selected ? 1.6 : 1,
+                          ),
+                        ),
+                        child: Text(
+                          option.icon,
+                          style: const TextStyle(fontSize: 22, height: 1),
+                        ),
                       ),
                     ),
-                    child: Text(emoji, style: const TextStyle(fontSize: 24)),
-                  ),
-                );
-              }).toList(),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              section.label,
+              style: const TextStyle(
+                color: ssText2,
+                fontSize: 13,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final crossAxisCount = math.max(
+                    6,
+                    math.min(9, (constraints.maxWidth / 46).floor()),
+                  );
+
+                  return GridView.builder(
+                    key: ValueKey(section.label),
+                    physics: const BouncingScrollPhysics(),
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: crossAxisCount,
+                      mainAxisSpacing: 8,
+                      crossAxisSpacing: 8,
+                    ),
+                    itemCount: section.emojis.length,
+                    itemBuilder: (context, index) {
+                      final emoji = section.emojis[index];
+                      final selected = emoji == selectedEmoji;
+
+                      return InkWell(
+                        onTap: () => Navigator.pop(context, emoji),
+                        borderRadius: BorderRadius.circular(14),
+                        child: Container(
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: selected ? ssOrangeLight : ssBg,
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(
+                              color: selected ? ssOrange : ssBorder,
+                              width: selected ? 1.6 : 1,
+                            ),
+                          ),
+                          child: Text(
+                            emoji,
+                            style: const TextStyle(fontSize: 24, height: 1),
+                          ),
+                        ),
+                      );
+                    },
+                  );
+                },
+              ),
             ),
           ],
         ),
@@ -4649,6 +11745,7 @@ class InviteInfoCard extends StatelessWidget {
     );
   }
 }
+
 class GroupInviteReadyIcon extends StatelessWidget {
   final String groupId;
   final String groupName;
@@ -4662,7 +11759,10 @@ class GroupInviteReadyIcon extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: FirebaseFirestore.instance.collection('groups').doc(groupId).snapshots(),
+      stream: FirebaseFirestore.instance
+          .collection('groups')
+          .doc(groupId)
+          .snapshots(),
       builder: (context, snapshot) {
         final data = snapshot.data?.data();
         return GroupIcon(
@@ -4676,7 +11776,6 @@ class GroupInviteReadyIcon extends StatelessWidget {
     );
   }
 }
-
 
 class GroupInviteReadyScreen extends StatelessWidget {
   final String groupId;
@@ -4700,7 +11799,9 @@ class GroupInviteReadyScreen extends StatelessWidget {
             AppHeader(
               onBack: () => Navigator.pushReplacement(
                 context,
-                MaterialPageRoute(builder: (_) => GroupScreen(groupId: groupId)),
+                MaterialPageRoute(
+                  builder: (_) => GroupScreen(groupId: groupId),
+                ),
               ),
             ),
             Expanded(
@@ -4709,7 +11810,12 @@ class GroupInviteReadyScreen extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Center(child: GroupInviteReadyIcon(groupId: groupId, groupName: groupName)),
+                    Center(
+                      child: GroupInviteReadyIcon(
+                        groupId: groupId,
+                        groupName: groupName,
+                      ),
+                    ),
                     const SizedBox(height: 18),
                     Text(
                       groupName,
@@ -4751,7 +11857,9 @@ class GroupInviteReadyScreen extends StatelessWidget {
                 text: 'Entrar al grupo',
                 onPressed: () => Navigator.pushReplacement(
                   context,
-                  MaterialPageRoute(builder: (_) => GroupScreen(groupId: groupId)),
+                  MaterialPageRoute(
+                    builder: (_) => GroupScreen(groupId: groupId),
+                  ),
                 ),
               ),
             ),
@@ -4836,8 +11944,13 @@ class InviteCodePreviewCard extends StatelessWidget {
 
 class JoinGroupScreen extends StatefulWidget {
   final User user;
+  final String? initialInviteInput;
 
-  const JoinGroupScreen({super.key, required this.user});
+  const JoinGroupScreen({
+    super.key,
+    required this.user,
+    this.initialInviteInput,
+  });
 
   @override
   State<JoinGroupScreen> createState() => _JoinGroupScreenState();
@@ -4846,6 +11959,15 @@ class JoinGroupScreen extends StatefulWidget {
 class _JoinGroupScreenState extends State<JoinGroupScreen> {
   final TextEditingController codeController = TextEditingController();
   bool joining = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final initialInviteInput = widget.initialInviteInput?.trim();
+    if (initialInviteInput != null && initialInviteInput.isNotEmpty) {
+      codeController.text = initialInviteInput;
+    }
+  }
 
   @override
   void dispose() {
@@ -4879,11 +12001,7 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
     setState(() => joining = true);
 
     try {
-      await solicitarEntradaAGrupo(
-        user: widget.user,
-        groupId: groupId,
-        inviteInput: input,
-      );
+      await solicitarEntradaAGrupo(groupId: groupId, inviteInput: input);
 
       if (!mounted) return;
       Navigator.pushReplacement(
@@ -4902,6 +12020,9 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final openedFromInviteLink =
+        widget.initialInviteInput?.trim().isNotEmpty == true;
+
     return Scaffold(
       backgroundColor: ssBg,
       body: SafeArea(
@@ -4914,8 +12035,10 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    const Text(
-                      'Unirme a un grupo',
+                    Text(
+                      openedFromInviteLink
+                          ? 'Solicitud de acceso'
+                          : 'Unirme a un grupo',
                       style: TextStyle(
                         color: ssTitle,
                         fontSize: 28,
@@ -4924,8 +12047,10 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                       ),
                     ),
                     const SizedBox(height: 8),
-                    const Text(
-                      'Pega el enlace o escribe el código de invitación que te hayan enviado.',
+                    Text(
+                      openedFromInviteLink
+                          ? 'Revisa el grupo antes de enviar tu solicitud.'
+                          : 'Pega el enlace o escribe el código de invitación que te hayan enviado.',
                       style: TextStyle(
                         color: ssText2,
                         fontSize: 14,
@@ -4933,39 +12058,44 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                         fontWeight: FontWeight.w500,
                       ),
                     ),
-                    const SizedBox(height: 28),
-                    const Text(
-                      'INVITACIÓN',
-                      style: TextStyle(
-                        color: ssText3,
-                        fontSize: 12,
-                        letterSpacing: 1.2,
-                        fontWeight: FontWeight.w800,
+                    if (!openedFromInviteLink) ...[
+                      const SizedBox(height: 28),
+                      const Text(
+                        'INVITACIÓN',
+                        style: TextStyle(
+                          color: ssText3,
+                          fontSize: 12,
+                          letterSpacing: 1.2,
+                          fontWeight: FontWeight.w800,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 8),
-                    SundayTextField(
-                      controller: codeController,
-                      hintText: 'sundayselfie.app/j/...',
-                      textInputAction: TextInputAction.done,
-                      onSubmitted: (_) => _joinGroup(),
-                    ),
-                    const SizedBox(height: 10),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: TextButton.icon(
-                        onPressed: _pasteFromClipboard,
-                        icon: const Icon(Icons.content_paste_rounded, size: 18),
-                        label: const Text('Pegar desde portapapeles'),
-                        style: TextButton.styleFrom(
-                          foregroundColor: ssOrange,
-                          textStyle: const TextStyle(
-                            fontWeight: FontWeight.w800,
+                      const SizedBox(height: 8),
+                      SundayTextField(
+                        controller: codeController,
+                        hintText: 'sundayselfie.app/j/...',
+                        textInputAction: TextInputAction.done,
+                        onSubmitted: (_) => _joinGroup(),
+                      ),
+                      const SizedBox(height: 10),
+                      Align(
+                        alignment: Alignment.centerLeft,
+                        child: TextButton.icon(
+                          onPressed: _pasteFromClipboard,
+                          icon: const Icon(
+                            Icons.content_paste_rounded,
+                            size: 18,
+                          ),
+                          label: const Text('Pegar desde portapapeles'),
+                          style: TextButton.styleFrom(
+                            foregroundColor: ssOrange,
+                            textStyle: const TextStyle(
+                              fontWeight: FontWeight.w800,
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                    const SizedBox(height: 18),
+                    ],
+                    SizedBox(height: openedFromInviteLink ? 28 : 18),
                     AnimatedBuilder(
                       animation: codeController,
                       builder: (context, _) {
@@ -4978,11 +12108,13 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                         return FutureBuilder<String?>(
                           future: resolverGroupIdDesdeInvitacion(input),
                           builder: (context, snapshot) {
-                            if (snapshot.connectionState == ConnectionState.waiting) {
+                            if (snapshot.connectionState ==
+                                ConnectionState.waiting) {
                               return const JoinPreviewMessageCard(
                                 icon: Icons.search_rounded,
                                 title: 'Comprobando invitación',
-                                message: 'Estamos buscando el grupo asociado a este código.',
+                                message:
+                                    'Estamos buscando el grupo asociado a este código.',
                               );
                             }
 
@@ -5008,10 +12140,13 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
               child: AnimatedBuilder(
                 animation: codeController,
                 builder: (context, _) {
-                  final valid =
-                      normalizarEntradaInvitacion(codeController.text).isNotEmpty;
+                  final valid = normalizarEntradaInvitacion(
+                    codeController.text,
+                  ).isNotEmpty;
                   return SundayButton(
-                    text: joining ? 'Enviando solicitud...' : 'Enviar solicitud',
+                    text: joining
+                        ? 'Enviando solicitud...'
+                        : 'Enviar solicitud de acceso',
                     onPressed: joining || !valid ? null : _joinGroup,
                   );
                 },
@@ -5079,7 +12214,11 @@ class InvalidInviteCard extends StatelessWidget {
           CircleAvatar(
             radius: 20,
             backgroundColor: Color(0xFFFFE5D6),
-            child: Icon(Icons.error_outline_rounded, color: ssOrangeDark, size: 20),
+            child: Icon(
+              Icons.error_outline_rounded,
+              color: ssOrangeDark,
+              size: 20,
+            ),
           ),
           SizedBox(width: 12),
           Expanded(
@@ -5111,7 +12250,9 @@ class JoinGroupPreviewCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final groupRef = FirebaseFirestore.instance.collection('groups').doc(groupId);
+    final groupRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId);
 
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
       stream: groupRef.snapshots(),
@@ -5129,7 +12270,8 @@ class JoinGroupPreviewCard extends StatelessWidget {
           return JoinPreviewMessageCard(
             icon: Icons.visibility_off_outlined,
             title: 'Invitación detectada',
-            message: 'No se puede previsualizar el grupo, pero puedes enviar la solicitud.',
+            message:
+                'No se puede previsualizar el grupo, pero puedes enviar la solicitud.',
           );
         }
 
@@ -5162,7 +12304,10 @@ class JoinGroupPreviewCard extends StatelessWidget {
             final isMember = memberSnapshot.data?.exists ?? false;
 
             return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-              stream: groupRef.collection('joinRequests').doc(currentUid).snapshots(),
+              stream: groupRef
+                  .collection('joinRequests')
+                  .doc(currentUid)
+                  .snapshots(),
               builder: (context, requestSnapshot) {
                 final hasRequest = requestSnapshot.data?.exists ?? false;
 
@@ -5205,7 +12350,7 @@ class JoinGroupPreviewCard extends StatelessWidget {
                             ),
                             const SizedBox(height: 4),
                             Text(
-                              '$memberCount miembros',
+                              formatMemberCount(memberCount),
                               style: const TextStyle(
                                 color: ssText2,
                                 fontSize: 13,
@@ -5388,7 +12533,8 @@ class JoinRequestSentScreen extends StatelessWidget {
               padding: const EdgeInsets.fromLTRB(24, 10, 24, 24),
               child: SundayButton(
                 text: 'Volver a grupos',
-                onPressed: () => Navigator.popUntil(context, (route) => route.isFirst),
+                onPressed: () =>
+                    Navigator.popUntil(context, (route) => route.isFirst),
               ),
             ),
           ],
@@ -5408,22 +12554,104 @@ class GroupScreen extends StatefulWidget {
 }
 
 class _GroupScreenState extends State<GroupScreen> {
-  String selectedWeekKey = obtenerWeekKeyActual();
+  String selectedWeekKey = '';
+  bool showingAllWeeks = false;
   bool chatExpanded = false;
+  double chatDragOffset = 0;
+  String? lastViewedWriteMarker;
+  late DocumentReference<Map<String, dynamic>> groupRef;
+  late Stream<DocumentSnapshot<Map<String, dynamic>>> groupStream;
+  late Stream<QuerySnapshot<Map<String, dynamic>>> weeksStream;
+  String? memberStreamUid;
+  Stream<DocumentSnapshot<Map<String, dynamic>>>? memberStream;
+
+  @override
+  void initState() {
+    super.initState();
+    configureGroupStreams();
+  }
+
+  @override
+  void didUpdateWidget(covariant GroupScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.groupId != widget.groupId) {
+      configureGroupStreams();
+    }
+  }
+
+  void configureGroupStreams() {
+    selectedWeekKey = '';
+    showingAllWeeks = false;
+    chatExpanded = false;
+    chatDragOffset = 0;
+    groupRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(widget.groupId);
+    groupStream = groupRef.snapshots();
+    weeksStream = groupRef
+        .collection('weeks')
+        .orderBy('createdAt', descending: true)
+        .snapshots();
+    memberStreamUid = null;
+    memberStream = null;
+  }
+
+  void _scheduleMarkWeekViewed(String weekKey) {
+    if (weekKey.isEmpty) return;
+
+    final marker = '${widget.groupId}:$weekKey';
+    if (lastViewedWriteMarker == marker) return;
+    lastViewedWriteMarker = marker;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+
+      unawaited(
+        marcarGrupoSemanaVisto(
+          groupId: widget.groupId,
+          weekKey: weekKey,
+        ).catchError((error) {
+          logDebug('No se pudo marcar el grupo como visto: $error');
+          if (mounted && lastViewedWriteMarker == marker) {
+            lastViewedWriteMarker = null;
+          }
+        }),
+      );
+    });
+  }
+
+  Stream<DocumentSnapshot<Map<String, dynamic>>> streamForMember(String uid) {
+    if (memberStreamUid != uid || memberStream == null) {
+      memberStreamUid = uid;
+      memberStream = groupRef.collection('members').doc(uid).snapshots();
+    }
+
+    return memberStream!;
+  }
+
+  void _setChatExpanded(bool expanded) {
+    chatExpanded = expanded;
+    chatDragOffset = 0;
+  }
+
+  void _handleChatDragOffsetChanged(double offset) {
+    if (!mounted) return;
+    final nextOffset = offset.isFinite ? math.max(0.0, offset) : 0.0;
+    if ((chatDragOffset - nextOffset).abs() < 0.5) return;
+
+    setState(() => chatDragOffset = nextOffset);
+  }
 
   @override
   Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
     final currentUser = FirebaseAuth.instance.currentUser;
-    final groupRef = FirebaseFirestore.instance
-        .collection('groups')
-        .doc(widget.groupId);
-    final weeksRef = groupRef
-        .collection('weeks')
-        .orderBy('createdAt', descending: true);
+    final keyboardVisible = MediaQuery.viewInsetsOf(context).bottom > 0;
 
     return Scaffold(
       backgroundColor: ssBg,
-      bottomNavigationBar: currentUser == null
+      resizeToAvoidBottomInset: true,
+      bottomNavigationBar: currentUser == null || keyboardVisible
           ? null
           : SundayTabBar(
               selectedIndex: 0,
@@ -5435,10 +12663,8 @@ class _GroupScreenState extends State<GroupScreen> {
 
                 Navigator.of(context).pushAndRemoveUntil(
                   MaterialPageRoute(
-                    builder: (_) => SundayShell(
-                      user: currentUser,
-                      initialIndex: index,
-                    ),
+                    builder: (_) =>
+                        SundayShell(user: currentUser, initialIndex: index),
                   ),
                   (_) => false,
                 );
@@ -5446,7 +12672,7 @@ class _GroupScreenState extends State<GroupScreen> {
             ),
       body: SafeArea(
         child: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-          stream: groupRef.snapshots(),
+          stream: groupStream,
           builder: (context, groupSnapshot) {
             if (groupSnapshot.connectionState == ConnectionState.waiting) {
               return const Center(
@@ -5454,106 +12680,578 @@ class _GroupScreenState extends State<GroupScreen> {
               );
             }
 
+            if (groupSnapshot.hasError) {
+              return GroupUnavailableScreen(
+                title: 'No se pudo abrir el grupo',
+                message:
+                    'Puede que ya no tengas acceso o que el grupo haya cambiado.',
+                groupId: currentUser == null ? null : widget.groupId,
+              );
+            }
+
             if (!groupSnapshot.hasData || !groupSnapshot.data!.exists) {
-              return const Center(child: Text('Grupo no encontrado'));
+              return GroupUnavailableScreen(
+                title: 'Grupo no encontrado',
+                message: 'Este grupo ya no está disponible.',
+                groupId: currentUser == null ? null : widget.groupId,
+              );
             }
 
             final groupData = groupSnapshot.data!.data()!;
+            if (groupData['deleted'] == true) {
+              return GroupUnavailableScreen(
+                title: 'Grupo eliminado',
+                message: 'Este grupo ya no está disponible.',
+                groupId: currentUser == null ? null : widget.groupId,
+              );
+            }
+
             final groupName = groupData['name'] ?? 'Grupo';
             final memberCount = groupData['memberCount'] ?? 0;
 
-            return Column(
-              children: [
-                AppHeader(
-                  subtitle: '${formatGroupDisplayName(groupName.toString())} · $memberCount miembros',
-                  onBack: () => Navigator.pop(context),
-                  right: GroupMembersHeaderButton(
+            if (currentUser == null) {
+              return const GroupUnavailableScreen(
+                title: 'Inicia sesión',
+                message: 'Necesitas iniciar sesión para abrir este grupo.',
+              );
+            }
+
+            return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+              stream: streamForMember(currentUser.uid),
+              builder: (context, memberSnapshot) {
+                if (memberSnapshot.connectionState == ConnectionState.waiting) {
+                  return const Center(
+                    child: CircularProgressIndicator(color: ssOrange),
+                  );
+                }
+
+                if (memberSnapshot.hasError ||
+                    !(memberSnapshot.data?.exists ?? false)) {
+                  return GroupUnavailableScreen(
+                    title: 'Sin acceso al grupo',
+                    message: 'Ya no perteneces a este grupo.',
                     groupId: widget.groupId,
-                    currentUid: currentUser?.uid,
-                  ),
-                ),
-                if (currentUser != null)
-                  GroupPendingRequestsShortcut(
-                    groupId: widget.groupId,
-                    currentUid: currentUser.uid,
-                  ),
-                StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                  stream: weeksRef.snapshots(),
-                  builder: (context, weeksSnapshot) {
-                    final weekDocs = weeksSnapshot.data?.docs ?? [];
-                    final weekKeys = <String>{
-                      if (esDomingo()) obtenerWeekKeyActual(),
-                      ...weekDocs.map((d) => d.id),
-                    }.toList();
+                  );
+                }
 
-                    if (weekKeys.isEmpty) {
-                      selectedWeekKey = '';
-                      return const SizedBox(height: 4);
-                    }
-
-                    if (!weekKeys.contains(selectedWeekKey)) {
-                      selectedWeekKey = weekKeys.first;
-                    }
-
-                    return SizedBox(
-                      height: 33,
-                      child: ListView.separated(
-                        scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.fromLTRB(16, 2, 16, 6),
-                        itemCount: weekKeys.length,
-                        separatorBuilder: (_, _) => const SizedBox(width: 8),
-                        itemBuilder: (context, index) {
-                          final key = weekKeys[index];
-                          final selected = key == selectedWeekKey;
-                          final weekDoc = weekDocs
-                              .where((doc) => doc.id == key)
-                              .firstOrNull;
-                          final rawPostCount = weekDoc?.data()['postCount'] ?? 0;
-                          final postCount = rawPostCount is int
-                              ? rawPostCount
-                              : int.tryParse('$rawPostCount') ?? 0;
+                return Column(
+                  children: [
+                    AppHeader(
+                      subtitle: formatGroupDisplayName(groupName.toString()),
+                      subtitleCenteredInBottomGap: true,
+                      subtitleStyle: ssGroupHeaderSubtitleStyle,
+                      logoTapToHome: false,
+                      onBack: () => Navigator.pop(context),
+                      right: GroupMembersHeaderButton(
+                        groupId: widget.groupId,
+                        currentUid: currentUser.uid,
+                      ),
+                    ),
+                    GroupPendingRequestsShortcut(
+                      groupId: widget.groupId,
+                      currentUid: currentUser.uid,
+                    ),
+                    Expanded(
+                      child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                        stream: weeksStream,
+                        builder: (context, weeksSnapshot) {
+                          final weekDocs = weeksSnapshot.data?.docs ?? [];
                           final total = memberCount is int
                               ? memberCount
                               : int.tryParse('$memberCount') ?? 0;
-                          final label = key == obtenerWeekKeyActual()
-                              ? 'Esta semana'
-                              : obtenerEtiquetaSemana(key);
-                          return WeekChip(
-                            key: ValueKey('group_week_${key}_$selected'),
-                            text: '$label  $postCount/$total',
-                            selected: selected,
-                            onTap: () => setState(() => selectedWeekKey = key),
+                          final weekKeys = obtenerWeekKeysCalendarioGrupo(
+                            groupCreatedAt: groupData['createdAt'],
+                            existingWeekKeys: weekDocs.map((d) => d.id),
+                          );
+                          final effectiveSelectedWeekKey =
+                              resolverWeekKeySeleccionadaGrupo(
+                                weekKeys: weekKeys,
+                                selectedWeekKey: selectedWeekKey,
+                              );
+                          final weekDocsById = {
+                            for (final doc in weekDocs) doc.id: doc,
+                          };
+                          final publishedWeekKeys =
+                              weekDocs
+                                  .where((doc) {
+                                    final postCount = intFromValue(
+                                      doc.data()['postCount'],
+                                    );
+                                    return postCount > 0 &&
+                                        weekKeys.contains(doc.id);
+                                  })
+                                  .map((doc) => doc.id)
+                                  .toList()
+                                ..sort((a, b) {
+                                  final aOrder = _weekKeyOrderValue(a) ?? 0;
+                                  final bOrder = _weekKeyOrderValue(b) ?? 0;
+                                  return bOrder.compareTo(aOrder);
+                                });
+                          final publishedWeeksSignature = publishedWeekKeys
+                              .map((key) {
+                                final postCount = intFromValue(
+                                  weekDocsById[key]?.data()['postCount'],
+                                );
+                                return '$key:$postCount';
+                              })
+                              .join('|');
+                          final calendarEntries =
+                              construirEntradasCalendarioSemanas(
+                                weekKeys: weekKeys,
+                                weekDocs: weekDocs,
+                                memberCount: total,
+                              );
+                          if (!showingAllWeeks) {
+                            _scheduleMarkWeekViewed(effectiveSelectedWeekKey);
+                          }
+
+                          Widget weekSelector;
+                          if (weeksSnapshot.hasError) {
+                            weekSelector = const Padding(
+                              padding: EdgeInsets.symmetric(vertical: 18),
+                              child: Text(
+                                'No se pudieron cargar las semanas del grupo',
+                                style: TextStyle(color: ssText2),
+                              ),
+                            );
+                          } else if (weekKeys.isEmpty) {
+                            weekSelector = const SizedBox(height: 4);
+                          } else {
+                            final weekSelectorItems =
+                                construirItemsSelectorSemanas(weekKeys);
+
+                            weekSelector = SizedBox(
+                              height: 33,
+                              child: Row(
+                                children: [
+                                  Padding(
+                                    padding: const EdgeInsets.fromLTRB(
+                                      16,
+                                      2,
+                                      0,
+                                      6,
+                                    ),
+                                    child: WeekCalendarButton(
+                                      onTap: () async {
+                                        final selected =
+                                            await showWeekCalendarSheet(
+                                              context: context,
+                                              entries: calendarEntries,
+                                              selectedWeekKey:
+                                                  effectiveSelectedWeekKey,
+                                            );
+
+                                        if (!mounted || selected == null) {
+                                          return;
+                                        }
+
+                                        setState(() {
+                                          selectedWeekKey = selected;
+                                          showingAllWeeks = false;
+                                        });
+                                      },
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Padding(
+                                    padding: const EdgeInsets.fromLTRB(
+                                      0,
+                                      2,
+                                      0,
+                                      6,
+                                    ),
+                                    child: WeekChip(
+                                      key: ValueKey(
+                                        'group_week_all_$showingAllWeeks',
+                                      ),
+                                      text: 'Todos',
+                                      selected: showingAllWeeks,
+                                      horizontalPadding: 10,
+                                      onTap: () => setState(() {
+                                        showingAllWeeks = true;
+                                        _setChatExpanded(false);
+                                      }),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Container(
+                                    width: 1,
+                                    height: 25,
+                                    margin: const EdgeInsets.only(
+                                      top: 2,
+                                      bottom: 6,
+                                    ),
+                                    color: ssBorder,
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Expanded(
+                                    child: Padding(
+                                      padding: const EdgeInsets.fromLTRB(
+                                        0,
+                                        2,
+                                        0,
+                                        6,
+                                      ),
+                                      child: ClipRRect(
+                                        borderRadius:
+                                            const BorderRadius.horizontal(
+                                              left: Radius.circular(999),
+                                            ),
+                                        child: SizedBox(
+                                          height: 25,
+                                          child: ListView.separated(
+                                            scrollDirection: Axis.horizontal,
+                                            padding: const EdgeInsets.fromLTRB(
+                                              0,
+                                              0,
+                                              16,
+                                              0,
+                                            ),
+                                            itemCount: weekSelectorItems.length,
+                                            separatorBuilder: (_, _) =>
+                                                const SizedBox(width: 6),
+                                            itemBuilder: (context, index) {
+                                              final item =
+                                                  weekSelectorItems[index];
+                                              if (item.startsWith('year:')) {
+                                                return WeekYearSeparatorChip(
+                                                  year: item.substring(5),
+                                                );
+                                              }
+
+                                              final key = item.substring(5);
+                                              final selected =
+                                                  !showingAllWeeks &&
+                                                  key ==
+                                                      effectiveSelectedWeekKey;
+                                              final label =
+                                                  obtenerEtiquetaSemanaCorta(
+                                                    key,
+                                                  );
+                                              return WeekChip(
+                                                key: ValueKey(
+                                                  'group_week_${key}_$selected',
+                                                ),
+                                                text: label,
+                                                selected: selected,
+                                                horizontalPadding: 13,
+                                                onTap: () => setState(() {
+                                                  selectedWeekKey = key;
+                                                  showingAllWeeks = false;
+                                                  chatDragOffset = 0;
+                                                }),
+                                              );
+                                            },
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          }
+
+                          final keyboardChatOpen =
+                              keyboardVisible && chatExpanded;
+                          final allWeeksMode = showingAllWeeks;
+                          final chatCanWrite =
+                              effectiveSelectedWeekKey.isNotEmpty &&
+                              esDomingo() &&
+                              effectiveSelectedWeekKey ==
+                                  obtenerWeekKeyActual();
+                          final expandedChatHeight =
+                              resolverAlturaPanelChatSemanal(
+                                screenHeight: MediaQuery.sizeOf(context).height,
+                                keyboardOpen: false,
+                                canWrite: chatCanWrite,
+                              );
+
+                          return GroupWeeklyContentLayout(
+                            keyboardVisible: keyboardVisible,
+                            showChatPanel: !allWeeksMode,
+                            chatExpanded: allWeeksMode ? false : chatExpanded,
+                            chatDragOffset: allWeeksMode ? 0 : chatDragOffset,
+                            expandedChatHeight: allWeeksMode
+                                ? null
+                                : expandedChatHeight,
+                            weekSelector: weekSelector,
+                            postsGrid: allWeeksMode
+                                ? GroupAllPostsGrid(
+                                    groupId: widget.groupId,
+                                    groupName: groupName.toString(),
+                                    groupPhotoUrl:
+                                        groupData['photoUrl'] as String?,
+                                    weekKeys: publishedWeekKeys,
+                                    reloadSignature: publishedWeeksSignature,
+                                  )
+                                : GroupPostsGrid(
+                                    groupId: widget.groupId,
+                                    groupName: groupName.toString(),
+                                    groupPhotoUrl:
+                                        groupData['photoUrl'] as String?,
+                                    weekKey: effectiveSelectedWeekKey,
+                                  ),
+                            chatPanel: allWeeksMode
+                                ? const SizedBox.shrink()
+                                : WeeklyChatPanel(
+                                    groupId: widget.groupId,
+                                    weekKey: effectiveSelectedWeekKey,
+                                    expanded: chatExpanded,
+                                    fillAvailableHeight: keyboardChatOpen,
+                                    onDragOffsetChanged:
+                                        _handleChatDragOffsetChanged,
+                                    onToggle: () => setState(
+                                      () => _setChatExpanded(!chatExpanded),
+                                    ),
+                                  ),
                           );
                         },
                       ),
-                    );
-                  },
-                ),
-                Expanded(
-                  child: GroupPostsGrid(
-                    groupId: widget.groupId,
-                    weekKey: selectedWeekKey,
-                  ),
-                ),
-                WeeklyChatPanel(
-                  groupId: widget.groupId,
-                  weekKey: selectedWeekKey,
-                  expanded: chatExpanded,
-                  onToggle: () => setState(() => chatExpanded = !chatExpanded),
-                ),
-              ],
+                    ),
+                  ],
+                );
+              },
             );
           },
         ),
       ),
     );
   }
-
-
 }
 
+class GroupWeeklyContentLayout extends StatelessWidget {
+  final bool keyboardVisible;
+  final bool showChatPanel;
+  final bool chatExpanded;
+  final double chatDragOffset;
+  final double? expandedChatHeight;
+  final Widget weekSelector;
+  final Widget postsGrid;
+  final Widget chatPanel;
 
-class GroupMembersHeaderButton extends StatelessWidget {
+  const GroupWeeklyContentLayout({
+    super.key,
+    required this.keyboardVisible,
+    this.showChatPanel = true,
+    required this.chatExpanded,
+    this.chatDragOffset = 0,
+    this.expandedChatHeight,
+    required this.weekSelector,
+    required this.postsGrid,
+    required this.chatPanel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final keyboardChatOpen = showChatPanel && keyboardVisible && chatExpanded;
+
+    if (keyboardChatOpen) {
+      return Column(
+        children: [
+          weekSelector,
+          Flexible(
+            key: const ValueKey('weekly_chat_panel_slot'),
+            fit: FlexFit.tight,
+            child: chatPanel,
+          ),
+        ],
+      );
+    }
+
+    return Column(
+      children: [
+        weekSelector,
+        const SizedBox(height: 5),
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final rawExpandedHeight = expandedChatHeight;
+              final resolvedExpandedHeight =
+                  rawExpandedHeight != null && rawExpandedHeight.isFinite
+                  ? rawExpandedHeight
+                  : kWeeklyChatCollapsedSlotHeight;
+              final expandedInset = math.min(
+                resolvedExpandedHeight,
+                constraints.maxHeight,
+              );
+              final safeChatDragOffset = chatDragOffset.isFinite
+                  ? math.max(0.0, chatDragOffset)
+                  : 0.0;
+              final bottomInset = !showChatPanel
+                  ? 0.0
+                  : chatExpanded
+                  ? math.max(
+                      kWeeklyChatCollapsedSlotHeight,
+                      expandedInset - safeChatDragOffset,
+                    )
+                  : kWeeklyChatCollapsedSlotHeight;
+              final draggingChatPanel =
+                  showChatPanel && chatExpanded && safeChatDragOffset > 0;
+
+              return Stack(
+                clipBehavior: Clip.hardEdge,
+                children: [
+                  Positioned.fill(
+                    child: AnimatedPadding(
+                      duration: draggingChatPanel
+                          ? Duration.zero
+                          : kWeeklyChatPanelAnimationDuration,
+                      curve: kWeeklyChatPanelAnimationCurve,
+                      padding: EdgeInsets.only(bottom: bottomInset),
+                      child: postsGrid,
+                    ),
+                  ),
+                  if (showChatPanel)
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxHeight: constraints.maxHeight,
+                        ),
+                        child: chatPanel,
+                      ),
+                    ),
+                ],
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class GroupUnavailableScreen extends StatefulWidget {
+  final String title;
+  final String message;
+  final String? groupId;
+
+  const GroupUnavailableScreen({
+    super.key,
+    required this.title,
+    required this.message,
+    this.groupId,
+  });
+
+  @override
+  State<GroupUnavailableScreen> createState() => _GroupUnavailableScreenState();
+}
+
+class _GroupUnavailableScreenState extends State<GroupUnavailableScreen> {
+  bool removing = false;
+
+  Future<void> _removeFromApp() async {
+    final groupId = widget.groupId?.trim();
+    if (groupId == null || groupId.isEmpty || removing) return;
+
+    setState(() => removing = true);
+
+    try {
+      await eliminarGrupoDeLaApp(groupId: groupId);
+
+      if (!mounted) return;
+      final user = FirebaseAuth.instance.currentUser;
+      if (user == null) {
+        Navigator.pop(context);
+        return;
+      }
+
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(
+          builder: (_) => SundayShell(user: user, initialIndex: 0),
+        ),
+        (_) => false,
+      );
+      final rootContext = sundayNavigatorKey.currentContext;
+      if (rootContext != null && rootContext.mounted) {
+        showSundaySnack(rootContext, 'Grupo eliminado de la app');
+      }
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'No se pudo eliminar el grupo: $error');
+    } finally {
+      if (mounted) setState(() => removing = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final canRemoveFromApp =
+        widget.groupId != null && widget.groupId!.trim().isNotEmpty;
+
+    return Column(
+      children: [
+        AppHeader(onBack: () => Navigator.pop(context)),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.all(28),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 78,
+                  height: 78,
+                  decoration: BoxDecoration(
+                    color: ssOrangeLight,
+                    borderRadius: BorderRadius.circular(26),
+                  ),
+                  child: const Icon(
+                    Icons.notifications_off_outlined,
+                    color: ssOrangeDark,
+                    size: 36,
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  widget.title,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: ssTitle,
+                    fontSize: 22,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  widget.message,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: ssText2,
+                    fontSize: 15,
+                    height: 1.45,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 22),
+                if (canRemoveFromApp) ...[
+                  SundayButton(
+                    text: removing
+                        ? 'Eliminando...'
+                        : 'Eliminar grupo de la app',
+                    onPressed: removing ? null : _removeFromApp,
+                  ),
+                  const SizedBox(height: 10),
+                ],
+                SundayButton(
+                  text: 'Volver',
+                  variant: canRemoveFromApp
+                      ? SundayButtonVariant.outline
+                      : SundayButtonVariant.primary,
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class GroupMembersHeaderButton extends StatefulWidget {
   final String groupId;
   final String? currentUid;
 
@@ -5563,32 +13261,68 @@ class GroupMembersHeaderButton extends StatelessWidget {
     required this.currentUid,
   });
 
+  @override
+  State<GroupMembersHeaderButton> createState() =>
+      _GroupMembersHeaderButtonState();
+}
+
+class _GroupMembersHeaderButtonState extends State<GroupMembersHeaderButton> {
+  Stream<DocumentSnapshot<Map<String, dynamic>>>? memberStream;
+  late Stream<QuerySnapshot<Map<String, dynamic>>> requestsStream;
+
+  @override
+  void initState() {
+    super.initState();
+    configureStreams();
+  }
+
+  @override
+  void didUpdateWidget(covariant GroupMembersHeaderButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.groupId != widget.groupId ||
+        oldWidget.currentUid != widget.currentUid) {
+      configureStreams();
+    }
+  }
+
+  void configureStreams() {
+    memberStream = widget.currentUid == null
+        ? null
+        : FirebaseFirestore.instance
+              .collection('groups')
+              .doc(widget.groupId)
+              .collection('members')
+              .doc(widget.currentUid!)
+              .snapshots();
+    requestsStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(widget.groupId)
+        .collection('joinRequests')
+        .snapshots();
+  }
+
   void _openMembers(BuildContext context) {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => GroupMembersScreen(groupId: groupId),
+        builder: (_) => GroupMembersScreen(groupId: widget.groupId),
       ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    if (currentUid == null) {
+    final currentMemberStream = memberStream;
+
+    if (currentMemberStream == null) {
       return IconButton(
         onPressed: () => _openMembers(context),
-        icon: const Icon(Icons.more_vert_rounded, color: ssOrange),
+        icon: const SundayHeaderMoreIcon(),
       );
     }
 
-    final memberRef = FirebaseFirestore.instance
-        .collection('groups')
-        .doc(groupId)
-        .collection('members')
-        .doc(currentUid);
-
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: memberRef.snapshots(),
+      stream: currentMemberStream,
       builder: (context, memberSnapshot) {
         final memberData = memberSnapshot.data?.data();
         final isAdmin = memberData?['role'] == 'admin';
@@ -5596,17 +13330,12 @@ class GroupMembersHeaderButton extends StatelessWidget {
         if (!isAdmin) {
           return IconButton(
             onPressed: () => _openMembers(context),
-            icon: const Icon(Icons.more_vert_rounded, color: ssOrange),
+            icon: const SundayHeaderMoreIcon(),
           );
         }
 
-        final requestsRef = FirebaseFirestore.instance
-            .collection('groups')
-            .doc(groupId)
-            .collection('joinRequests');
-
         return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-          stream: requestsRef.snapshots(),
+          stream: requestsStream,
           builder: (context, requestsSnapshot) {
             final pendingCount = requestsSnapshot.data?.docs.length ?? 0;
 
@@ -5615,7 +13344,7 @@ class GroupMembersHeaderButton extends StatelessWidget {
               children: [
                 IconButton(
                   onPressed: () => _openMembers(context),
-                  icon: const Icon(Icons.more_vert_rounded, color: ssOrange),
+                  icon: const SundayHeaderMoreIcon(),
                 ),
                 if (pendingCount > 0)
                   Positioned(
@@ -5653,7 +13382,7 @@ class GroupMembersHeaderButton extends StatelessWidget {
   }
 }
 
-class GroupPendingRequestsShortcut extends StatelessWidget {
+class GroupPendingRequestsShortcut extends StatefulWidget {
   final String groupId;
   final String currentUid;
 
@@ -5663,25 +13392,58 @@ class GroupPendingRequestsShortcut extends StatelessWidget {
     required this.currentUid,
   });
 
+  @override
+  State<GroupPendingRequestsShortcut> createState() =>
+      _GroupPendingRequestsShortcutState();
+}
+
+class _GroupPendingRequestsShortcutState
+    extends State<GroupPendingRequestsShortcut> {
+  late Stream<DocumentSnapshot<Map<String, dynamic>>> memberStream;
+  late Stream<QuerySnapshot<Map<String, dynamic>>> requestsStream;
+
+  @override
+  void initState() {
+    super.initState();
+    configureStreams();
+  }
+
+  @override
+  void didUpdateWidget(covariant GroupPendingRequestsShortcut oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.groupId != widget.groupId ||
+        oldWidget.currentUid != widget.currentUid) {
+      configureStreams();
+    }
+  }
+
+  void configureStreams() {
+    final groupRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(widget.groupId);
+    memberStream = groupRef
+        .collection('members')
+        .doc(widget.currentUid)
+        .snapshots();
+    requestsStream = groupRef
+        .collection('joinRequests')
+        .orderBy('requestedAt', descending: true)
+        .snapshots();
+  }
+
   void _openMembers(BuildContext context) {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => GroupMembersScreen(groupId: groupId),
+        builder: (_) => GroupMembersScreen(groupId: widget.groupId),
       ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final memberRef = FirebaseFirestore.instance
-        .collection('groups')
-        .doc(groupId)
-        .collection('members')
-        .doc(currentUid);
-
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: memberRef.snapshots(),
+      stream: memberStream,
       builder: (context, memberSnapshot) {
         final memberData = memberSnapshot.data?.data();
         final isAdmin = memberData?['role'] == 'admin';
@@ -5690,14 +13452,8 @@ class GroupPendingRequestsShortcut extends StatelessWidget {
           return const SizedBox.shrink();
         }
 
-        final requestsRef = FirebaseFirestore.instance
-            .collection('groups')
-            .doc(groupId)
-            .collection('joinRequests')
-            .orderBy('requestedAt', descending: true);
-
         return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-          stream: requestsRef.snapshots(),
+          stream: requestsStream,
           builder: (context, requestsSnapshot) {
             final requests = requestsSnapshot.data?.docs ?? [];
 
@@ -5789,7 +13545,6 @@ class GroupPendingRequestsShortcut extends StatelessWidget {
   }
 }
 
-
 class GroupMembersScreen extends StatelessWidget {
   final String groupId;
 
@@ -5797,7 +13552,9 @@ class GroupMembersScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final groupRef = FirebaseFirestore.instance.collection('groups').doc(groupId);
+    final groupRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(groupId);
 
     return Scaffold(
       backgroundColor: ssBg,
@@ -5842,7 +13599,9 @@ class GroupMembersScreen extends StatelessWidget {
               return Column(
                 children: [
                   AppHeader(onBack: () => Navigator.pop(context)),
-                  const Expanded(child: Center(child: Text('Grupo no encontrado'))),
+                  const Expanded(
+                    child: Center(child: Text('Grupo no encontrado')),
+                  ),
                 ],
               );
             }
@@ -5855,11 +13614,17 @@ class GroupMembersScreen extends StatelessWidget {
             final inviteCodeVersion = inviteCodeVersionRaw is int
                 ? inviteCodeVersionRaw
                 : int.tryParse('$inviteCodeVersionRaw') ?? 1;
+            final activeWeeks = semanasActivasDesdeCreatedAt(
+              groupData['createdAt'],
+            );
 
             return Column(
               children: [
                 AppHeader(
-                  subtitle: shortGroupHeaderTitle(groupName),
+                  subtitle: formatGroupDisplayName(groupName),
+                  subtitleCenteredInBottomGap: true,
+                  subtitleStyle: ssGroupHeaderSubtitleStyle,
+                  logoTapToHome: false,
                   onBack: () => Navigator.pop(context),
                 ),
                 Expanded(
@@ -5869,6 +13634,7 @@ class GroupMembersScreen extends StatelessWidget {
                     groupPhotoUrl: groupPhotoUrl,
                     inviteCode: inviteCode,
                     inviteCodeVersion: inviteCodeVersion,
+                    activeWeeks: activeWeeks,
                   ),
                 ),
               ],
@@ -5880,13 +13646,13 @@ class GroupMembersScreen extends StatelessWidget {
   }
 }
 
-
 class GroupMembersHtmlContent extends StatelessWidget {
   final String groupId;
   final String groupName;
   final String? groupPhotoUrl;
   final String inviteCode;
   final int inviteCodeVersion;
+  final int activeWeeks;
 
   const GroupMembersHtmlContent({
     super.key,
@@ -5895,50 +13661,22 @@ class GroupMembersHtmlContent extends StatelessWidget {
     required this.groupPhotoUrl,
     required this.inviteCode,
     required this.inviteCodeVersion,
+    required this.activeWeeks,
   });
 
   Future<void> _renameGroup(BuildContext context, bool isAdmin) async {
     if (!isAdmin) {
-      showSundaySnack(context, 'Solo los administradores pueden cambiar el nombre');
+      showSundaySnack(
+        context,
+        'Solo los administradores pueden cambiar el nombre',
+      );
       return;
     }
 
-    final controller = TextEditingController(
-      text: formatGroupDisplayName(groupName),
-    );
-
     final newName = await showDialog<String>(
       context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          backgroundColor: Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(22),
-          ),
-          title: const Text('Cambiar nombre del grupo'),
-          content: TextField(
-            controller: controller,
-            autofocus: true,
-            textCapitalization: TextCapitalization.sentences,
-            decoration: const InputDecoration(
-              hintText: 'Nombre del grupo',
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Cancelar'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, controller.text.trim()),
-              child: const Text('Guardar'),
-            ),
-          ],
-        );
-      },
+      builder: (_) => GroupNameEditDialog(initialName: groupName),
     );
-
-    controller.dispose();
 
     if (newName == null || newName.trim().isEmpty) return;
 
@@ -5954,7 +13692,10 @@ class GroupMembersHtmlContent extends StatelessWidget {
 
   Future<void> _changeGroupPhoto(BuildContext context, bool isAdmin) async {
     if (!isAdmin) {
-      showSundaySnack(context, 'Solo los administradores pueden cambiar la foto del grupo');
+      showSundaySnack(
+        context,
+        'Solo los administradores pueden cambiar la foto del grupo',
+      );
       return;
     }
 
@@ -6032,96 +13773,154 @@ class GroupMembersHtmlContent extends StatelessWidget {
   }
 
   Future<void> _downloadSelfies(BuildContext context) async {
-    final scope = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (_) => SafeArea(
-        top: false,
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(20, 14, 20, 24),
-          decoration: const BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Center(
-                child: Container(
-                  width: 38,
-                  height: 4,
-                  margin: const EdgeInsets.only(bottom: 18),
-                  decoration: BoxDecoration(
-                    color: ssBorder,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                ),
-              ),
-              const Text(
-                'Descargar selfies',
-                style: TextStyle(
-                  color: ssTitle,
-                  fontSize: 19,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              const SizedBox(height: 6),
-              const Text(
-                'Elige si quieres preparar las fotos de esta semana o todas las semanas del grupo.',
-                style: TextStyle(
-                  color: ssText2,
-                  fontSize: 13,
-                  height: 1.35,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(height: 18),
-              InviteActionButton(
-                text: '📸 Esta semana',
-                variant: InviteActionButtonVariant.primary,
-                onTap: () => Navigator.pop(context, 'week'),
-              ),
-              const SizedBox(height: 10),
-              InviteActionButton(
-                text: '🗂️ Todas las semanas',
-                variant: InviteActionButtonVariant.secondary,
-                onTap: () => Navigator.pop(context, 'all'),
-              ),
-            ],
-          ),
-        ),
-      ),
+    final firestore = FirebaseFirestore.instance;
+    final groupRef = firestore.collection('groups').doc(groupId);
+    final groupSnapshot = await groupRef.get();
+    final groupData = groupSnapshot.data() ?? const <String, dynamic>{};
+    final memberCount = intFromValue(groupData['memberCount']);
+    final weeksSnapshot = await groupRef
+        .collection('weeks')
+        .orderBy('createdAt', descending: true)
+        .get();
+    final weekKeys = obtenerWeekKeysCalendarioGrupo(
+      groupCreatedAt: groupData['createdAt'],
+      existingWeekKeys: weeksSnapshot.docs.map((doc) => doc.id),
+    );
+    final entries = construirEntradasCalendarioSemanas(
+      weekKeys: weekKeys,
+      weekDocs: weeksSnapshot.docs,
+      memberCount: memberCount,
     );
 
-    if (scope == null || !context.mounted) return;
+    if (!context.mounted) return;
 
-    showSundaySnack(context, 'Preparando selfies...');
+    final selectedWeekKeys = await showDownloadWeeksSheet(
+      context: context,
+      entries: entries,
+    );
+
+    if (!context.mounted) return;
+    if (selectedWeekKeys == null || selectedWeekKeys.isEmpty) return;
+
+    showSundaySnack(context, 'Guardando selfies...');
     try {
       final files = await descargarSelfiesGrupo(
         groupId: groupId,
         groupName: groupName,
-        allWeeks: scope == 'all',
-        weekKey: obtenerWeekKeyActual(),
+        allWeeks: false,
+        weekKeys: selectedWeekKeys,
       );
 
       if (!context.mounted) return;
 
-      await compartirArchivosDescargados(
-        context: context,
+      final savedCount = await guardarArchivosDescargadosEnTelefono(
         files: files,
-        title: scope == 'all'
-            ? 'Selfies de ${formatGroupDisplayName(groupName)}'
-            : 'Selfies de ${formatGroupDisplayName(groupName)} · ${obtenerEtiquetaSemana(obtenerWeekKeyActual())}',
       );
+
+      if (!context.mounted) return;
+      if (savedCount == 0) {
+        showSundaySnack(context, 'No hay selfies para descargar');
+      } else {
+        showSundaySnack(
+          context,
+          savedCount == 1
+              ? '1 selfie guardada en el teléfono'
+              : '$savedCount selfies guardadas en el teléfono',
+        );
+      }
     } catch (error) {
       if (!context.mounted) return;
-      showSundaySnack(context, 'Error preparando descarga: $error');
+      showSundaySnack(context, mensajeErrorGuardandoArchivos(error));
+    }
+  }
+
+  String get _inviteLink => crearEnlaceInvitacion(inviteCode);
+
+  Future<void> _copyInviteCode(BuildContext context) async {
+    final code = inviteCode.trim();
+    if (code.isEmpty) {
+      showSundaySnack(context, 'No hay invitación disponible todavía');
+      return;
+    }
+
+    await Clipboard.setData(ClipboardData(text: code));
+    if (!context.mounted) return;
+    showSundaySnack(context, 'Código copiado');
+  }
+
+  void _shareInviteLink(BuildContext context) {
+    final code = inviteCode.trim();
+    if (code.isEmpty) {
+      showSundaySnack(context, 'No hay invitación disponible todavía');
+      return;
+    }
+
+    final box = context.findRenderObject() as RenderBox?;
+    final origin = box == null
+        ? const Rect.fromLTWH(0, 0, 1, 1)
+        : box.localToGlobal(Offset.zero) & box.size;
+
+    unawaited(
+      SharePlus.instance.share(
+        ShareParams(
+          text: 'Únete a mi grupo de Sunday Selfie: $_inviteLink',
+          subject: 'Invitación a $groupName',
+          sharePositionOrigin: origin,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _regenerateInvite(BuildContext context, bool isAdmin) async {
+    if (!isAdmin) {
+      showSundaySnack(
+        context,
+        'Solo los administradores pueden regenerar el código',
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(22),
+          ),
+          title: const Text('Regenerar invitación'),
+          content: const Text(
+            'El código anterior dejará de funcionar. Tendrás que compartir el nuevo código.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancelar'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Regenerar'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (confirmed != true || !context.mounted) return;
+
+    try {
+      await regenerarInvitacionGrupo(groupId: groupId);
+      if (!context.mounted) return;
+      showSundaySnack(context, 'Código de invitación regenerado');
+    } catch (error) {
+      if (!context.mounted) return;
+      showSundaySnack(context, 'Error regenerando invitación: $error');
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
     final membersRef = FirebaseFirestore.instance
         .collection('groups')
         .doc(groupId)
@@ -6138,7 +13937,9 @@ class GroupMembersHtmlContent extends StatelessWidget {
       stream: membersRef.snapshots(),
       builder: (context, membersSnapshot) {
         if (membersSnapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator(color: ssOrange));
+          return const Center(
+            child: CircularProgressIndicator(color: ssOrange),
+          );
         }
 
         if (membersSnapshot.hasError) {
@@ -6162,8 +13963,12 @@ class GroupMembersHtmlContent extends StatelessWidget {
             if (aRole == 'admin') return -1;
             if (bRole == 'admin') return 1;
           }
-          final aName = formatUserDisplayName(a.data()['effectiveName'] ?? '').toLowerCase();
-          final bName = formatUserDisplayName(b.data()['effectiveName'] ?? '').toLowerCase();
+          final aName = formatUserDisplayName(
+            a.data()['effectiveName'] ?? '',
+          ).toLowerCase();
+          final bName = formatUserDisplayName(
+            b.data()['effectiveName'] ?? '',
+          ).toLowerCase();
           return aName.compareTo(bName);
         });
 
@@ -6183,6 +13988,14 @@ class GroupMembersHtmlContent extends StatelessWidget {
             return ListView(
               padding: const EdgeInsets.fromLTRB(20, 14, 20, 24),
               children: [
+                const MembersHtmlSectionLabel(text: 'INFORMACIÓN'),
+                const SizedBox(height: 8),
+                GroupInfoInlineRow(
+                  icon: Icons.calendar_month_outlined,
+                  label: 'Tiempo activo',
+                  value: activeWeeks == 1 ? '1 semana' : '$activeWeeks semanas',
+                ),
+                const SizedBox(height: 24),
                 if (isCurrentAdmin)
                   GroupJoinRequestsInlineSection(
                     groupId: groupId,
@@ -6204,51 +14017,203 @@ class GroupMembersHtmlContent extends StatelessWidget {
                   ...memberDocs.map(
                     (doc) => GroupMemberHtmlRow(
                       groupId: groupId,
+                      groupName: groupName,
+                      groupPhotoUrl: groupPhotoUrl,
                       memberDoc: doc,
                       posted: postedUids.contains(doc.id),
                       currentUserIsAdmin: isCurrentAdmin,
                     ),
                   ),
-                const SizedBox(height: 24),
-                InviteActionButton(
-                  text: '🖼️ Cambiar foto del grupo',
-                  variant: isCurrentAdmin
-                      ? InviteActionButtonVariant.secondary
-                      : InviteActionButtonVariant.outline,
-                  onTap: () => _changeGroupPhoto(context, isCurrentAdmin),
+                const SizedBox(height: 26),
+                GroupOptionsSection(
+                  title: 'AJUSTES DEL GRUPO',
+                  rows: [
+                    GroupOptionRow(
+                      icon: GroupOptionIconKind.photo,
+                      title: 'Foto',
+                      onTap: () => _changeGroupPhoto(context, isCurrentAdmin),
+                    ),
+                    GroupOptionRow(
+                      icon: GroupOptionIconKind.editName,
+                      title: 'Nombre',
+                      onTap: () => _renameGroup(context, isCurrentAdmin),
+                    ),
+                    GroupOptionRow(
+                      icon: GroupOptionIconKind.download,
+                      title: 'Descargar',
+                      onTap: () => _downloadSelfies(context),
+                    ),
+                  ],
                 ),
-                const SizedBox(height: 10),
-                InviteActionButton(
-                  text: '✏️ Cambiar nombre del grupo',
-                  variant: isCurrentAdmin
-                      ? InviteActionButtonVariant.secondary
-                      : InviteActionButtonVariant.outline,
-                  onTap: () => _renameGroup(context, isCurrentAdmin),
+                const SizedBox(height: 28),
+                GroupOptionsSection(
+                  title: 'INVITAR AMIGOS',
+                  rows: [
+                    GroupOptionRow(
+                      icon: GroupOptionIconKind.invite,
+                      title: 'Invitar',
+                      onTap: () => _shareInviteLink(context),
+                    ),
+                    GroupOptionRow(
+                      icon: GroupOptionIconKind.code,
+                      title: 'Código',
+                      trailingText: inviteCode.trim().isEmpty
+                          ? 'SIN CÓDIGO'
+                          : inviteCode.trim(),
+                      onTap: () => _copyInviteCode(context),
+                    ),
+                    if (isCurrentAdmin)
+                      GroupOptionRow(
+                        icon: GroupOptionIconKind.refresh,
+                        title: 'Regenerar código',
+                        onTap: () => _regenerateInvite(context, isCurrentAdmin),
+                      ),
+                  ],
                 ),
-                const SizedBox(height: 10),
-                InviteActionButton(
-                  text: '⬇️ Descargar selfies',
-                  variant: InviteActionButtonVariant.secondary,
-                  onTap: () => _downloadSelfies(context),
-                ),
-                const SizedBox(height: 10),
-                GroupInviteActionButtons(
-                  groupId: groupId,
-                  groupName: groupName,
-                  inviteCode: inviteCode,
-                  isAdmin: isCurrentAdmin,
-                ),
-                const SizedBox(height: 10),
-                InviteActionButton(
-                  text: '🚪 Abandonar grupo',
-                  variant: InviteActionButtonVariant.outline,
-                  onTap: () => _leaveGroup(context),
+                const SizedBox(height: 28),
+                GroupOptionsSection(
+                  rows: [
+                    GroupOptionRow(
+                      icon: GroupOptionIconKind.leave,
+                      title: 'Salir',
+                      destructive: true,
+                      onTap: () => _leaveGroup(context),
+                    ),
+                  ],
                 ),
               ],
             );
           },
         );
       },
+    );
+  }
+}
+
+class GroupNameEditDialog extends StatefulWidget {
+  final String initialName;
+
+  const GroupNameEditDialog({super.key, required this.initialName});
+
+  @override
+  State<GroupNameEditDialog> createState() => _GroupNameEditDialogState();
+}
+
+class _GroupNameEditDialogState extends State<GroupNameEditDialog> {
+  late final TextEditingController _controller;
+  late final FocusNode _focusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(
+      text: formatGroupDisplayName(widget.initialName),
+    );
+    _focusNode = FocusNode();
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _close([String? result]) {
+    _focusNode.unfocus();
+    Navigator.of(context).pop(result);
+  }
+
+  void _save() {
+    final nextName = _controller.text.trim();
+    if (nextName.isEmpty) return;
+    _close(nextName);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: Colors.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+      title: const Text('Cambiar nombre del grupo'),
+      content: TextField(
+        controller: _controller,
+        focusNode: _focusNode,
+        autofocus: true,
+        textCapitalization: TextCapitalization.sentences,
+        textInputAction: TextInputAction.done,
+        onSubmitted: (_) => _save(),
+        decoration: const InputDecoration(hintText: 'Nombre del grupo'),
+      ),
+      actions: [
+        TextButton(onPressed: () => _close(), child: const Text('Cancelar')),
+        TextButton(onPressed: _save, child: const Text('Guardar')),
+      ],
+    );
+  }
+}
+
+class GroupMemberNameEditDialog extends StatefulWidget {
+  final String initialName;
+
+  const GroupMemberNameEditDialog({super.key, required this.initialName});
+
+  @override
+  State<GroupMemberNameEditDialog> createState() =>
+      _GroupMemberNameEditDialogState();
+}
+
+class _GroupMemberNameEditDialogState extends State<GroupMemberNameEditDialog> {
+  late final TextEditingController _controller;
+  late final FocusNode _focusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(
+      text: formatUserDisplayName(widget.initialName),
+    );
+    _focusNode = FocusNode();
+  }
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _close([String? result]) {
+    _focusNode.unfocus();
+    Navigator.of(context).pop(result);
+  }
+
+  void _save() {
+    final nextName = _controller.text.trim();
+    if (nextName.isEmpty) return;
+    _close(nextName);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: Colors.white,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+      title: const Text('Cambiar nombre en este grupo'),
+      content: TextField(
+        controller: _controller,
+        focusNode: _focusNode,
+        autofocus: true,
+        maxLength: 80,
+        textCapitalization: TextCapitalization.words,
+        textInputAction: TextInputAction.done,
+        onSubmitted: (_) => _save(),
+        decoration: const InputDecoration(hintText: 'Tu nombre en este grupo'),
+      ),
+      actions: [
+        TextButton(onPressed: () => _close(), child: const Text('Cancelar')),
+        TextButton(onPressed: _save, child: const Text('Guardar')),
+      ],
     );
   }
 }
@@ -6267,6 +14232,56 @@ class MembersHtmlSectionLabel extends StatelessWidget {
         fontSize: 12,
         fontWeight: FontWeight.w900,
         letterSpacing: 1.1,
+      ),
+    );
+  }
+}
+
+class GroupInfoInlineRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String value;
+
+  const GroupInfoInlineRow({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: ssSeparator, width: 1.2),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: ssOrangeDark, size: 21),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: ssText2,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          Text(
+            value,
+            style: const TextStyle(
+              color: ssTitle,
+              fontSize: 14,
+              fontWeight: FontWeight.w900,
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -6295,6 +14310,8 @@ class MembersInlineEmptyText extends StatelessWidget {
 
 class GroupMemberHtmlRow extends StatelessWidget {
   final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
   final QueryDocumentSnapshot<Map<String, dynamic>> memberDoc;
   final bool posted;
   final bool currentUserIsAdmin;
@@ -6302,23 +14319,82 @@ class GroupMemberHtmlRow extends StatelessWidget {
   const GroupMemberHtmlRow({
     super.key,
     required this.groupId,
+    required this.groupName,
+    required this.groupPhotoUrl,
     required this.memberDoc,
     required this.posted,
     required this.currentUserIsAdmin,
   });
 
-  void _openActions(BuildContext context) {
-    final currentUid = FirebaseAuth.instance.currentUser?.uid;
-    if (memberDoc.id == currentUid) return;
-
+  void _openAdminActions(BuildContext context) {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
       builder: (_) => MemberActionsSheet(
         groupId: groupId,
+        groupName: groupName,
+        groupPhotoUrl: groupPhotoUrl,
         memberDoc: memberDoc,
         posted: posted,
-        currentUserIsAdmin: currentUserIsAdmin,
+        currentUserIsAdmin: true,
+        showReminderControls: false,
+        showSelfiesAction: true,
+      ),
+    );
+  }
+
+  void _openReminderActions(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => MemberActionsSheet(
+        groupId: groupId,
+        groupName: groupName,
+        groupPhotoUrl: groupPhotoUrl,
+        memberDoc: memberDoc,
+        posted: posted,
+        currentUserIsAdmin: false,
+        showReminderControls: true,
+        showSelfiesAction: false,
+      ),
+    );
+  }
+
+  void _openOwnActions(
+    BuildContext context, {
+    required String memberName,
+    required String? memberPhotoUrl,
+  }) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => OwnMemberGroupOptionsSheet(
+        groupId: groupId,
+        groupName: groupName,
+        groupPhotoUrl: groupPhotoUrl,
+        memberUid: memberDoc.id,
+        memberName: memberName,
+        memberPhotoUrl: memberPhotoUrl,
+      ),
+    );
+  }
+
+  void _openMemberSelfies(
+    BuildContext context, {
+    required String memberName,
+    required String? memberPhotoUrl,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GroupMemberSelfiesScreen(
+          groupId: groupId,
+          groupName: groupName,
+          groupPhotoUrl: groupPhotoUrl,
+          memberUid: memberDoc.id,
+          memberName: memberName,
+          memberPhotoUrl: memberPhotoUrl,
+        ),
       ),
     );
   }
@@ -6332,9 +14408,25 @@ class GroupMemberHtmlRow extends StatelessWidget {
     final photoUrl = data['effectivePhotoUrl'] as String?;
     final isAdmin = role == 'admin';
     final isMe = memberDoc.id == currentUid;
+    final showMissingPublicationStatus = debeMostrarMiembroSinPublicar(
+      posted: posted,
+    );
+    final showPublicationStatus = posted || showMissingPublicationStatus;
 
     return InkWell(
-      onTap: isMe ? null : () => _openActions(context),
+      onTap: isMe
+          ? () => _openOwnActions(
+              context,
+              memberName: name,
+              memberPhotoUrl: photoUrl,
+            )
+          : currentUserIsAdmin
+          ? () => _openAdminActions(context)
+          : () => _openMemberSelfies(
+              context,
+              memberName: name,
+              memberPhotoUrl: photoUrl,
+            ),
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 12),
         decoration: const BoxDecoration(
@@ -6351,15 +14443,31 @@ class GroupMemberHtmlRow extends StatelessWidget {
                   Row(
                     children: [
                       Flexible(
-                        child: Text(
-                          name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: ssText,
-                            fontSize: 15,
-                            fontWeight: FontWeight.w800,
-                            height: 1.2,
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: isMe
+                              ? () => _openOwnActions(
+                                  context,
+                                  memberName: name,
+                                  memberPhotoUrl: photoUrl,
+                                )
+                              : currentUserIsAdmin
+                              ? () => _openAdminActions(context)
+                              : () => _openMemberSelfies(
+                                  context,
+                                  memberName: name,
+                                  memberPhotoUrl: photoUrl,
+                                ),
+                          child: Text(
+                            name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: ssText,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w800,
+                              height: 1.2,
+                            ),
                           ),
                         ),
                       ),
@@ -6369,48 +14477,63 @@ class GroupMemberHtmlRow extends StatelessWidget {
                       ],
                     ],
                   ),
-                  const SizedBox(height: 4),
-                  Row(
-                    children: [
-                      Container(
-                        width: 7,
-                        height: 7,
-                        decoration: BoxDecoration(
-                          color: posted
-                              ? const Color(0xFFA8D8A8)
-                              : ssSeparator,
-                          shape: BoxShape.circle,
+                  if (showPublicationStatus) ...[
+                    const SizedBox(height: 4),
+                    Row(
+                      children: [
+                        Container(
+                          width: 7,
+                          height: 7,
+                          decoration: BoxDecoration(
+                            color: posted
+                                ? const Color(0xFFA8D8A8)
+                                : ssSeparator,
+                            shape: BoxShape.circle,
+                          ),
                         ),
-                      ),
-                      const SizedBox(width: 6),
-                      Text(
-                        posted ? 'Publicó esta semana' : 'Aún no ha publicado',
-                        style: TextStyle(
-                          color: posted ? const Color(0xFF4CAF50) : ssText3,
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
+                        const SizedBox(width: 6),
+                        Text(
+                          posted
+                              ? 'Publicó esta semana'
+                              : 'Aún no ha publicado',
+                          style: TextStyle(
+                            color: posted ? const Color(0xFF4CAF50) : ssText3,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
-                      ),
-                    ],
-                  ),
+                      ],
+                    ),
+                  ],
                 ],
               ),
             ),
             const SizedBox(width: 12),
             if (isMe)
-              const Text(
-                'Tú',
-                style: TextStyle(
-                  color: ssText3,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                ),
+              const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'Tú',
+                    style: TextStyle(
+                      color: ssText3,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  SizedBox(width: 5),
+                  Icon(Icons.edit_outlined, color: ssText3, size: 17),
+                ],
               )
-            else if (!posted)
-              ReminderInlineBadge(
-                groupId: groupId,
-                weekKey: obtenerWeekKeyActual(),
-                targetUid: memberDoc.id,
+            else if (!posted && esDomingo())
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => _openReminderActions(context),
+                child: ReminderInlineBadge(
+                  groupId: groupId,
+                  weekKey: obtenerWeekKeyActual(),
+                  targetUid: memberDoc.id,
+                ),
               )
             else
               const Icon(Icons.chevron_right_rounded, color: ssText3, size: 22),
@@ -6421,6 +14544,536 @@ class GroupMemberHtmlRow extends StatelessWidget {
   }
 }
 
+class GroupOptionsSection extends StatelessWidget {
+  final String? title;
+  final List<Widget> rows;
+
+  const GroupOptionsSection({super.key, this.title, required this.rows});
+
+  @override
+  Widget build(BuildContext context) {
+    if (rows.isEmpty) return const SizedBox.shrink();
+
+    final borderRadius = BorderRadius.circular(18);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (title != null) ...[
+          MembersHtmlSectionLabel(text: title!),
+          const SizedBox(height: 8),
+        ],
+        Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: borderRadius,
+            border: Border.all(color: ssBorder, width: 1.1),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.028),
+                blurRadius: 14,
+                offset: const Offset(0, 5),
+              ),
+            ],
+          ),
+          child: ClipRRect(
+            borderRadius: borderRadius,
+            child: Material(
+              color: Colors.transparent,
+              child: Column(
+                children: [
+                  for (var index = 0; index < rows.length; index++) ...[
+                    rows[index],
+                    if (index != rows.length - 1)
+                      const Divider(
+                        height: 1,
+                        thickness: 1,
+                        color: ssSeparator,
+                        indent: 76,
+                      ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+enum GroupOptionIconKind {
+  photo,
+  editName,
+  download,
+  invite,
+  code,
+  refresh,
+  leave,
+}
+
+class GroupOptionRow extends StatelessWidget {
+  final GroupOptionIconKind icon;
+  final String title;
+  final String? subtitle;
+  final String? trailingText;
+  final bool highlighted;
+  final bool destructive;
+  final VoidCallback onTap;
+
+  const GroupOptionRow({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.onTap,
+    this.subtitle,
+    this.trailingText,
+    this.highlighted = false,
+    this.destructive = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final dangerColor = const Color(0xFFD96558);
+    final titleColor = destructive
+        ? dangerColor
+        : highlighted
+        ? ssOrangeDark
+        : ssText;
+    final iconBackground = destructive
+        ? const Color(0xFFFFF5F3)
+        : highlighted
+        ? ssOrangeLight
+        : ssBg;
+    final iconBorderColor = destructive
+        ? const Color(0xFFF3C9C4)
+        : highlighted
+        ? ssOrangeMid
+        : ssBorder;
+    final iconColor = destructive ? dangerColor : ssOrangeDark;
+    final chevronColor = destructive ? dangerColor : ssText3;
+
+    return Semantics(
+      button: true,
+      child: InkWell(
+        onTap: onTap,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 64),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 9, 12, 9),
+            child: Row(
+              children: [
+                Container(
+                  width: 46,
+                  height: 46,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: iconBackground,
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(color: iconBorderColor, width: 1.1),
+                  ),
+                  child: GroupOptionLineIcon(icon: icon, color: iconColor),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: titleColor,
+                          fontSize: 15,
+                          height: 1.15,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      if (subtitle != null) ...[
+                        const SizedBox(height: 3),
+                        Text(
+                          subtitle!,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: ssText3,
+                            fontSize: 12,
+                            height: 1.2,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (trailingText != null) ...[
+                  const SizedBox(width: 10),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 112),
+                    child: Text(
+                      trailingText!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.right,
+                      style: const TextStyle(
+                        color: ssText3,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800,
+                        fontFeatures: [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(width: 6),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  color: chevronColor,
+                  size: 24,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class GroupOptionLineIcon extends StatelessWidget {
+  final GroupOptionIconKind icon;
+  final Color color;
+  final double size;
+
+  const GroupOptionLineIcon({
+    super.key,
+    required this.icon,
+    required this.color,
+    this.size = 30,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.square(
+      dimension: size,
+      child: CustomPaint(painter: _GroupOptionLineIconPainter(icon, color)),
+    );
+  }
+}
+
+class _GroupOptionLineIconPainter extends CustomPainter {
+  final GroupOptionIconKind icon;
+  final Color color;
+
+  const _GroupOptionLineIconPainter(this.icon, this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final side = size.shortestSide;
+    final offset = Offset((size.width - side) / 2, (size.height - side) / 2);
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 5.8
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+
+    canvas.save();
+    canvas.translate(offset.dx, offset.dy);
+    canvas.scale(side / 100);
+
+    switch (icon) {
+      case GroupOptionIconKind.photo:
+        _paintPhoto(canvas, paint);
+        break;
+      case GroupOptionIconKind.editName:
+        _paintPencil(canvas, paint);
+        break;
+      case GroupOptionIconKind.download:
+        _paintDownload(canvas, paint);
+        break;
+      case GroupOptionIconKind.invite:
+        _paintInvite(canvas, paint);
+        break;
+      case GroupOptionIconKind.code:
+        _paintKey(canvas, paint);
+        break;
+      case GroupOptionIconKind.refresh:
+        _paintRefresh(canvas, paint);
+        break;
+      case GroupOptionIconKind.leave:
+        _paintLeave(canvas, paint);
+        break;
+    }
+
+    canvas.restore();
+  }
+
+  void _paintPhoto(Canvas canvas, Paint paint) {
+    final frame = RRect.fromRectAndRadius(
+      const Rect.fromLTWH(14, 22, 72, 56),
+      const Radius.circular(11),
+    );
+    canvas.drawRRect(frame, paint);
+    canvas.drawCircle(const Offset(34, 40), 7, paint);
+
+    final mountains = Path()
+      ..moveTo(17, 70)
+      ..lineTo(37, 51)
+      ..lineTo(51, 64)
+      ..lineTo(64, 48)
+      ..lineTo(84, 68);
+    canvas.drawPath(mountains, paint);
+  }
+
+  void _paintPencil(Canvas canvas, Paint paint) {
+    final pencil = Path()
+      ..moveTo(23, 76)
+      ..lineTo(31, 55)
+      ..lineTo(69, 17)
+      ..quadraticBezierTo(75, 11, 81, 17)
+      ..lineTo(83, 19)
+      ..quadraticBezierTo(89, 25, 83, 31)
+      ..lineTo(45, 69)
+      ..close();
+    canvas.drawPath(pencil, paint);
+    canvas.drawLine(const Offset(67, 19), const Offset(81, 33), paint);
+    canvas.drawLine(const Offset(31, 55), const Offset(45, 69), paint);
+  }
+
+  void _paintDownload(Canvas canvas, Paint paint) {
+    canvas.drawLine(const Offset(50, 18), const Offset(50, 58), paint);
+
+    final arrow = Path()
+      ..moveTo(32, 42)
+      ..lineTo(50, 60)
+      ..lineTo(68, 42);
+    canvas.drawPath(arrow, paint);
+
+    final tray = Path()
+      ..moveTo(22, 62)
+      ..lineTo(22, 75)
+      ..quadraticBezierTo(22, 82, 29, 82)
+      ..lineTo(71, 82)
+      ..quadraticBezierTo(78, 82, 78, 75)
+      ..lineTo(78, 62);
+    canvas.drawPath(tray, paint);
+  }
+
+  void _paintInvite(Canvas canvas, Paint paint) {
+    final plane = Path()
+      ..moveTo(14, 42)
+      ..lineTo(86, 17)
+      ..lineTo(63, 82)
+      ..lineTo(49, 56)
+      ..close();
+    canvas.drawPath(plane, paint);
+    canvas.drawLine(const Offset(49, 56), const Offset(86, 17), paint);
+  }
+
+  void _paintKey(Canvas canvas, Paint paint) {
+    canvas.drawCircle(const Offset(34, 60), 13, paint);
+    canvas.drawLine(const Offset(45, 51), const Offset(77, 19), paint);
+    canvas.drawLine(const Offset(62, 34), const Offset(74, 46), paint);
+    canvas.drawLine(const Offset(70, 26), const Offset(82, 38), paint);
+  }
+
+  void _paintRefresh(Canvas canvas, Paint paint) {
+    canvas.drawArc(
+      const Rect.fromLTWH(24, 24, 52, 52),
+      -math.pi * 0.18,
+      math.pi * 1.55,
+      false,
+      paint,
+    );
+
+    final arrowHead = Path()
+      ..moveTo(70, 28)
+      ..lineTo(81, 24)
+      ..lineTo(79, 36);
+    canvas.drawPath(arrowHead, paint);
+  }
+
+  void _paintLeave(Canvas canvas, Paint paint) {
+    final door = Path()
+      ..moveTo(43, 20)
+      ..lineTo(27, 20)
+      ..quadraticBezierTo(19, 20, 19, 28)
+      ..lineTo(19, 72)
+      ..quadraticBezierTo(19, 80, 27, 80)
+      ..lineTo(43, 80);
+    canvas.drawPath(door, paint);
+
+    canvas.drawLine(const Offset(45, 50), const Offset(84, 50), paint);
+    final arrow = Path()
+      ..moveTo(68, 34)
+      ..lineTo(84, 50)
+      ..lineTo(68, 66);
+    canvas.drawPath(arrow, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _GroupOptionLineIconPainter oldDelegate) {
+    return oldDelegate.icon != icon || oldDelegate.color != color;
+  }
+}
+
+class OwnMemberGroupOptionsSheet extends StatefulWidget {
+  final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
+  final String memberUid;
+  final String memberName;
+  final String? memberPhotoUrl;
+
+  const OwnMemberGroupOptionsSheet({
+    super.key,
+    required this.groupId,
+    required this.groupName,
+    required this.groupPhotoUrl,
+    required this.memberUid,
+    required this.memberName,
+    required this.memberPhotoUrl,
+  });
+
+  @override
+  State<OwnMemberGroupOptionsSheet> createState() =>
+      _OwnMemberGroupOptionsSheetState();
+}
+
+class _OwnMemberGroupOptionsSheetState
+    extends State<OwnMemberGroupOptionsSheet> {
+  bool saving = false;
+
+  Future<void> _changeName() async {
+    if (saving) return;
+
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (_) => GroupMemberNameEditDialog(initialName: widget.memberName),
+    );
+
+    if (newName == null || newName.trim().isEmpty) return;
+
+    final trimmedName = newName.trim();
+    if (trimmedName == widget.memberName.trim()) return;
+
+    setState(() => saving = true);
+
+    try {
+      await actualizarNombreEnGrupo(
+        groupId: widget.groupId,
+        newName: trimmedName,
+      );
+
+      if (!mounted) return;
+      Navigator.pop(context);
+      showSundaySnack(context, 'Nombre actualizado sólo en este grupo');
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error actualizando nombre: $error');
+    } finally {
+      if (mounted) setState(() => saving = false);
+    }
+  }
+
+  void _openSelfies() {
+    final navigator = Navigator.of(context);
+    navigator.pop();
+    navigator.push(
+      MaterialPageRoute(
+        builder: (_) => GroupMemberSelfiesScreen(
+          groupId: widget.groupId,
+          groupName: widget.groupName,
+          groupPhotoUrl: widget.groupPhotoUrl,
+          memberUid: widget.memberUid,
+          memberName: widget.memberName,
+          memberPhotoUrl: widget.memberPhotoUrl,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      top: false,
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(24, 20, 24, 32),
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 20),
+                decoration: BoxDecoration(
+                  color: ssBorder,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+            ),
+            Row(
+              children: [
+                MembersInitialAvatar(
+                  name: widget.memberName,
+                  photoUrl: widget.memberPhotoUrl,
+                  size: 44,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        widget.memberName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: ssText,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w900,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      const Text(
+                        'Tu nombre dentro de este grupo',
+                        style: TextStyle(
+                          color: ssText3,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 18),
+            InviteActionButton(
+              text: saving ? 'Guardando...' : 'Cambiar nombre en este grupo',
+              variant: InviteActionButtonVariant.primary,
+              onTap: saving ? () {} : _changeName,
+            ),
+            const SizedBox(height: 8),
+            InviteActionButton(
+              text: 'Ver mis selfies en este grupo',
+              variant: InviteActionButtonVariant.secondary,
+              onTap: _openSelfies,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
 
 class ReminderInlineBadge extends StatelessWidget {
   final String groupId;
@@ -6442,18 +15095,19 @@ class ReminderInlineBadge extends StatelessWidget {
       return const Icon(Icons.chevron_right_rounded, color: ssText3, size: 22);
     }
 
-    final reminderRef = FirebaseFirestore.instance
+    final targetRemindersRef = FirebaseFirestore.instance
         .collection('groups')
         .doc(groupId)
         .collection('weeks')
         .doc(weekKey)
         .collection('reminders')
-        .doc('${currentUid}_$targetUid');
+        .where('targetUid', isEqualTo: targetUid)
+        .limit(1);
 
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: reminderRef.snapshots(),
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: targetRemindersRef.snapshots(),
       builder: (context, snapshot) {
-        final sent = snapshot.data?.exists ?? false;
+        final sent = snapshot.data?.docs.isNotEmpty ?? false;
 
         if (sent) {
           return Container(
@@ -6464,7 +15118,7 @@ class ReminderInlineBadge extends StatelessWidget {
               border: Border.all(color: ssOrangeMid),
             ),
             child: const Text(
-              'Recordatorio\nenviado',
+              'Zumbido\nenviado',
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: ssOrangeDark,
@@ -6597,10 +15251,7 @@ class GroupJoinRequestsInlineSection extends StatelessWidget {
 class GroupBlockedUsersInlineSection extends StatelessWidget {
   final String groupId;
 
-  const GroupBlockedUsersInlineSection({
-    super.key,
-    required this.groupId,
-  });
+  const GroupBlockedUsersInlineSection({super.key, required this.groupId});
 
   @override
   Widget build(BuildContext context) {
@@ -6622,7 +15273,9 @@ class GroupBlockedUsersInlineSection extends StatelessWidget {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            MembersHtmlSectionLabel(text: 'EXPULSADOS — ${blockedUsers.length}'),
+            MembersHtmlSectionLabel(
+              text: 'EXPULSADOS — ${blockedUsers.length}',
+            ),
             const SizedBox(height: 8),
             ...blockedUsers.map(
               (doc) => GroupBlockedUserHtmlRow(
@@ -6641,10 +15294,7 @@ class GroupBlockedUsersInlineSection extends StatelessWidget {
 class GroupModerationReportsInlineSection extends StatefulWidget {
   final String groupId;
 
-  const GroupModerationReportsInlineSection({
-    super.key,
-    required this.groupId,
-  });
+  const GroupModerationReportsInlineSection({super.key, required this.groupId});
 
   @override
   State<GroupModerationReportsInlineSection> createState() =>
@@ -6666,7 +15316,9 @@ class _GroupModerationReportsInlineSectionState
   }
 
   @override
-  void didUpdateWidget(covariant GroupModerationReportsInlineSection oldWidget) {
+  void didUpdateWidget(
+    covariant GroupModerationReportsInlineSection oldWidget,
+  ) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.groupId != widget.groupId) {
       _loadReports();
@@ -6760,10 +15412,7 @@ class _GroupModerationReportsInlineSectionState
     return confirmed == true;
   }
 
-  Future<void> _resolveReport(
-    ModerationReport report,
-    String decision,
-  ) async {
+  Future<void> _resolveReport(ModerationReport report, String decision) async {
     if (resolvingReportId != null) return;
 
     if (decision == kModerationDecisionRemoveSelfie) {
@@ -6777,10 +15426,7 @@ class _GroupModerationReportsInlineSectionState
     });
 
     try {
-      await resolverReporteGrupo(
-        reportId: report.reportId,
-        decision: decision,
-      );
+      await resolverReporteGrupo(reportId: report.reportId, decision: decision);
 
       if (!mounted) return;
       showSundaySnack(
@@ -6873,14 +15519,9 @@ class _GroupModerationReportsInlineSectionState
             busy: busy,
             resolvingDecision: busy ? resolvingDecision : null,
             onOpen: () => _openReport(report),
-            onDismiss: () => _resolveReport(
-              report,
-              kModerationDecisionDismiss,
-            ),
-            onRemove: () => _resolveReport(
-              report,
-              kModerationDecisionRemoveSelfie,
-            ),
+            onDismiss: () => _resolveReport(report, kModerationDecisionDismiss),
+            onRemove: () =>
+                _resolveReport(report, kModerationDecisionRemoveSelfie),
           );
         }),
         const SizedBox(height: 22),
@@ -6943,10 +15584,11 @@ class GroupModerationReportCard extends StatelessWidget {
                     height: 58,
                     color: ssOrangeLight,
                     child: report.postExists && report.thumbUrl.isNotEmpty
-                        ? Image.network(
-                            report.thumbUrl,
+                        ? CachedRemoteImage(
+                            imageUrl: report.thumbUrl,
+                            cacheVariant: 'thumbnail',
                             fit: BoxFit.cover,
-                            errorBuilder: (_, _, _) => const Icon(
+                            errorWidget: const Icon(
                               Icons.broken_image_outlined,
                               color: ssOrangeDark,
                             ),
@@ -7035,9 +15677,7 @@ class GroupModerationReportCard extends StatelessWidget {
                     ),
                   ),
                   child: Text(
-                    busy &&
-                            resolvingDecision ==
-                                kModerationDecisionRemoveSelfie
+                    busy && resolvingDecision == kModerationDecisionRemoveSelfie
                         ? 'Retirando...'
                         : 'Retirar',
                   ),
@@ -7062,7 +15702,8 @@ class GroupBlockedUserHtmlRow extends StatefulWidget {
   });
 
   @override
-  State<GroupBlockedUserHtmlRow> createState() => _GroupBlockedUserHtmlRowState();
+  State<GroupBlockedUserHtmlRow> createState() =>
+      _GroupBlockedUserHtmlRowState();
 }
 
 class _GroupBlockedUserHtmlRowState extends State<GroupBlockedUserHtmlRow> {
@@ -7160,7 +15801,8 @@ class GroupJoinRequestHtmlRow extends StatefulWidget {
   });
 
   @override
-  State<GroupJoinRequestHtmlRow> createState() => _GroupJoinRequestHtmlRowState();
+  State<GroupJoinRequestHtmlRow> createState() =>
+      _GroupJoinRequestHtmlRowState();
 }
 
 class _GroupJoinRequestHtmlRowState extends State<GroupJoinRequestHtmlRow> {
@@ -7216,7 +15858,8 @@ class _GroupJoinRequestHtmlRowState extends State<GroupJoinRequestHtmlRow> {
     final data = widget.requestDoc.data();
     final requestName = (data['baseName'] ?? 'Usuario').toString();
     final rawRequestPhoto = data['basePhotoUrl'];
-    final requestPhoto = rawRequestPhoto is String && rawRequestPhoto.trim().isNotEmpty
+    final requestPhoto =
+        rawRequestPhoto is String && rawRequestPhoto.trim().isNotEmpty
         ? rawRequestPhoto.trim()
         : null;
 
@@ -7227,7 +15870,11 @@ class _GroupJoinRequestHtmlRowState extends State<GroupJoinRequestHtmlRow> {
       ),
       child: Row(
         children: [
-          MembersInitialAvatar(name: requestName, photoUrl: requestPhoto, size: 44),
+          MembersInitialAvatar(
+            name: requestName,
+            photoUrl: requestPhoto,
+            size: 44,
+          ),
           const SizedBox(width: 14),
           Expanded(
             child: Text(
@@ -7294,7 +15941,10 @@ class GroupInviteActionButtons extends StatelessWidget {
 
   Future<void> _regenerateInvite(BuildContext context) async {
     if (!isAdmin) {
-      showSundaySnack(context, 'Solo los administradores pueden regenerar el código');
+      showSundaySnack(
+        context,
+        'Solo los administradores pueden regenerar el código',
+      );
       return;
     }
 
@@ -7636,16 +16286,24 @@ class InviteSheetButton extends StatelessWidget {
 
 class MemberActionsSheet extends StatefulWidget {
   final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
   final QueryDocumentSnapshot<Map<String, dynamic>> memberDoc;
   final bool posted;
   final bool currentUserIsAdmin;
+  final bool showReminderControls;
+  final bool showSelfiesAction;
 
   const MemberActionsSheet({
     super.key,
     required this.groupId,
+    required this.groupName,
+    required this.groupPhotoUrl,
     required this.memberDoc,
     required this.posted,
     required this.currentUserIsAdmin,
+    this.showReminderControls = true,
+    this.showSelfiesAction = false,
   });
 
   @override
@@ -7654,6 +16312,8 @@ class MemberActionsSheet extends StatefulWidget {
 
 class _MemberActionsSheetState extends State<MemberActionsSheet> {
   bool sendingReminder = false;
+  bool preparingExtraReminder = false;
+  bool extraReminderUnlocked = false;
 
   Future<void> _sendReminder() async {
     if (sendingReminder) return;
@@ -7664,16 +16324,36 @@ class _MemberActionsSheetState extends State<MemberActionsSheet> {
       await enviarZumbidoSelfie(
         groupId: widget.groupId,
         targetUid: widget.memberDoc.id,
+        rewardedAdWatched: extraReminderUnlocked,
       );
 
       if (!mounted) return;
       Navigator.pop(context);
-      showSundaySnack(context, 'Recordatorio enviado');
+      showSundaySnack(context, 'Zumbido enviado');
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'Error: $error');
     } finally {
       if (mounted) setState(() => sendingReminder = false);
+    }
+  }
+
+  Future<void> _prepareExtraReminder() async {
+    if (preparingExtraReminder) return;
+
+    setState(() => preparingExtraReminder = true);
+
+    try {
+      final unlocked = await prepararZumbidoExtraConAnuncio(context);
+      if (!mounted) return;
+      if (unlocked) {
+        setState(() => extraReminderUnlocked = true);
+      }
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error: $error');
+    } finally {
+      if (mounted) setState(() => preparingExtraReminder = false);
     }
   }
 
@@ -7727,13 +16407,42 @@ class _MemberActionsSheetState extends State<MemberActionsSheet> {
     }
   }
 
+  void _openSelfies(String name, String? photoUrl) {
+    final navigator = Navigator.of(context);
+    navigator.pop();
+    navigator.push(
+      MaterialPageRoute(
+        builder: (_) => GroupMemberSelfiesScreen(
+          groupId: widget.groupId,
+          groupName: widget.groupName,
+          groupPhotoUrl: widget.groupPhotoUrl,
+          memberUid: widget.memberDoc.id,
+          memberName: name,
+          memberPhotoUrl: photoUrl,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
     final data = widget.memberDoc.data();
     final name = formatUserDisplayName(data['effectiveName'] ?? 'Usuario');
     final photoUrl = data['effectivePhotoUrl'] as String?;
     final role = (data['role'] ?? 'member').toString();
     final isAdmin = role == 'admin';
+    final currentUid = FirebaseAuth.instance.currentUser?.uid;
+    final showReminderSection =
+        widget.showReminderControls && (widget.posted || esDomingo());
+    final targetRemindersRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(widget.groupId)
+        .collection('weeks')
+        .doc(obtenerWeekKeyActual())
+        .collection('reminders')
+        .where('targetUid', isEqualTo: widget.memberDoc.id)
+        .limit(1);
 
     return SafeArea(
       top: false,
@@ -7791,89 +16500,108 @@ class _MemberActionsSheetState extends State<MemberActionsSheet> {
               ],
             ),
             const SizedBox(height: 16),
-            if (!widget.posted && esDomingo()) ...[
-              InviteActionButton(
-                text: sendingReminder
-                    ? '🔔 Enviando zumbido...'
-                    : '🔔 Enviar zumbido',
-                variant: InviteActionButtonVariant.primary,
-                onTap: sendingReminder ? () {} : _sendReminder,
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'Le recordaremos que todavía falta su Sunday Selfie de esta semana.',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: ssText3,
-                  fontSize: 12,
-                  height: 1.35,
-                  fontWeight: FontWeight.w600,
+            if (showReminderSection) ...[
+              if (!widget.posted && esDomingo()) ...[
+                if (currentUid == null)
+                  const SizedBox.shrink()
+                else
+                  StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                    stream: targetRemindersRef.snapshots(),
+                    builder: (context, snapshot) {
+                      final targetAlreadyReminded =
+                          snapshot.data?.docs.isNotEmpty ?? false;
+                      final needsAd =
+                          targetAlreadyReminded && !extraReminderUnlocked;
+                      final busy = sendingReminder || preparingExtraReminder;
+
+                      return InviteActionButton(
+                        text: busy
+                            ? preparingExtraReminder
+                                  ? 'Cargando anuncio...'
+                                  : 'Enviando zumbido...'
+                            : needsAd
+                            ? 'Zumbido enviado'
+                            : 'Enviar zumbido',
+                        variant: needsAd && !busy
+                            ? InviteActionButtonVariant.secondary
+                            : InviteActionButtonVariant.primary,
+                        onTap: busy
+                            ? () {}
+                            : needsAd
+                            ? _prepareExtraReminder
+                            : _sendReminder,
+                      );
+                    },
+                  ),
+                const SizedBox(height: 8),
+                Text(
+                  extraReminderUnlocked
+                      ? 'El anuncio ya terminó. Puedes enviar otro zumbido.'
+                      : 'Le recordaremos que todavía falta su Sunday Selfie de esta semana.',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: ssText3,
+                    fontSize: 12,
+                    height: 1.35,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 16),
-            ] else if (!widget.posted) ...[
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                decoration: BoxDecoration(
-                  color: ssOrangeLight,
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: ssOrangeMid),
-                ),
-                child: const Row(
-                  children: [
-                    Icon(Icons.event_rounded, color: ssOrangeDark, size: 20),
-                    SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        'Los recordatorios solo están disponibles los domingos',
-                        style: TextStyle(
-                          color: ssOrangeDark,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w800,
+                const SizedBox(height: 16),
+              ] else if (widget.posted) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 12,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFF2FAF2),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: const Color(0xFFD8EED8)),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(
+                        Icons.check_circle_outline_rounded,
+                        color: Color(0xFF4CAF50),
+                        size: 20,
+                      ),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Ya publicó esta semana',
+                          style: TextStyle(
+                            color: Color(0xFF4CAF50),
+                            fontSize: 13,
+                            fontWeight: FontWeight.w800,
+                          ),
                         ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
-              ),
-              const SizedBox(height: 16),
-            ] else ...[
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFF2FAF2),
-                  borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: const Color(0xFFD8EED8)),
-                ),
-                child: const Row(
-                  children: [
-                    Icon(Icons.check_circle_outline_rounded,
-                        color: Color(0xFF4CAF50), size: 20),
-                    SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        'Ya publicó esta semana',
-                        style: TextStyle(
-                          color: Color(0xFF4CAF50),
-                          fontSize: 13,
-                          fontWeight: FontWeight.w800,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+                const SizedBox(height: 16),
+              ],
+              const Divider(height: 1, color: ssBorder),
               const SizedBox(height: 16),
             ],
-            const Divider(height: 1, color: ssBorder),
-            const SizedBox(height: 16),
+            if (widget.showSelfiesAction)
+              InviteActionButton(
+                text: 'Ver sus selfies en este grupo',
+                variant: InviteActionButtonVariant.primary,
+                onTap: () => _openSelfies(name, photoUrl),
+              ),
+            if (widget.showSelfiesAction &&
+                widget.currentUserIsAdmin &&
+                !isAdmin)
+              const SizedBox(height: 8),
             if (widget.currentUserIsAdmin && !isAdmin)
               InviteActionButton(
                 text: '⬆️ Hacer administrador',
                 variant: InviteActionButtonVariant.secondary,
                 onTap: () => _makeAdmin(name),
               ),
-            if (widget.currentUserIsAdmin && !isAdmin) const SizedBox(height: 8),
+            if (widget.currentUserIsAdmin && !isAdmin)
+              const SizedBox(height: 8),
             if (widget.currentUserIsAdmin && !isAdmin)
               InviteActionButton(
                 text: '🚫 Expulsar del grupo',
@@ -7885,13 +16613,6 @@ class _MemberActionsSheetState extends State<MemberActionsSheet> {
       ),
     );
   }
-}
-
-String shortGroupHeaderTitle(String groupName) {
-  final clean = cleanGroupDisplayName(groupName);
-  final parts = clean.split(RegExp(r'\s+')).where((p) => p.trim().isNotEmpty);
-  final short = parts.take(2).join(' ');
-  return short.isEmpty ? 'Grupo' : short;
 }
 
 Color memberAvatarColor(String seed) {
@@ -7910,19 +16631,65 @@ Color memberAvatarColor(String seed) {
   return colors[value % colors.length];
 }
 
-class GroupPostsGrid extends StatelessWidget {
+class GroupPostsGrid extends StatefulWidget {
   final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
   final String weekKey;
 
   const GroupPostsGrid({
     super.key,
     required this.groupId,
+    required this.groupName,
+    required this.groupPhotoUrl,
     required this.weekKey,
   });
 
   @override
+  State<GroupPostsGrid> createState() => _GroupPostsGridState();
+}
+
+class _GroupPostsGridState extends State<GroupPostsGrid> {
+  Stream<QuerySnapshot<Map<String, dynamic>>>? postsStream;
+  Stream<QuerySnapshot<Map<String, dynamic>>>? membersStream;
+
+  @override
+  void initState() {
+    super.initState();
+    configureStreams();
+  }
+
+  @override
+  void didUpdateWidget(covariant GroupPostsGrid oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.groupId != widget.groupId ||
+        oldWidget.weekKey != widget.weekKey) {
+      configureStreams();
+    }
+  }
+
+  void configureStreams() {
+    if (widget.weekKey.isEmpty) {
+      postsStream = null;
+      membersStream = null;
+      return;
+    }
+
+    final groupRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(widget.groupId);
+    postsStream = groupRef
+        .collection('weeks')
+        .doc(widget.weekKey)
+        .collection('posts')
+        .orderBy('updatedAt', descending: true)
+        .snapshots();
+    membersStream = groupRef.collection('members').orderBy('role').snapshots();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    if (weekKey.isEmpty) {
+    if (widget.weekKey.isEmpty) {
       return const Center(
         child: Padding(
           padding: EdgeInsets.all(24),
@@ -7939,19 +16706,15 @@ class GroupPostsGrid extends StatelessWidget {
       );
     }
 
-    final groupRef = FirebaseFirestore.instance
-        .collection('groups')
-        .doc(groupId);
-    final postsRef = groupRef
-        .collection('weeks')
-        .doc(weekKey)
-        .collection('posts')
-        .orderBy('updatedAt', descending: true);
+    final currentPostsStream = postsStream;
+    final currentMembersStream = membersStream;
 
-    final membersRef = groupRef.collection('members').orderBy('role');
+    if (currentPostsStream == null || currentMembersStream == null) {
+      return const SizedBox.shrink();
+    }
 
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: postsRef.snapshots(),
+      stream: currentPostsStream,
       builder: (context, postsSnapshot) {
         if (postsSnapshot.connectionState == ConnectionState.waiting) {
           return const Center(
@@ -7972,10 +16735,13 @@ class GroupPostsGrid extends StatelessWidget {
         }
 
         final postDocs = postsSnapshot.data?.docs ?? [];
+        for (final postDoc in postDocs) {
+          prefetchPostPhotoCache(postDoc.data(), includeOriginal: true);
+        }
         final postedUids = postDocs.map((d) => d.id).toSet();
 
         return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-          stream: membersRef.snapshots(),
+          stream: currentMembersStream,
           builder: (context, membersSnapshot) {
             final memberDocs = membersSnapshot.data?.docs ?? [];
             final missingMembers = memberDocs
@@ -7999,8 +16765,10 @@ class GroupPostsGrid extends StatelessWidget {
                         final doc = postDocs[index];
                         final post = doc.data();
                         return SelfieTile(
-                          groupId: groupId,
-                          weekKey: weekKey,
+                          groupId: widget.groupId,
+                          groupName: widget.groupName,
+                          groupPhotoUrl: widget.groupPhotoUrl,
+                          weekKey: widget.weekKey,
                           postUid: doc.id,
                           post: post,
                           onTap: () {
@@ -8008,15 +16776,19 @@ class GroupPostsGrid extends StatelessWidget {
                               context,
                               MaterialPageRoute(
                                 builder: (_) => SelfieFullScreen(
-                                  groupId: groupId,
-                                  weekKey: weekKey,
+                                  groupId: widget.groupId,
+                                  groupName: widget.groupName,
+                                  groupPhotoUrl: widget.groupPhotoUrl,
+                                  weekKey: widget.weekKey,
                                   postUid: doc.id,
                                   post: post,
                                   initialIndex: index,
                                   galleryEntries: postDocs.map((postDoc) {
                                     return SelfieViewerEntry(
-                                      groupId: groupId,
-                                      weekKey: weekKey,
+                                      groupId: widget.groupId,
+                                      groupName: widget.groupName,
+                                      groupPhotoUrl: widget.groupPhotoUrl,
+                                      weekKey: widget.weekKey,
                                       postUid: postDoc.id,
                                       post: postDoc.data(),
                                     );
@@ -8028,16 +16800,22 @@ class GroupPostsGrid extends StatelessWidget {
                         );
                       }
 
-                      final missingDoc = missingMembers[index - postDocs.length];
+                      final missingDoc =
+                          missingMembers[index - postDocs.length];
                       final missing = missingDoc.data();
-                      final name = formatUserDisplayName(missing['effectiveName'] ?? 'Usuario');
+                      final name = formatUserDisplayName(
+                        missing['effectiveName'] ?? 'Usuario',
+                      );
                       final photoUrl = missing['effectivePhotoUrl'] as String?;
                       return MissingSelfieTile(
-                        groupId: groupId,
-                        weekKey: weekKey,
+                        groupId: widget.groupId,
+                        groupName: widget.groupName,
+                        groupPhotoUrl: widget.groupPhotoUrl,
+                        weekKey: widget.weekKey,
                         targetUid: missingDoc.id,
                         name: name,
                         photoUrl: photoUrl,
+                        joinedAt: missing['joinedAt'],
                       );
                     }, childCount: postDocs.length + missingMembers.length),
                   ),
@@ -8051,10 +16829,276 @@ class GroupPostsGrid extends StatelessWidget {
   }
 }
 
+class GroupPublishedSelfieEntry {
+  final String weekKey;
+  final String postUid;
+  final Map<String, dynamic> post;
+
+  const GroupPublishedSelfieEntry({
+    required this.weekKey,
+    required this.postUid,
+    required this.post,
+  });
+
+  DateTime? get publishedAt =>
+      timestampToDate(post['updatedAt']) ?? timestampToDate(post['createdAt']);
+
+  SelfieViewerEntry toViewerEntry({
+    required String groupId,
+    required String groupName,
+    required String? groupPhotoUrl,
+  }) {
+    return SelfieViewerEntry(
+      groupId: groupId,
+      groupName: groupName,
+      groupPhotoUrl: groupPhotoUrl,
+      weekKey: weekKey,
+      postUid: postUid,
+      post: post,
+    );
+  }
+}
+
+int compareGroupPublishedSelfiesNewest(
+  GroupPublishedSelfieEntry a,
+  GroupPublishedSelfieEntry b,
+) {
+  final dateA = a.publishedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+  final dateB = b.publishedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+  final dateCompare = dateB.compareTo(dateA);
+  if (dateCompare != 0) return dateCompare;
+
+  final weekCompare = (_weekKeyOrderValue(b.weekKey) ?? 0).compareTo(
+    _weekKeyOrderValue(a.weekKey) ?? 0,
+  );
+  if (weekCompare != 0) return weekCompare;
+
+  return a.postUid.compareTo(b.postUid);
+}
+
+class GroupAllPostsGrid extends StatefulWidget {
+  final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
+  final List<String> weekKeys;
+  final String reloadSignature;
+
+  const GroupAllPostsGrid({
+    super.key,
+    required this.groupId,
+    required this.groupName,
+    required this.groupPhotoUrl,
+    required this.weekKeys,
+    required this.reloadSignature,
+  });
+
+  @override
+  State<GroupAllPostsGrid> createState() => _GroupAllPostsGridState();
+}
+
+class _GroupAllPostsGridState extends State<GroupAllPostsGrid> {
+  late Future<List<GroupPublishedSelfieEntry>> postsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    configureFuture();
+  }
+
+  @override
+  void didUpdateWidget(covariant GroupAllPostsGrid oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.groupId != widget.groupId ||
+        oldWidget.reloadSignature != widget.reloadSignature ||
+        !listEquals(oldWidget.weekKeys, widget.weekKeys)) {
+      configureFuture();
+    }
+  }
+
+  void configureFuture() {
+    postsFuture = _loadPublishedPosts();
+  }
+
+  Future<List<GroupPublishedSelfieEntry>> _loadPublishedPosts() async {
+    if (widget.weekKeys.isEmpty) return const [];
+
+    final groupRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(widget.groupId);
+    final entries = <GroupPublishedSelfieEntry>[];
+
+    for (final weekKey in widget.weekKeys) {
+      try {
+        final postsSnapshot = await groupRef
+            .collection('weeks')
+            .doc(weekKey)
+            .collection('posts')
+            .get();
+
+        for (final postDoc in postsSnapshot.docs) {
+          final post = postDoc.data();
+          prefetchPostPhotoCache(post, includeOriginal: true);
+          entries.add(
+            GroupPublishedSelfieEntry(
+              weekKey: weekKey,
+              postUid: postDoc.id,
+              post: post,
+            ),
+          );
+        }
+      } catch (error) {
+        logDebug('No se pudieron cargar selfies de $weekKey: $error');
+      }
+    }
+
+    entries.sort(compareGroupPublishedSelfiesNewest);
+    return entries;
+  }
+
+  void _openSelfie(
+    BuildContext context,
+    GroupPublishedSelfieEntry entry,
+    List<GroupPublishedSelfieEntry> entries,
+  ) {
+    final initialIndex = entries.indexWhere(
+      (candidate) =>
+          candidate.weekKey == entry.weekKey &&
+          candidate.postUid == entry.postUid,
+    );
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SelfieFullScreen(
+          groupId: widget.groupId,
+          groupName: widget.groupName,
+          groupPhotoUrl: widget.groupPhotoUrl,
+          weekKey: entry.weekKey,
+          postUid: entry.postUid,
+          post: entry.post,
+          initialIndex: initialIndex < 0 ? 0 : initialIndex,
+          galleryEntries: entries
+              .map(
+                (candidate) => candidate.toViewerEntry(
+                  groupId: widget.groupId,
+                  groupName: widget.groupName,
+                  groupPhotoUrl: widget.groupPhotoUrl,
+                ),
+              )
+              .toList(),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<List<GroupPublishedSelfieEntry>>(
+      future: postsFuture,
+      builder: (context, snapshot) {
+        final loading = snapshot.connectionState == ConnectionState.waiting;
+
+        if (loading) {
+          return const Center(
+            child: CircularProgressIndicator(color: ssOrange),
+          );
+        }
+
+        if (snapshot.hasError) {
+          return Center(
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Text(
+                'Error cargando selfies: ${snapshot.error}',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          );
+        }
+
+        final entries = snapshot.data ?? const <GroupPublishedSelfieEntry>[];
+        if (entries.isEmpty) {
+          return const Center(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                'Aún no hay selfies publicados en este grupo.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: ssText3,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          );
+        }
+
+        return CustomScrollView(
+          slivers: [
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+              sliver: SliverGrid(
+                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                  crossAxisCount: 2,
+                  mainAxisSpacing: 12,
+                  crossAxisSpacing: 12,
+                  childAspectRatio: 0.56,
+                ),
+                delegate: SliverChildBuilderDelegate((context, index) {
+                  final entry = entries[index];
+                  return SelfieTile(
+                    groupId: widget.groupId,
+                    groupName: widget.groupName,
+                    groupPhotoUrl: widget.groupPhotoUrl,
+                    weekKey: entry.weekKey,
+                    postUid: entry.postUid,
+                    post: entry.post,
+                    onTap: () => _openSelfie(context, entry, entries),
+                  );
+                }, childCount: entries.length),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+const double kGroupWeekSelectorKeyboardReserveHeight = 33.0;
+const double kWeeklyChatCollapsedSlotHeight = 60.0;
+const Duration kWeeklyChatPanelAnimationDuration = Duration(milliseconds: 240);
+const Curve kWeeklyChatPanelAnimationCurve = Curves.easeOutCubic;
+const double kWeeklyChatDragDismissDistance = 24.0;
+const double kWeeklyChatDragDismissVelocity = 320.0;
+
+double resolverAlturaPanelChatSemanal({
+  required double screenHeight,
+  required bool keyboardOpen,
+  required bool canWrite,
+  double? maxExpandedHeight,
+}) {
+  final targetHeight = math.min(
+    screenHeight * (keyboardOpen ? 0.34 : 0.43),
+    keyboardOpen ? 292.0 : (canWrite ? 356.0 : 326.0),
+  );
+
+  final availableHeight = maxExpandedHeight;
+  if (availableHeight == null || !availableHeight.isFinite) {
+    return targetHeight;
+  }
+
+  return math.max(0.0, math.min(targetHeight, availableHeight));
+}
+
 class WeeklyChatPanel extends StatefulWidget {
   final String groupId;
   final String weekKey;
   final bool expanded;
+  final double? maxExpandedHeight;
+  final bool fillAvailableHeight;
+  final ValueChanged<double>? onDragOffsetChanged;
   final VoidCallback onToggle;
 
   const WeeklyChatPanel({
@@ -8062,6 +17106,9 @@ class WeeklyChatPanel extends StatefulWidget {
     required this.groupId,
     required this.weekKey,
     required this.expanded,
+    this.maxExpandedHeight,
+    this.fillAvailableHeight = false,
+    this.onDragOffsetChanged,
     required this.onToggle,
   });
 
@@ -8069,12 +17116,84 @@ class WeeklyChatPanel extends StatefulWidget {
   State<WeeklyChatPanel> createState() => _WeeklyChatPanelState();
 }
 
-class _WeeklyChatPanelState extends State<WeeklyChatPanel> {
+class _WeeklyChatPanelState extends State<WeeklyChatPanel>
+    with SingleTickerProviderStateMixin {
   final TextEditingController messageController = TextEditingController();
+  final FocusNode messageFocusNode = FocusNode();
+  late final AnimationController dragAnimationController;
   bool sending = false;
+  Stream<QuerySnapshot<Map<String, dynamic>>>? messagesStream;
+  Stream<DocumentSnapshot<Map<String, dynamic>>>? readStateStream;
+  DateTime? optimisticReadAt;
+  String? lastReadWriteMarker;
+  double dragOffset = 0;
+  double dragAnimationStartOffset = 0;
+  double dragAnimationEndOffset = 0;
+  double lastExpandedPanelHeight = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    dragAnimationController = AnimationController(
+      vsync: this,
+      duration: kWeeklyChatPanelAnimationDuration,
+    )..addListener(_handleDragAnimationTick);
+    configureMessagesStream();
+    configureReadStateStream();
+  }
+
+  @override
+  void didUpdateWidget(covariant WeeklyChatPanel oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.groupId != widget.groupId ||
+        oldWidget.weekKey != widget.weekKey) {
+      configureMessagesStream();
+      configureReadStateStream();
+      optimisticReadAt = null;
+      lastReadWriteMarker = null;
+    }
+
+    if (oldWidget.expanded != widget.expanded) {
+      dragAnimationController.stop();
+      dragOffset = 0;
+    }
+  }
+
+  void configureMessagesStream() {
+    if (widget.weekKey.isEmpty) {
+      messagesStream = null;
+      return;
+    }
+
+    messagesStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(widget.groupId)
+        .collection('weeks')
+        .doc(widget.weekKey)
+        .collection('chatMessages')
+        .orderBy('createdAt', descending: false)
+        .snapshots();
+  }
+
+  void configureReadStateStream() {
+    final currentUser = FirebaseAuth.instance.currentUser;
+    if (currentUser == null) {
+      readStateStream = null;
+      return;
+    }
+
+    readStateStream = FirebaseFirestore.instance
+        .collection('users')
+        .doc(currentUser.uid)
+        .collection('groups')
+        .doc(widget.groupId)
+        .snapshots();
+  }
 
   @override
   void dispose() {
+    dragAnimationController.dispose();
+    messageFocusNode.dispose();
     messageController.dispose();
     super.dispose();
   }
@@ -8123,81 +17242,404 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel> {
     }
   }
 
+  Future<void> _sendGif(SundayChatGif gif) async {
+    if (sending || !canWrite) return;
+
+    final caption = messageController.text.trim();
+
+    setState(() => sending = true);
+
+    try {
+      await enviarMensajeChatSemana(
+        groupId: widget.groupId,
+        weekKey: widget.weekKey,
+        text: caption,
+        gifUrl: gif.url,
+        gifLabel: gif.label,
+      );
+
+      messageController.clear();
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error: $error');
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  Future<void> _openGifPicker() async {
+    if (sending || !canWrite) return;
+
+    FocusScope.of(context).unfocus();
+
+    final gif = await showModalBottomSheet<SundayChatGif>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => const SundayGifPickerSheet(),
+    );
+
+    if (!mounted || gif == null) return;
+
+    await _sendGif(gif);
+  }
+
+  DateTime? _messageCreatedAt(Map<String, dynamic> message) {
+    final createdAt = message['createdAt'];
+    if (createdAt is Timestamp) return createdAt.toDate();
+    if (createdAt is DateTime) return createdAt;
+    return null;
+  }
+
+  DateTime? _storedReadAt(Map<String, dynamic>? userGroupData) {
+    final chatReads = userGroupData?['chatReads'];
+    if (chatReads is! Map) return null;
+
+    final weekReadState = chatReads[widget.weekKey];
+    if (weekReadState is! Map) return null;
+
+    final lastReadAt = weekReadState['lastReadAt'];
+    if (lastReadAt is Timestamp) return lastReadAt.toDate();
+    if (lastReadAt is DateTime) return lastReadAt;
+    return null;
+  }
+
+  DateTime? _mostRecentReadAt(DateTime? storedReadAt) {
+    final optimistic = optimisticReadAt;
+    if (storedReadAt == null) return optimistic;
+    if (optimistic == null) return storedReadAt;
+    return optimistic.isAfter(storedReadAt) ? optimistic : storedReadAt;
+  }
+
+  int _unreadMessageCount({
+    required List<QueryDocumentSnapshot<Map<String, dynamic>>> messages,
+    required DateTime? lastReadAt,
+    required String? currentUid,
+  }) {
+    if (currentUid == null || messages.isEmpty) return 0;
+
+    var unread = 0;
+    for (final doc in messages) {
+      final message = doc.data();
+      if ((message['uid'] ?? '').toString() == currentUid) continue;
+
+      final createdAt = _messageCreatedAt(message);
+      if (createdAt == null) continue;
+
+      if (lastReadAt == null || createdAt.isAfter(lastReadAt)) {
+        unread += 1;
+      }
+    }
+
+    return unread;
+  }
+
+  void _scheduleMarkReadIfNeeded({
+    required List<QueryDocumentSnapshot<Map<String, dynamic>>> messages,
+    required int unreadCount,
+  }) {
+    if (!widget.expanded || unreadCount == 0 || messages.isEmpty) return;
+
+    final latestMessage = messages.last;
+    final marker = '${widget.weekKey}:${latestMessage.id}';
+    if (lastReadWriteMarker == marker) return;
+
+    lastReadWriteMarker = marker;
+    final readThroughAt =
+        _messageCreatedAt(latestMessage.data()) ?? DateTime.now();
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !widget.expanded) return;
+
+      setState(() => optimisticReadAt = readThroughAt);
+      unawaited(_markRead(marker));
+    });
+  }
+
+  Future<void> _markRead(String marker) async {
+    try {
+      await marcarChatSemanaLeido(
+        groupId: widget.groupId,
+        weekKey: widget.weekKey,
+      );
+    } catch (error) {
+      logDebug('No se pudo marcar el chat como leído: $error');
+      if (mounted && lastReadWriteMarker == marker) {
+        lastReadWriteMarker = null;
+      }
+    }
+  }
+
+  void _togglePanel() {
+    if (widget.expanded) {
+      _collapsePanel();
+      return;
+    }
+    widget.onToggle();
+  }
+
+  void _collapsePanel() {
+    if (!widget.expanded) return;
+    messageFocusNode.unfocus();
+    dragAnimationController.stop();
+    if (dragOffset > 0) {
+      _setDragOffset(0);
+    }
+    widget.onToggle();
+  }
+
+  void _setDragOffset(double offset) {
+    final nextOffset = offset.isFinite ? math.max(0.0, offset) : 0.0;
+    setState(() => dragOffset = nextOffset);
+    widget.onDragOffsetChanged?.call(nextOffset);
+  }
+
+  void _handleDragAnimationTick() {
+    final easedValue = kWeeklyChatPanelAnimationCurve.transform(
+      dragAnimationController.value,
+    );
+    final nextOffset = lerpDouble(
+      dragAnimationStartOffset,
+      dragAnimationEndOffset,
+      easedValue,
+    );
+    if (nextOffset == null) return;
+    _setDragOffset(nextOffset);
+  }
+
+  double _panelDismissDistance() {
+    if (lastExpandedPanelHeight > 0) return lastExpandedPanelHeight;
+
+    return resolverAlturaPanelChatSemanal(
+      screenHeight: MediaQuery.sizeOf(context).height,
+      keyboardOpen: MediaQuery.viewInsetsOf(context).bottom > 0,
+      canWrite: canWrite,
+    );
+  }
+
+  Future<void> _animateDragOffset(double targetOffset) async {
+    dragAnimationController.stop();
+    dragAnimationStartOffset = dragOffset;
+    dragAnimationEndOffset = targetOffset;
+
+    final dismissDistance = math.max(_panelDismissDistance(), 1.0);
+    final remainingFraction =
+        (dragAnimationEndOffset - dragAnimationStartOffset).abs() /
+        dismissDistance;
+    final durationMs = math.max(
+      90,
+      (kWeeklyChatPanelAnimationDuration.inMilliseconds * remainingFraction)
+          .round(),
+    );
+    dragAnimationController.duration = Duration(milliseconds: durationMs);
+
+    try {
+      await dragAnimationController.forward(from: 0).orCancel;
+    } on TickerCanceled {
+      return;
+    }
+
+    if (!mounted) return;
+
+    _setDragOffset(targetOffset);
+  }
+
+  void _handlePanelDragStart() {
+    if (!widget.expanded) return;
+    dragAnimationController.stop();
+  }
+
+  void _handlePanelDragUpdate(double distance) {
+    if (!widget.expanded) return;
+    final safeDistance = _panelDismissDistance();
+    _setDragOffset(distance.clamp(0.0, safeDistance).toDouble());
+  }
+
+  void _handlePanelDragEnd(double distance, double velocity) {
+    if (!widget.expanded) return;
+
+    final shouldDismiss =
+        distance > kWeeklyChatDragDismissDistance ||
+        velocity > kWeeklyChatDragDismissVelocity;
+
+    if (shouldDismiss) {
+      _collapsePanel();
+    } else {
+      unawaited(_animateDragOffset(0));
+    }
+  }
+
+  void _handlePanelDragCancel() {
+    if (!widget.expanded) return;
+    unawaited(_animateDragOffset(0));
+  }
+
   @override
   Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
     if (widget.weekKey.isEmpty) return const SizedBox.shrink();
 
-    final messagesRef = FirebaseFirestore.instance
-        .collection('groups')
-        .doc(widget.groupId)
-        .collection('weeks')
-        .doc(widget.weekKey)
-        .collection('chatMessages')
-        .orderBy('createdAt', descending: false);
+    final currentMessagesStream = messagesStream;
+    if (currentMessagesStream == null) return const SizedBox.shrink();
+    final currentReadStateStream = readStateStream;
 
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-      stream: messagesRef.snapshots(),
+      stream: currentMessagesStream,
       builder: (context, snapshot) {
         final messages = snapshot.data?.docs ?? [];
-        final messageCount = messages.length;
+        final currentUid = FirebaseAuth.instance.currentUser?.uid;
 
-        if (!widget.expanded) {
-          return WeeklyChatCollapsedBar(
+        Widget buildPanel(DateTime? storedReadAt, bool readStateReady) {
+          final unreadCount = readStateReady
+              ? _unreadMessageCount(
+                  messages: messages,
+                  lastReadAt: _mostRecentReadAt(storedReadAt),
+                  currentUid: currentUid,
+                )
+              : 0;
+
+          _scheduleMarkReadIfNeeded(
+            messages: messages,
+            unreadCount: unreadCount,
+          );
+
+          Widget animatedPanelSize(Widget child) {
+            if (widget.fillAvailableHeight) return child;
+
+            return AnimatedSize(
+              duration: kWeeklyChatPanelAnimationDuration,
+              curve: kWeeklyChatPanelAnimationCurve,
+              alignment: Alignment.bottomCenter,
+              child: child,
+            );
+          }
+
+          if (!widget.expanded) {
+            return animatedPanelSize(
+              WeeklyChatCollapsedBar(
+                canWrite: canWrite,
+                unreadCount: unreadCount,
+                onToggle: _togglePanel,
+              ),
+            );
+          }
+
+          final keyboardOpen = MediaQuery.viewInsetsOf(context).bottom > 0;
+          final panelHeight = resolverAlturaPanelChatSemanal(
+            screenHeight: MediaQuery.sizeOf(context).height,
+            keyboardOpen: keyboardOpen,
             canWrite: canWrite,
-            messageCount: messageCount,
-            onToggle: widget.onToggle,
+            maxExpandedHeight: widget.maxExpandedHeight,
+          );
+
+          final panel = Container(
+            decoration: const BoxDecoration(
+              color: ssBg,
+              border: Border(top: BorderSide(color: ssSeparator, width: 1)),
+            ),
+            child: Column(
+              children: [
+                WeeklyChatDragHandle(
+                  onDismiss: _collapsePanel,
+                  onDragStart: _handlePanelDragStart,
+                  onDragUpdate: _handlePanelDragUpdate,
+                  onDragEnd: _handlePanelDragEnd,
+                  onDragCancel: _handlePanelDragCancel,
+                ),
+                WeeklyChatHeader(weekLabel: weekLabel),
+                Expanded(
+                  child: snapshot.connectionState == ConnectionState.waiting
+                      ? const Center(
+                          child: CircularProgressIndicator(
+                            color: ssOrange,
+                            strokeWidth: 2,
+                          ),
+                        )
+                      : messages.isEmpty
+                      ? WeeklyChatEmptyState(canWrite: canWrite)
+                      : ListView.separated(
+                          padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+                          itemCount: messages.length,
+                          separatorBuilder: (_, _) => const SizedBox(height: 8),
+                          itemBuilder: (context, index) {
+                            final doc = messages[index];
+                            return WeeklyChatMessageBubble(
+                              message: doc.data(),
+                              fallbackSeed: doc.id,
+                            );
+                          },
+                        ),
+                ),
+                WeeklyChatInputBar(
+                  canWrite: canWrite,
+                  sending: sending,
+                  controller: messageController,
+                  focusNode: messageFocusNode,
+                  onSend: _send,
+                  onGif: _openGifPicker,
+                  onToggle: _togglePanel,
+                ),
+              ],
+            ),
+          );
+
+          if (widget.fillAvailableHeight) {
+            return LayoutBuilder(
+              builder: (context, constraints) {
+                final panelDistance =
+                    constraints.hasBoundedHeight &&
+                        constraints.maxHeight.isFinite
+                    ? constraints.maxHeight
+                    : panelHeight;
+                lastExpandedPanelHeight = panelDistance;
+                final visibleDragOffset = dragOffset
+                    .clamp(0.0, panelDistance)
+                    .toDouble();
+
+                return ClipRect(
+                  child: Transform.translate(
+                    offset: Offset(0, visibleDragOffset),
+                    child: panel,
+                  ),
+                );
+              },
+            );
+          }
+
+          lastExpandedPanelHeight = panelHeight;
+          final visibleDragOffset = dragOffset
+              .clamp(0.0, panelHeight)
+              .toDouble();
+
+          return animatedPanelSize(
+            SizedBox(
+              height: panelHeight,
+              child: ClipRect(
+                child: Transform.translate(
+                  offset: Offset(0, visibleDragOffset),
+                  child: panel,
+                ),
+              ),
+            ),
           );
         }
 
-        final maxPanelHeight = math.min(
-          MediaQuery.sizeOf(context).height * 0.43,
-          canWrite ? 356.0 : 326.0,
-        );
+        if (currentReadStateStream == null) {
+          return buildPanel(null, true);
+        }
 
-        return Container(
-          height: maxPanelHeight,
-          decoration: const BoxDecoration(
-            color: ssBg,
-            border: Border(top: BorderSide(color: ssSeparator, width: 1)),
-          ),
-          child: Column(
-            children: [
-              WeeklyChatHeader(
-                weekLabel: weekLabel,
-                messageCount: messageCount,
-              ),
-              Expanded(
-                child: snapshot.connectionState == ConnectionState.waiting
-                    ? const Center(
-                        child: CircularProgressIndicator(
-                          color: ssOrange,
-                          strokeWidth: 2,
-                        ),
-                      )
-                    : messages.isEmpty
-                        ? WeeklyChatEmptyState(canWrite: canWrite)
-                        : ListView.separated(
-                            padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-                            itemCount: messages.length,
-                            separatorBuilder: (_, _) => const SizedBox(height: 8),
-                            itemBuilder: (context, index) {
-                              final doc = messages[index];
-                              return WeeklyChatMessageBubble(
-                                message: doc.data(),
-                                fallbackSeed: doc.id,
-                              );
-                            },
-                          ),
-              ),
-              WeeklyChatInputBar(
-                canWrite: canWrite,
-                sending: sending,
-                controller: messageController,
-                onSend: _send,
-                onToggle: widget.onToggle,
-              ),
-            ],
-          ),
+        return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+          stream: currentReadStateStream,
+          builder: (context, readSnapshot) {
+            final readStateReady =
+                readSnapshot.connectionState != ConnectionState.waiting ||
+                readSnapshot.hasData;
+
+            return buildPanel(
+              _storedReadAt(readSnapshot.data?.data()),
+              readStateReady,
+            );
+          },
         );
       },
     );
@@ -8206,13 +17648,13 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel> {
 
 class WeeklyChatCollapsedBar extends StatelessWidget {
   final bool canWrite;
-  final int messageCount;
+  final int unreadCount;
   final VoidCallback onToggle;
 
   const WeeklyChatCollapsedBar({
     super.key,
     required this.canWrite,
-    required this.messageCount,
+    required this.unreadCount,
     required this.onToggle,
   });
 
@@ -8229,58 +17671,29 @@ class WeeklyChatCollapsedBar extends StatelessWidget {
         bottom: false,
         child: Row(
           children: [
-            WeeklyChatToggleButton(
-              expanded: false,
-              messageCount: messageCount,
-              onTap: onToggle,
-            ),
-            const SizedBox(width: 8),
             Expanded(
-              child: Material(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(999),
-                child: InkWell(
-                  onTap: onToggle,
-                  borderRadius: BorderRadius.circular(999),
-                  child: Container(
-                    height: 40,
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(999),
-                      border: Border.all(
-                        color: canWrite ? ssBorder : ssOrangeLight,
-                        width: 1.2,
-                      ),
-                    ),
-                    child: Row(
+              child: canWrite
+                  ? Row(
                       children: [
-                        Icon(
-                          canWrite
-                              ? Icons.chat_bubble_outline_rounded
-                              : Icons.lock_outline_rounded,
-                          color: canWrite ? ssText3 : ssText3,
-                          size: 15,
+                        WeeklyChatToggleButton(
+                          expanded: false,
+                          unreadCount: unreadCount,
+                          onTap: onToggle,
                         ),
                         const SizedBox(width: 8),
                         Expanded(
-                          child: Text(
-                            canWrite
-                                ? 'Escribe en el chat de esta semana'
-                                : 'Chat solo de lectura · semana cerrada',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: ssText3,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w800,
-                            ),
+                          child: WeeklyChatPromptPill(
+                            canWrite: true,
+                            onTap: onToggle,
                           ),
                         ),
                       ],
+                    )
+                  : WeeklyChatPromptPill(
+                      canWrite: false,
+                      unreadCount: unreadCount,
+                      onTap: onToggle,
                     ),
-                  ),
-                ),
-              ),
             ),
           ],
         ),
@@ -8291,13 +17704,8 @@ class WeeklyChatCollapsedBar extends StatelessWidget {
 
 class WeeklyChatHeader extends StatelessWidget {
   final String weekLabel;
-  final int messageCount;
 
-  const WeeklyChatHeader({
-    super.key,
-    required this.weekLabel,
-    required this.messageCount,
-  });
+  const WeeklyChatHeader({super.key, required this.weekLabel});
 
   @override
   Widget build(BuildContext context) {
@@ -8324,24 +17732,88 @@ class WeeklyChatHeader extends StatelessWidget {
               ),
             ),
           ),
-          if (messageCount > 0)
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        ],
+      ),
+    );
+  }
+}
+
+class WeeklyChatDragHandle extends StatefulWidget {
+  final VoidCallback onDismiss;
+  final VoidCallback? onDragStart;
+  final ValueChanged<double>? onDragUpdate;
+  final void Function(double distance, double velocity)? onDragEnd;
+  final VoidCallback? onDragCancel;
+
+  const WeeklyChatDragHandle({
+    super.key,
+    required this.onDismiss,
+    this.onDragStart,
+    this.onDragUpdate,
+    this.onDragEnd,
+    this.onDragCancel,
+  });
+
+  @override
+  State<WeeklyChatDragHandle> createState() => _WeeklyChatDragHandleState();
+}
+
+class _WeeklyChatDragHandleState extends State<WeeklyChatDragHandle> {
+  double dragDistance = 0;
+
+  void _resetDrag() {
+    dragDistance = 0;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: 'Minimizar chat',
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onDismiss,
+        onVerticalDragStart: (_) {
+          _resetDrag();
+          widget.onDragStart?.call();
+        },
+        onVerticalDragUpdate: (details) {
+          final delta = details.primaryDelta ?? 0;
+          dragDistance = math.max(0, dragDistance + delta);
+          widget.onDragUpdate?.call(dragDistance);
+        },
+        onVerticalDragEnd: (details) {
+          final distance = dragDistance;
+          final velocity = details.primaryVelocity ?? 0;
+          final shouldDismiss =
+              distance > kWeeklyChatDragDismissDistance ||
+              velocity > kWeeklyChatDragDismissVelocity;
+          _resetDrag();
+          final onDragEnd = widget.onDragEnd;
+          if (onDragEnd != null) {
+            onDragEnd(distance, velocity);
+          } else if (shouldDismiss) {
+            widget.onDismiss();
+          }
+        },
+        onVerticalDragCancel: () {
+          _resetDrag();
+          widget.onDragCancel?.call();
+        },
+        child: SizedBox(
+          width: double.infinity,
+          height: 22,
+          child: Center(
+            child: Container(
+              width: 42,
+              height: 4,
               decoration: BoxDecoration(
-                color: ssOrangeLight,
+                color: ssText3.withValues(alpha: 0.28),
                 borderRadius: BorderRadius.circular(999),
               ),
-              child: Text(
-                '$messageCount',
-                style: const TextStyle(
-                  color: ssOrangeDark,
-                  fontSize: 10,
-                  fontWeight: FontWeight.w900,
-                  fontFeatures: [FontFeature.tabularFigures()],
-                ),
-              ),
             ),
-        ],
+          ),
+        ),
       ),
     );
   }
@@ -8354,42 +17826,56 @@ class WeeklyChatEmptyState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 28),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 42,
-              height: 42,
-              decoration: const BoxDecoration(
-                color: ssOrangeLight,
-                shape: BoxShape.circle,
-              ),
-              child: Icon(
-                canWrite
-                    ? Icons.chat_bubble_outline_rounded
-                    : Icons.lock_outline_rounded,
-                color: ssOrange,
-                size: 20,
-              ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compact =
+            constraints.hasBoundedHeight && constraints.maxHeight < 96;
+
+        return Center(
+          child: Padding(
+            padding: EdgeInsets.symmetric(
+              horizontal: 28,
+              vertical: compact ? 4 : 0,
             ),
-            const SizedBox(height: 10),
-            Text(
-              canWrite
-                  ? 'Todavía no hay mensajes esta semana.'
-                  : 'No hubo mensajes esta semana.',
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                color: ssText3,
-                fontSize: 13,
-                fontWeight: FontWeight.w800,
-              ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (!compact) ...[
+                  Container(
+                    width: 42,
+                    height: 42,
+                    decoration: const BoxDecoration(
+                      color: ssOrangeLight,
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(
+                      canWrite
+                          ? Icons.chat_bubble_outline_rounded
+                          : Icons.lock_outline_rounded,
+                      color: ssOrange,
+                      size: 20,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                ],
+                Text(
+                  canWrite
+                      ? 'Todavía no hay mensajes esta semana.'
+                      : 'No hubo mensajes esta semana.',
+                  maxLines: compact ? 1 : 2,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: ssText3,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
             ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }
@@ -8410,7 +17896,11 @@ class WeeklyChatMessageBubble extends StatelessWidget {
     final name = formatUserDisplayName(message['authorName'] ?? 'Usuario');
     final photoUrl = message['authorPhotoUrl'] as String?;
     final text = (message['text'] ?? '').toString();
+    final gifUrl = (message['gifUrl'] ?? '').toString().trim();
+    final gifLabel = (message['gifLabel'] ?? 'GIF').toString();
     final createdAt = message['createdAt'];
+    final hasText = text.trim().isNotEmpty;
+    final hasGif = gifUrl.isNotEmpty;
 
     return Row(
       crossAxisAlignment: CrossAxisAlignment.end,
@@ -8453,7 +17943,10 @@ class WeeklyChatMessageBubble extends StatelessWidget {
               ),
               const SizedBox(height: 3),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
                 decoration: BoxDecoration(
                   color: Colors.white,
                   borderRadius: BorderRadius.circular(14),
@@ -8466,14 +17959,70 @@ class WeeklyChatMessageBubble extends StatelessWidget {
                     ),
                   ],
                 ),
-                child: Text(
-                  text,
-                  style: const TextStyle(
-                    color: ssTitle,
-                    fontSize: 13,
-                    height: 1.25,
-                    fontWeight: FontWeight.w500,
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (hasText)
+                      Text(
+                        text,
+                        style: const TextStyle(
+                          color: ssTitle,
+                          fontSize: 13,
+                          height: 1.25,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    if (hasText && hasGif) const SizedBox(height: 8),
+                    if (hasGif)
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(10),
+                        child: Image.network(
+                          gifUrl,
+                          width: 190,
+                          height: 132,
+                          fit: BoxFit.cover,
+                          gaplessPlayback: true,
+                          semanticLabel: gifLabel,
+                          loadingBuilder: (context, child, loadingProgress) {
+                            if (loadingProgress == null) return child;
+                            return const SizedBox(
+                              width: 190,
+                              height: 132,
+                              child: Center(
+                                child: CircularProgressIndicator(
+                                  color: ssOrange,
+                                  strokeWidth: 2,
+                                ),
+                              ),
+                            );
+                          },
+                          errorBuilder: (_, _, _) => Container(
+                            width: 190,
+                            height: 96,
+                            alignment: Alignment.center,
+                            color: ssOrangeLight,
+                            child: const Text(
+                              'GIF',
+                              style: TextStyle(
+                                color: ssOrangeDark,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w900,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    if (!hasText && !hasGif)
+                      const Text(
+                        'Mensaje',
+                        style: TextStyle(
+                          color: ssText3,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                  ],
                 ),
               ),
             ],
@@ -8488,7 +18037,9 @@ class WeeklyChatInputBar extends StatelessWidget {
   final bool canWrite;
   final bool sending;
   final TextEditingController controller;
+  final FocusNode? focusNode;
   final VoidCallback onSend;
+  final VoidCallback onGif;
   final VoidCallback onToggle;
 
   const WeeklyChatInputBar({
@@ -8496,7 +18047,9 @@ class WeeklyChatInputBar extends StatelessWidget {
     required this.canWrite,
     required this.sending,
     required this.controller,
+    this.focusNode,
     required this.onSend,
+    required this.onGif,
     required this.onToggle,
   });
 
@@ -8507,20 +18060,17 @@ class WeeklyChatInputBar extends StatelessWidget {
         color: ssBg,
         border: Border(top: BorderSide(color: ssSeparator, width: 1)),
       ),
-      padding: EdgeInsets.fromLTRB(
-        10,
-        8,
-        10,
-        8 + MediaQuery.viewInsetsOf(context).bottom.clamp(0, 18).toDouble(),
-      ),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
       child: Row(
         children: [
-          WeeklyChatToggleButton(
-            expanded: true,
-            messageCount: 0,
-            onTap: onToggle,
-          ),
-          const SizedBox(width: 8),
+          if (canWrite) ...[
+            WeeklyChatToggleButton(
+              expanded: true,
+              unreadCount: 0,
+              onTap: onToggle,
+            ),
+            const SizedBox(width: 8),
+          ],
           Expanded(
             child: canWrite
                 ? Container(
@@ -8530,68 +18080,69 @@ class WeeklyChatInputBar extends StatelessWidget {
                       borderRadius: BorderRadius.circular(999),
                       border: Border.all(color: ssBorder, width: 1.1),
                     ),
-                    child: TextField(
-                      controller: controller,
-                      minLines: 1,
-                      maxLines: 1,
-                      maxLength: 500,
-                      textInputAction: TextInputAction.send,
-                      onSubmitted: (_) => onSend(),
-                      cursorColor: ssOrange,
-                      style: const TextStyle(
-                        color: ssTitle,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                      ),
-                      decoration: const InputDecoration(
-                        counterText: '',
-                        hintText: 'Escribe en el chat de esta semana',
-                        hintStyle: TextStyle(
-                          color: ssText3,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700,
-                        ),
-                        border: InputBorder.none,
-                        contentPadding: EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 9,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                      child: Center(
+                        child: TextField(
+                          controller: controller,
+                          focusNode: focusNode,
+                          minLines: 1,
+                          maxLines: 1,
+                          maxLength: 500,
+                          textAlignVertical: TextAlignVertical.center,
+                          textInputAction: TextInputAction.send,
+                          onSubmitted: (_) => onSend(),
+                          cursorColor: ssOrange,
+                          style: const TextStyle(
+                            color: ssTitle,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                          decoration: const InputDecoration(
+                            isCollapsed: true,
+                            counterText: '',
+                            hintText: 'Mensaje',
+                            hintStyle: TextStyle(
+                              color: ssText3,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                            ),
+                            border: InputBorder.none,
+                            contentPadding: EdgeInsets.zero,
+                          ),
                         ),
                       ),
                     ),
                   )
-                : Container(
-                    height: 40,
-                    padding: const EdgeInsets.symmetric(horizontal: 14),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(999),
-                      border: Border.all(color: ssOrangeLight, width: 1.1),
-                    ),
-                    child: const Row(
-                      children: [
-                        Icon(
-                          Icons.lock_outline_rounded,
-                          color: ssText3,
-                          size: 15,
-                        ),
-                        SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            'Chat solo de lectura · semana cerrada',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: ssText3,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                : WeeklyChatPromptPill(canWrite: false, onTap: onToggle),
           ),
           if (canWrite) ...[
+            const SizedBox(width: 8),
+            Material(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(999),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(999),
+                onTap: sending ? null : onGif,
+                child: Container(
+                  height: 40,
+                  padding: const EdgeInsets.symmetric(horizontal: 11),
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(color: ssOrangeMid, width: 1.2),
+                  ),
+                  child: const Text(
+                    'GIF',
+                    style: TextStyle(
+                      color: ssOrangeDark,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
+              ),
+            ),
             const SizedBox(width: 8),
             Material(
               color: sending ? ssOrangeMid : ssOrangeMid,
@@ -8628,15 +18179,101 @@ class WeeklyChatInputBar extends StatelessWidget {
   }
 }
 
+class WeeklyChatPromptPill extends StatelessWidget {
+  final bool canWrite;
+  final int unreadCount;
+  final VoidCallback onTap;
+
+  const WeeklyChatPromptPill({
+    super.key,
+    required this.canWrite,
+    this.unreadCount = 0,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final borderColor = canWrite ? ssBorder : ssOrangeLight;
+    final icon = canWrite
+        ? Icons.chat_bubble_outline_rounded
+        : Icons.lock_outline_rounded;
+    final label = canWrite ? 'Mensaje' : 'Chat de domingo finalizado';
+
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Material(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(999),
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: BorderRadius.circular(999),
+            child: Container(
+              height: 40,
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(color: borderColor, width: 1.1),
+              ),
+              child: Row(
+                children: [
+                  Icon(icon, color: ssText3, size: 15),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: ssText3,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        if (!canWrite && unreadCount > 0)
+          Positioned(
+            right: -1,
+            top: -7,
+            child: Container(
+              constraints: const BoxConstraints(minWidth: 17, minHeight: 17),
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: ssOrange,
+                borderRadius: BorderRadius.circular(999),
+                border: Border.all(color: ssBg, width: 2),
+              ),
+              child: Text(
+                unreadCount > 9 ? '9+' : '$unreadCount',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w900,
+                  height: 1,
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
 class WeeklyChatToggleButton extends StatelessWidget {
   final bool expanded;
-  final int messageCount;
+  final int unreadCount;
   final VoidCallback onTap;
 
   const WeeklyChatToggleButton({
     super.key,
     required this.expanded,
-    required this.messageCount,
+    required this.unreadCount,
     required this.onTap,
   });
 
@@ -8664,7 +18301,7 @@ class WeeklyChatToggleButton extends StatelessWidget {
             ),
           ),
         ),
-        if (!expanded && messageCount > 0)
+        if (!expanded && unreadCount > 0)
           Positioned(
             right: -1,
             top: -7,
@@ -8678,7 +18315,7 @@ class WeeklyChatToggleButton extends StatelessWidget {
                 border: Border.all(color: ssBg, width: 2),
               ),
               child: Text(
-                messageCount > 9 ? '9+' : '$messageCount',
+                unreadCount > 9 ? '9+' : '$unreadCount',
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 9,
@@ -8689,6 +18326,450 @@ class WeeklyChatToggleButton extends StatelessWidget {
             ),
           ),
       ],
+    );
+  }
+}
+
+class SundayChatGif {
+  final String label;
+  final String url;
+  final List<String> keywords;
+
+  const SundayChatGif({
+    required this.label,
+    required this.url,
+    required this.keywords,
+  });
+}
+
+class SundayGifSearchResult {
+  final List<SundayChatGif> gifs;
+  final String next;
+  final bool fromTenor;
+  final String? errorMessage;
+
+  const SundayGifSearchResult({
+    required this.gifs,
+    required this.next,
+    required this.fromTenor,
+    this.errorMessage,
+  });
+}
+
+class SundayGifRepository {
+  static const int pageSize = 24;
+
+  Future<SundayGifSearchResult> search({
+    required String query,
+    String? pos,
+  }) async {
+    final cleanQuery = query.trim();
+    final cleanPos = pos?.trim() ?? '';
+
+    try {
+      final callable = FirebaseFunctions.instance.httpsCallable(
+        'buscarGifsTenor',
+      );
+      final response = await callable.call({
+        'query': cleanQuery,
+        'pos': cleanPos,
+        'limit': pageSize,
+      });
+      final data = response.data;
+
+      if (data is! Map) {
+        throw const FormatException('Respuesta de GIFs no válida');
+      }
+
+      final rawGifs = data['gifs'];
+      final gifs = rawGifs is List
+          ? rawGifs
+                .map(_gifFromCallableMap)
+                .whereType<SundayChatGif>()
+                .toList(growable: false)
+          : <SundayChatGif>[];
+
+      return SundayGifSearchResult(
+        gifs: gifs,
+        next: (data['next'] ?? '').toString(),
+        fromTenor: true,
+      );
+    } catch (error) {
+      logDebug('No se pudo cargar GIFs de Tenor: $error');
+
+      return SundayGifSearchResult(
+        gifs: const [],
+        next: '',
+        fromTenor: false,
+        errorMessage: _searchErrorMessage(
+          error,
+          paginating: cleanPos.isNotEmpty,
+        ),
+      );
+    }
+  }
+
+  static SundayChatGif? _gifFromCallableMap(dynamic value) {
+    if (value is! Map) return null;
+
+    final url = (value['url'] ?? '').toString().trim();
+    if (!_isTenorMediaUrl(url)) return null;
+
+    final label = (value['label'] ?? 'GIF').toString().trim();
+    final rawKeywords = value['keywords'];
+    final keywords = rawKeywords is List
+        ? rawKeywords
+              .map((keyword) => keyword.toString().trim().toLowerCase())
+              .where((keyword) => keyword.isNotEmpty)
+              .toList(growable: false)
+        : <String>[];
+
+    return SundayChatGif(
+      label: label.isEmpty ? 'GIF' : label,
+      url: url,
+      keywords: keywords,
+    );
+  }
+
+  static bool _isTenorMediaUrl(String url) {
+    final uri = Uri.tryParse(url);
+    return uri != null &&
+        uri.scheme == 'https' &&
+        uri.host == 'media.tenor.com' &&
+        uri.path.isNotEmpty;
+  }
+
+  static String _searchErrorMessage(Object error, {required bool paginating}) {
+    if (paginating) return 'No se pudieron cargar más GIFs';
+
+    if (error is FirebaseFunctionsException) {
+      if (error.code == 'failed-precondition') {
+        return 'La biblioteca de GIFs no está configurada todavía';
+      }
+
+      return error.message ?? 'No se pudo cargar la biblioteca de GIFs';
+    }
+
+    return 'No se pudo cargar la biblioteca de GIFs';
+  }
+}
+
+class SundayGifPickerSheet extends StatefulWidget {
+  const SundayGifPickerSheet({super.key});
+
+  @override
+  State<SundayGifPickerSheet> createState() => _SundayGifPickerSheetState();
+}
+
+class _SundayGifPickerSheetState extends State<SundayGifPickerSheet> {
+  final TextEditingController searchController = TextEditingController();
+  final ScrollController scrollController = ScrollController();
+  final SundayGifRepository gifRepository = SundayGifRepository();
+  Timer? searchDebounce;
+  List<SundayChatGif> gifs = const [];
+  String nextPagePosition = '';
+  String query = '';
+  String? errorMessage;
+  bool loading = true;
+  bool loadingMore = false;
+  bool showingTenorResults = false;
+  int requestGeneration = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    scrollController.addListener(_handleScroll);
+    unawaited(_loadGifs(reset: true));
+  }
+
+  @override
+  void dispose() {
+    searchDebounce?.cancel();
+    searchController.dispose();
+    scrollController.dispose();
+    super.dispose();
+  }
+
+  void _handleScroll() {
+    if (!scrollController.hasClients ||
+        loading ||
+        loadingMore ||
+        nextPagePosition.isEmpty) {
+      return;
+    }
+
+    final position = scrollController.position;
+    if (position.pixels >= position.maxScrollExtent - 420) {
+      unawaited(_loadGifs(reset: false));
+    }
+  }
+
+  void _handleSearchChanged(String value) {
+    query = value;
+    searchDebounce?.cancel();
+    searchDebounce = Timer(
+      const Duration(milliseconds: 320),
+      () => _loadGifs(reset: true),
+    );
+  }
+
+  Future<void> _loadGifs({required bool reset}) async {
+    if (!reset && (loading || loadingMore || nextPagePosition.isEmpty)) {
+      return;
+    }
+
+    final generation = reset ? ++requestGeneration : requestGeneration;
+    final searchQuery = query;
+    final pagePosition = reset ? null : nextPagePosition;
+    if (reset && scrollController.hasClients) {
+      scrollController.jumpTo(0);
+    }
+
+    setState(() {
+      if (reset) {
+        loading = true;
+        loadingMore = false;
+        nextPagePosition = '';
+        gifs = const [];
+        errorMessage = null;
+      } else {
+        loadingMore = true;
+      }
+    });
+
+    final result = await gifRepository.search(
+      query: searchQuery,
+      pos: pagePosition,
+    );
+
+    if (!mounted || generation != requestGeneration) return;
+
+    setState(() {
+      if (reset) {
+        gifs = result.gifs;
+        showingTenorResults = result.fromTenor;
+        errorMessage = result.errorMessage;
+      } else {
+        final seenUrls = gifs.map((gif) => gif.url).toSet();
+        gifs = [...gifs, ...result.gifs.where((gif) => seenUrls.add(gif.url))];
+        showingTenorResults = showingTenorResults || result.fromTenor;
+        errorMessage = result.errorMessage;
+      }
+
+      nextPagePosition = result.next;
+      loading = false;
+      loadingMore = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.viewInsetsOf(context).bottom;
+    final currentErrorMessage = errorMessage;
+
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: EdgeInsets.only(bottom: bottomInset),
+        child: Container(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.sizeOf(context).height * 0.78,
+          ),
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+          ),
+          child: Column(
+            children: [
+              SizedBox(
+                width: double.infinity,
+                height: 44,
+                child: Stack(
+                  alignment: Alignment.topCenter,
+                  children: [
+                    Positioned(
+                      top: 10,
+                      child: Container(
+                        width: 36,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: ssBorder,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      top: 2,
+                      right: 8,
+                      child: IconButton(
+                        tooltip: 'Cerrar',
+                        onPressed: () => Navigator.pop(context),
+                        icon: const Icon(Icons.close_rounded, color: ssText3),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(18, 0, 18, 12),
+                child: Container(
+                  height: 42,
+                  decoration: BoxDecoration(
+                    color: ssBg,
+                    borderRadius: BorderRadius.circular(999),
+                    border: Border.all(color: ssBorder, width: 1),
+                  ),
+                  child: TextField(
+                    controller: searchController,
+                    cursorColor: ssOrange,
+                    textInputAction: TextInputAction.search,
+                    onChanged: _handleSearchChanged,
+                    style: const TextStyle(
+                      color: ssTitle,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                    ),
+                    decoration: InputDecoration(
+                      border: InputBorder.none,
+                      prefixIcon: const Icon(
+                        Icons.search_rounded,
+                        color: ssText3,
+                        size: 20,
+                      ),
+                      hintText: showingTenorResults
+                          ? 'Buscar en Tenor'
+                          : 'Buscar GIFs',
+                      hintStyle: const TextStyle(
+                        color: ssText3,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(vertical: 10),
+                    ),
+                  ),
+                ),
+              ),
+              Expanded(
+                child: loading && gifs.isEmpty
+                    ? const Center(
+                        child: CircularProgressIndicator(
+                          color: ssOrange,
+                          strokeWidth: 2,
+                        ),
+                      )
+                    : currentErrorMessage != null && gifs.isEmpty
+                    ? Center(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 26),
+                          child: Text(
+                            currentErrorMessage,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: ssText3,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w800,
+                              height: 1.25,
+                            ),
+                          ),
+                        ),
+                      )
+                    : gifs.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'Sin GIFs para esa búsqueda',
+                          style: TextStyle(
+                            color: ssText3,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      )
+                    : GridView.builder(
+                        controller: scrollController,
+                        padding: const EdgeInsets.fromLTRB(18, 2, 18, 22),
+                        gridDelegate:
+                            const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 2,
+                              mainAxisSpacing: 12,
+                              crossAxisSpacing: 12,
+                              childAspectRatio: 1.06,
+                            ),
+                        itemCount: gifs.length + (loadingMore ? 1 : 0),
+                        itemBuilder: (context, index) {
+                          if (index >= gifs.length) {
+                            return const Center(
+                              child: CircularProgressIndicator(
+                                color: ssOrange,
+                                strokeWidth: 2,
+                              ),
+                            );
+                          }
+
+                          final gif = gifs[index];
+                          return Material(
+                            color: Colors.white,
+                            elevation: 5,
+                            shadowColor: Colors.black.withValues(alpha: 0.22),
+                            surfaceTintColor: Colors.transparent,
+                            borderRadius: BorderRadius.circular(12),
+                            clipBehavior: Clip.antiAlias,
+                            child: InkWell(
+                              onTap: () => Navigator.pop(context, gif),
+                              child: Image.network(
+                                gif.url,
+                                width: double.infinity,
+                                height: double.infinity,
+                                fit: BoxFit.cover,
+                                gaplessPlayback: true,
+                                semanticLabel: gif.label,
+                                loadingBuilder:
+                                    (context, child, loadingProgress) {
+                                      if (loadingProgress == null) {
+                                        return child;
+                                      }
+
+                                      return const Center(
+                                        child: CircularProgressIndicator(
+                                          color: ssOrange,
+                                          strokeWidth: 2,
+                                        ),
+                                      );
+                                    },
+                                errorBuilder: (_, _, _) => const Center(
+                                  child: Text(
+                                    'GIF',
+                                    style: TextStyle(
+                                      color: ssOrangeDark,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+              if (showingTenorResults)
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(18, 0, 18, 12),
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: Text(
+                      'Powered by Tenor',
+                      style: TextStyle(
+                        color: ssText3,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
@@ -8706,7 +18787,6 @@ String formatChatMessageTime(dynamic value) {
 
   return '${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
 }
-
 
 class GroupWeekSummaryCard extends StatelessWidget {
   final String weekKey;
@@ -8858,18 +18938,24 @@ class EmptyWeekCard extends StatelessWidget {
 
 class MissingSelfieTile extends StatefulWidget {
   final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
   final String weekKey;
   final String targetUid;
   final String name;
   final String? photoUrl;
+  final dynamic joinedAt;
 
   const MissingSelfieTile({
     super.key,
     required this.groupId,
+    required this.groupName,
+    required this.groupPhotoUrl,
     required this.weekKey,
     required this.targetUid,
     required this.name,
     required this.photoUrl,
+    required this.joinedAt,
   });
 
   @override
@@ -8877,132 +18963,258 @@ class MissingSelfieTile extends StatefulWidget {
 }
 
 class _MissingSelfieTileState extends State<MissingSelfieTile> {
-  bool sending = false;
+  bool openingCameraOrUploading = false;
 
-  Future<void> _sendReminder() async {
-    if (sending) return;
+  Future<void> _openCameraAndUpload() async {
+    if (openingCameraOrUploading) return;
 
-    setState(() => sending = true);
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || user.uid != widget.targetUid) return;
+
+    final window = obtenerSundayWindowState();
+    final isCurrentWeek = widget.weekKey == obtenerWeekKeyActual();
+    final isRegularSundayUpload = isCurrentWeek && window.canUpload;
+    final isLateMondayUpload = miembroPuedeSubirSelfieLunesConRetraso(
+      widget.weekKey,
+      widget.joinedAt,
+    );
+
+    if (!isRegularSundayUpload && !isLateMondayUpload) {
+      showSundaySnack(context, 'La ventana de subida está cerrada');
+      return;
+    }
+
+    setState(() => openingCameraOrUploading = true);
 
     try {
-      await enviarZumbidoSelfie(
+      if (isLateMondayUpload) {
+        final unlocked = await prepararSelfieConRetrasoConAnuncio(context);
+        if (!mounted || !unlocked) return;
+      }
+
+      final foto = await Navigator.push<XFile>(
+        context,
+        MaterialPageRoute(
+          builder: (_) => CameraCaptureScreen(groupName: widget.groupName),
+        ),
+      );
+
+      if (!mounted || foto == null) return;
+      final validPhoto = await validarFotoSelfieParaSubida(context, foto);
+      if (!mounted || !validPhoto) return;
+
+      await publicarSelfieReal(
         groupId: widget.groupId,
-        targetUid: widget.targetUid,
+        user: user,
+        foto: foto,
+        weekKey: widget.weekKey,
+        rewardedAdWatched: isLateMondayUpload,
       );
 
       if (!mounted) return;
-      showSundaySnack(context, 'Recordatorio enviado');
+      showSundaySnack(
+        context,
+        'Selfie publicado en ${formatGroupDisplayName(widget.groupName)}',
+      );
+    } on SelfiePhotoValidationException catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, error.message);
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'Error: $error');
     } finally {
-      if (mounted) setState(() => sending = false);
+      if (mounted) {
+        setState(() => openingCameraOrUploading = false);
+      }
     }
+  }
+
+  void _openMemberSelfies() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GroupMemberSelfiesScreen(
+          groupId: widget.groupId,
+          groupName: widget.groupName,
+          groupPhotoUrl: widget.groupPhotoUrl,
+          memberUid: widget.targetUid,
+          memberName: widget.name,
+          memberPhotoUrl: widget.photoUrl,
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
     final currentUid = FirebaseAuth.instance.currentUser?.uid;
     final isMe = currentUid == widget.targetUid;
+    final canUploadSelfie =
+        isMe &&
+        widget.weekKey == obtenerWeekKeyActual() &&
+        obtenerSundayWindowState().canUpload;
+    final canUploadLateSelfie =
+        isMe &&
+        miembroPuedeSubirSelfieLunesConRetraso(widget.weekKey, widget.joinedAt);
+    final canTapSelfie = canUploadSelfie || canUploadLateSelfie;
     final displayName = formatUserDisplayName(widget.name);
+    final statusLabel = missingSundaySelfieStatusLabel(widget.weekKey);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        SizedBox(
-          height: 32,
-          child: Row(
-            children: [
-              MiniProfileAvatar(
-                name: displayName,
-                photoUrl: widget.photoUrl,
-                size: 24,
-                borderColor: ssBg,
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  displayName,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: ssTitle,
-                    fontSize: 13.5,
-                    fontWeight: FontWeight.w900,
-                    height: 1,
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: _openMemberSelfies,
+          child: SizedBox(
+            height: 32,
+            child: Row(
+              children: [
+                MiniProfileAvatar(
+                  name: displayName,
+                  photoUrl: widget.photoUrl,
+                  size: 24,
+                  borderColor: ssBg,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: ssTitle,
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w900,
+                      height: 1,
+                    ),
                   ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
         Expanded(
           child: CustomPaint(
-            painter: const SundayDashedBorderPainter(
-              color: ssBorder,
+            foregroundPainter: const SundayDashedBorderPainter(
+              color: ssOrangeMid,
               radius: 18,
-              strokeWidth: 1.4,
+              strokeWidth: 0.9,
               dashLength: 4,
               gapLength: 4,
             ),
-            child: Container(
-              decoration: BoxDecoration(
-                color: Colors.white,
+            child: Material(
+              color: Colors.transparent,
+              borderRadius: BorderRadius.circular(18),
+              child: InkWell(
                 borderRadius: BorderRadius.circular(18),
-              ),
-              padding: const EdgeInsets.fromLTRB(10, 12, 10, 10),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Spacer(),
-                  MiniProfileAvatar(
-                    name: displayName,
-                    photoUrl: widget.photoUrl,
-                    size: 54,
-                    borderColor: ssBg,
+                onTap: canTapSelfie && !openingCameraOrUploading
+                    ? _openCameraAndUpload
+                    : null,
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(18),
                   ),
-                  const SizedBox(height: 8),
-                  Text(
-                    displayName,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: ssText3,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
-                    ),
+                  padding: const EdgeInsets.fromLTRB(10, 12, 10, 10),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Spacer(),
+                      if (openingCameraOrUploading)
+                        const SizedBox(
+                          width: 54,
+                          height: 54,
+                          child: Padding(
+                            padding: EdgeInsets.all(12),
+                            child: CircularProgressIndicator(
+                              color: ssOrange,
+                              strokeWidth: 2.5,
+                            ),
+                          ),
+                        )
+                      else
+                        MiniProfileAvatar(
+                          name: displayName,
+                          photoUrl: widget.photoUrl,
+                          size: 54,
+                          borderColor: ssBg,
+                        ),
+                      const SizedBox(height: 8),
+                      Text(
+                        displayName,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: ssText3,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        statusLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          color: ssText3,
+                          fontSize: 10,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      if (canTapSelfie) ...[
+                        const SizedBox(height: 8),
+                        Icon(
+                          canUploadLateSelfie
+                              ? Icons.lock_clock_rounded
+                              : Icons.photo_camera_rounded,
+                          color: openingCameraOrUploading
+                              ? ssText3
+                              : ssOrangeDark,
+                          size: 18,
+                        ),
+                      ],
+                      const Spacer(),
+                    ],
                   ),
-                  const SizedBox(height: 4),
-                  const Text(
-                    'Sunday Selfie pendiente',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: ssText3,
-                      fontSize: 10,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                  const Spacer(),
-                ],
+                ),
               ),
             ),
           ),
         ),
         const SizedBox(height: 8),
-        if (isMe || currentUid == null)
-          const SizedBox(height: 31)
-        else
-          MissingSelfieReminderButton(
-            groupId: widget.groupId,
-            weekKey: widget.weekKey,
-            targetUid: widget.targetUid,
-            sending: sending,
-            onTap: _sendReminder,
-          ),
+        const MissingSelfieReactionPlaceholder(),
       ],
+    );
+  }
+}
+
+class MissingSelfieReactionPlaceholder extends StatelessWidget {
+  const MissingSelfieReactionPlaceholder({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const SizedBox(
+      height: 31,
+      child: CustomPaint(
+        foregroundPainter: SundayDashedBorderPainter(
+          color: ssOrangeMid,
+          radius: 999,
+          strokeWidth: 0.9,
+          dashLength: 4,
+          gapLength: 4,
+        ),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.all(Radius.circular(999)),
+          ),
+          child: SizedBox.expand(),
+        ),
+      ),
     );
   }
 }
@@ -9012,7 +19224,10 @@ class MissingSelfieReminderButton extends StatelessWidget {
   final String weekKey;
   final String targetUid;
   final bool sending;
+  final bool preparingExtraReminder;
+  final bool extraReminderUnlocked;
   final VoidCallback onTap;
+  final VoidCallback onPrepareExtraReminder;
 
   const MissingSelfieReminderButton({
     super.key,
@@ -9020,34 +19235,44 @@ class MissingSelfieReminderButton extends StatelessWidget {
     required this.weekKey,
     required this.targetUid,
     required this.sending,
+    required this.preparingExtraReminder,
+    required this.extraReminderUnlocked,
     required this.onTap,
+    required this.onPrepareExtraReminder,
   });
 
   @override
   Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
     final currentUid = FirebaseAuth.instance.currentUser?.uid;
 
     if (currentUid == null || !esDomingo()) return const SizedBox.shrink();
 
-    final reminderRef = FirebaseFirestore.instance
+    final targetRemindersRef = FirebaseFirestore.instance
         .collection('groups')
         .doc(groupId)
         .collection('weeks')
         .doc(weekKey)
         .collection('reminders')
-        .doc('${currentUid}_$targetUid');
+        .where('targetUid', isEqualTo: targetUid)
+        .limit(1);
 
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: reminderRef.snapshots(),
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      stream: targetRemindersRef.snapshots(),
       builder: (context, snapshot) {
-        final sent = snapshot.data?.exists ?? false;
-        final disabled = sent || sending;
+        final sent = snapshot.data?.docs.isNotEmpty ?? false;
+        final needsAd = sent && !extraReminderUnlocked;
+        final busy = sending || preparingExtraReminder;
 
         return Material(
           color: Colors.transparent,
           child: InkWell(
             borderRadius: BorderRadius.circular(999),
-            onTap: disabled ? null : onTap,
+            onTap: busy
+                ? null
+                : needsAd
+                ? onPrepareExtraReminder
+                : onTap,
             child: Container(
               height: 31,
               width: double.infinity,
@@ -9057,7 +19282,7 @@ class MissingSelfieReminderButton extends StatelessWidget {
                 color: Colors.white,
                 borderRadius: BorderRadius.circular(999),
                 border: Border.all(
-                  color: disabled ? ssBorder : ssOrangeMid,
+                  color: busy ? ssBorder : ssOrangeMid,
                   width: 1.2,
                 ),
                 boxShadow: [
@@ -9074,23 +19299,25 @@ class MissingSelfieReminderButton extends StatelessWidget {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(
-                      sent
+                      needsAd
                           ? Icons.check_rounded
                           : Icons.notifications_none_rounded,
-                      color: disabled ? ssText3 : ssOrangeDark,
+                      color: busy ? ssText3 : ssOrangeDark,
                       size: 13,
                     ),
                     const SizedBox(width: 4),
                     Text(
                       sending
                           ? 'Enviando...'
-                          : sent
-                              ? 'Recordatorio enviado'
-                              : 'Enviar recordatorio',
+                          : preparingExtraReminder
+                          ? 'Anuncio...'
+                          : needsAd
+                          ? 'Zumbido enviado'
+                          : 'Enviar zumbido',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        color: disabled ? ssText3 : ssOrangeDark,
+                        color: busy ? ssText3 : ssOrangeDark,
                         fontSize: 9.4,
                         fontWeight: FontWeight.w900,
                       ),
@@ -9108,6 +19335,8 @@ class MissingSelfieReminderButton extends StatelessWidget {
 
 class SelfieTile extends StatelessWidget {
   final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
   final String weekKey;
   final String postUid;
   final Map<String, dynamic> post;
@@ -9116,6 +19345,8 @@ class SelfieTile extends StatelessWidget {
   const SelfieTile({
     super.key,
     required this.groupId,
+    required this.groupName,
+    required this.groupPhotoUrl,
     required this.weekKey,
     required this.postUid,
     required this.post,
@@ -9144,6 +19375,25 @@ class SelfieTile extends StatelessWidget {
         .collection('reactions')
         .orderBy('updatedAt', descending: true);
 
+    void openAuthorSelfies({
+      required String memberName,
+      required String? memberPhotoUrl,
+    }) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => GroupMemberSelfiesScreen(
+            groupId: groupId,
+            groupName: groupName,
+            groupPhotoUrl: groupPhotoUrl,
+            memberUid: postUid,
+            memberName: memberName,
+            memberPhotoUrl: memberPhotoUrl,
+          ),
+        ),
+      );
+    }
+
     return Material(
       color: Colors.transparent,
       child: InkWell(
@@ -9159,38 +19409,46 @@ class SelfieTile extends StatelessWidget {
                 final memberPhotoUrl =
                     memberData?['effectivePhotoUrl'] as String?;
                 final memberName = formatUserDisplayName(
-                    memberData?['effectiveName'] ?? authorName,
-                  );
-                final resolvedPhotoUrl = postAuthorPhotoUrl != null &&
+                  memberData?['effectiveName'] ?? authorName,
+                );
+                final resolvedPhotoUrl =
+                    postAuthorPhotoUrl != null &&
                         postAuthorPhotoUrl.trim().isNotEmpty
                     ? postAuthorPhotoUrl
                     : memberPhotoUrl;
 
-                return SizedBox(
-                  height: 32,
-                  child: Row(
-                    children: [
-                      MiniProfileAvatar(
-                        name: memberName,
-                        photoUrl: resolvedPhotoUrl,
-                        size: 24,
-                        borderColor: ssBg,
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          memberName,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: ssTitle,
-                            fontSize: 13.5,
-                            fontWeight: FontWeight.w900,
-                            height: 1,
+                return GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => openAuthorSelfies(
+                    memberName: memberName,
+                    memberPhotoUrl: resolvedPhotoUrl,
+                  ),
+                  child: SizedBox(
+                    height: 32,
+                    child: Row(
+                      children: [
+                        MiniProfileAvatar(
+                          name: memberName,
+                          photoUrl: resolvedPhotoUrl,
+                          size: 24,
+                          borderColor: ssBg,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            memberName,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              color: ssTitle,
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.w900,
+                              height: 1,
+                            ),
                           ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
                 );
               },
@@ -9202,16 +19460,14 @@ class SelfieTile extends StatelessWidget {
                   width: double.infinity,
                   color: ssOrangeLight,
                   child: imageUrl.isNotEmpty
-                      ? Image.network(
-                          imageUrl,
+                      ? CachedRemoteImage(
+                          imageUrl: imageUrl,
+                          cacheVariant: 'thumbnail',
                           fit: BoxFit.cover,
                           alignment: Alignment.center,
                           filterQuality: FilterQuality.high,
-                          loadingBuilder: (context, child, progress) {
-                            if (progress == null) return child;
-                            return const _ImageLoadingFill();
-                          },
-                          errorBuilder: (_, _, _) => Center(
+                          loadingWidget: const _ImageLoadingFill(),
+                          errorWidget: Center(
                             child: Text(
                               initialsFromName(authorName),
                               style: const TextStyle(
@@ -9244,17 +19500,20 @@ class SelfieTile extends StatelessWidget {
   }
 }
 
-
 class GroupAggregatedReactionsStrip extends StatelessWidget {
   final Query<Map<String, dynamic>> reactionsRef;
   final bool compact;
   final bool overlay;
+  final bool plain;
+  final bool hideWhenEmpty;
 
   const GroupAggregatedReactionsStrip({
     super.key,
     required this.reactionsRef,
     this.compact = false,
     this.overlay = false,
+    this.plain = false,
+    this.hideWhenEmpty = false,
   });
 
   @override
@@ -9273,29 +19532,37 @@ class GroupAggregatedReactionsStrip extends StatelessWidget {
           counts[emoji] = (counts[emoji] ?? 0) + 1;
         }
 
-        if (counts.isEmpty) {
-          return SizedBox(height: compact ? 26 : 31);
+        if (counts.isEmpty && hideWhenEmpty) {
+          return const SizedBox.shrink();
         }
+
+        final overlayTextShadow = [
+          Shadow(
+            color: Colors.black.withValues(alpha: 0.42),
+            blurRadius: 5,
+            offset: const Offset(0, 1),
+          ),
+        ];
 
         return Container(
           height: compact ? 28 : 31,
-          decoration: BoxDecoration(
-            color: overlay
-                ? Colors.white.withValues(alpha: 0.88)
-                : Colors.white,
-            borderRadius: BorderRadius.circular(999),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: overlay ? 0.12 : 0.045),
-                blurRadius: overlay ? 10 : 8,
-                offset: const Offset(0, 2),
-              ),
-            ],
-          ),
+          decoration: overlay || plain
+              ? null
+              : BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(999),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.045),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
+                ),
           child: ListView.separated(
             scrollDirection: Axis.horizontal,
             padding: EdgeInsets.symmetric(
-              horizontal: compact ? 8 : 10,
+              horizontal: overlay || plain ? 0 : (compact ? 8 : 10),
               vertical: compact ? 5 : 6,
             ),
             itemCount: counts.length,
@@ -9314,20 +19581,18 @@ class GroupAggregatedReactionsStrip extends StatelessWidget {
                   children: [
                     Text(
                       entry.key,
-                      style: TextStyle(
-                        fontSize: compact ? 13 : 14,
-                        height: 1,
-                      ),
+                      style: TextStyle(fontSize: compact ? 13 : 14, height: 1),
                     ),
                     if (entry.value > 1) ...[
                       const SizedBox(width: 2),
                       Text(
                         '${entry.value}',
                         style: TextStyle(
-                          color: ssTitle,
+                          color: overlay ? Colors.white : ssTitle,
                           fontSize: compact ? 13 : 14,
                           fontWeight: FontWeight.w900,
                           height: 1,
+                          shadows: overlay ? overlayTextShadow : null,
                           fontFeatures: const [FontFeature.tabularFigures()],
                         ),
                       ),
@@ -9345,20 +19610,33 @@ class GroupAggregatedReactionsStrip extends StatelessWidget {
 
 class SelfieViewerEntry {
   final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
   final String weekKey;
   final String postUid;
   final Map<String, dynamic> post;
 
   const SelfieViewerEntry({
     required this.groupId,
+    this.groupName = 'Grupo',
+    this.groupPhotoUrl,
     required this.weekKey,
     required this.postUid,
     required this.post,
   });
 }
 
+enum _SelfieViewerAction {
+  downloadSelfie,
+  replaceProfilePhoto,
+  report,
+  deleteSelfie,
+}
+
 class SelfieFullScreen extends StatefulWidget {
   final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
   final String weekKey;
   final String postUid;
   final Map<String, dynamic> post;
@@ -9368,6 +19646,8 @@ class SelfieFullScreen extends StatefulWidget {
   const SelfieFullScreen({
     super.key,
     required this.groupId,
+    this.groupName = 'Grupo',
+    this.groupPhotoUrl,
     required this.weekKey,
     required this.postUid,
     required this.post,
@@ -9382,7 +19662,11 @@ class SelfieFullScreen extends StatefulWidget {
 class _SelfieFullScreenState extends State<SelfieFullScreen> {
   bool sendingReaction = false;
   bool sendingReport = false;
+  bool replacingProfilePhoto = false;
+  bool downloadingSelfie = false;
+  bool deletingSelfie = false;
   late int currentIndex;
+  late PageController pageController;
 
   List<SelfieViewerEntry> get entries {
     final provided = widget.galleryEntries;
@@ -9390,6 +19674,8 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
     return [
       SelfieViewerEntry(
         groupId: widget.groupId,
+        groupName: widget.groupName,
+        groupPhotoUrl: widget.groupPhotoUrl,
         weekKey: widget.weekKey,
         postUid: widget.postUid,
         post: widget.post,
@@ -9401,7 +19687,10 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
   void initState() {
     super.initState();
     final maxIndex = entries.length - 1;
-    currentIndex = widget.initialIndex.clamp(0, maxIndex < 0 ? 0 : maxIndex).toInt();
+    currentIndex = widget.initialIndex
+        .clamp(0, maxIndex < 0 ? 0 : maxIndex)
+        .toInt();
+    pageController = PageController(initialPage: currentIndex);
   }
 
   @override
@@ -9410,19 +19699,145 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
     if (oldWidget.galleryEntries != widget.galleryEntries) {
       final maxIndex = entries.length - 1;
       currentIndex = currentIndex.clamp(0, maxIndex < 0 ? 0 : maxIndex).toInt();
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !pageController.hasClients) return;
+        pageController.jumpToPage(currentIndex);
+      });
     }
   }
 
-  void _moveVertical(int delta) {
+  void _setCurrentIndex(int index) {
     final list = entries;
-    if (list.length <= 1) return;
-    final next = (currentIndex + delta).clamp(0, list.length - 1).toInt();
+    final next = index.clamp(0, list.length - 1).toInt();
     if (next == currentIndex) return;
     setState(() {
       currentIndex = next;
       sendingReaction = false;
       sendingReport = false;
+      downloadingSelfie = false;
+      deletingSelfie = false;
     });
+  }
+
+  @override
+  void dispose() {
+    pageController.dispose();
+    super.dispose();
+  }
+
+  void _openAuthorSelfies(
+    SelfieViewerEntry entry, {
+    required String authorName,
+    required String? authorPhotoUrl,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => GroupMemberSelfiesScreen(
+          groupId: entry.groupId,
+          groupName: entry.groupName,
+          groupPhotoUrl: entry.groupPhotoUrl,
+          memberUid: entry.postUid,
+          memberName: authorName,
+          memberPhotoUrl: authorPhotoUrl,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _sendReaction(SelfieViewerEntry entry, String emoji) async {
+    if (sendingReaction) return;
+
+    setState(() => sendingReaction = true);
+    try {
+      await reaccionarASelfie(
+        groupId: entry.groupId,
+        weekKey: entry.weekKey,
+        postUid: entry.postUid,
+        emoji: emoji,
+      );
+    } catch (error) {
+      final isOwnReactionError = error.toString().contains(
+        'No puedes reaccionar a tu propio selfie',
+      );
+      if (mounted && !isOwnReactionError) {
+        showSundaySnack(context, 'Error al reaccionar: $error');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => sendingReaction = false);
+      }
+    }
+  }
+
+  Future<void> _openReactionPicker({
+    required String? currentReaction,
+    required bool canReact,
+    required String unavailableMessage,
+    required ValueChanged<String> onReact,
+  }) async {
+    if (sendingReaction) return;
+
+    if (!canReact) {
+      final message = unavailableMessage.trim();
+      if (message.isNotEmpty) showSundaySnack(context, message);
+      return;
+    }
+
+    final selected = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) =>
+          EmojiReactionPickerSheet(currentReaction: currentReaction),
+    );
+
+    if (selected == null || selected.isEmpty) return;
+    onReact(selected);
+  }
+
+  Future<void> _handleImageReactionHold(
+    SelfieViewerEntry entry, {
+    required bool isOwnSelfie,
+    required String? currentReaction,
+  }) async {
+    if (sendingReaction || isOwnSelfie) return;
+
+    final currentUser = FirebaseAuth.instance.currentUser;
+    if (currentUser == null) {
+      showSundaySnack(context, 'Inicia sesión para reaccionar');
+      return;
+    }
+
+    final myPostRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(entry.groupId)
+        .collection('weeks')
+        .doc(entry.weekKey)
+        .collection('posts')
+        .doc(currentUser.uid);
+
+    final myPostSnapshot = await myPostRef.get();
+    if (!mounted) return;
+
+    final hasPublishedThisWeek = myPostSnapshot.exists;
+    final isCurrentSundayWeek =
+        esDomingo() && entry.weekKey == obtenerWeekKeyActual();
+    if (!isCurrentSundayWeek && currentReaction != null) return;
+
+    final missingCurrentSundaySelfie =
+        !hasPublishedThisWeek &&
+        esDomingo() &&
+        entry.weekKey == obtenerWeekKeyActual();
+
+    await _openReactionPicker(
+      currentReaction: currentReaction,
+      canReact: hasPublishedThisWeek,
+      unavailableMessage: missingCurrentSundaySelfie
+          ? 'Sube tu selfie semanal para poder reaccionar'
+          : '',
+      onReact: (emoji) => unawaited(_sendReaction(entry, emoji)),
+    );
   }
 
   Future<void> _reportSelfie(SelfieViewerEntry entry) async {
@@ -9503,256 +19918,359 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
     }
   }
 
+  Future<void> _replaceProfilePhoto(SelfieViewerEntry entry) async {
+    if (replacingProfilePhoto) return;
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || user.uid != entry.postUid) {
+      showSundaySnack(context, 'Solo puedes usar tus propias selfies');
+      return;
+    }
+
+    final imageUrl = (entry.post['imageUrl'] ?? entry.post['thumbUrl'] ?? '')
+        .toString()
+        .trim();
+    if (imageUrl.isEmpty) {
+      showSundaySnack(context, 'Esta selfie no tiene una imagen disponible');
+      return;
+    }
+
+    setState(() => replacingProfilePhoto = true);
+
+    try {
+      final unlocked = await prepararCambioFotoPerfilConAnuncio(context);
+      if (!mounted || !unlocked) return;
+
+      await reemplazarFotoPerfilConSelfie(user: user, selfieUrl: imageUrl);
+
+      if (!mounted) return;
+      showSundaySnack(context, 'Foto de perfil actualizada');
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error actualizando foto: $error');
+    } finally {
+      if (mounted) setState(() => replacingProfilePhoto = false);
+    }
+  }
+
+  Future<void> _downloadSelfie(SelfieViewerEntry entry) async {
+    if (downloadingSelfie) return;
+
+    final imageUrl = (entry.post['imageUrl'] ?? entry.post['thumbUrl'] ?? '')
+        .toString()
+        .trim();
+    if (imageUrl.isEmpty) {
+      showSundaySnack(context, 'Esta selfie no tiene una imagen disponible');
+      return;
+    }
+
+    final authorName = formatUserDisplayName(
+      entry.post['authorName'] ?? 'Usuario',
+    );
+
+    setState(() => downloadingSelfie = true);
+    showSundaySnack(context, 'Guardando selfie...');
+
+    try {
+      final file = await descargarSelfieIndividual(
+        imageUrl: imageUrl,
+        groupName: entry.groupName,
+        weekKey: entry.weekKey,
+        authorName: authorName,
+      );
+
+      if (!mounted) return;
+      final savedCount = await guardarArchivosDescargadosEnTelefono(
+        files: [file],
+      );
+
+      if (!mounted) return;
+      showSundaySnack(
+        context,
+        savedCount == 0
+            ? 'No se pudo guardar la selfie'
+            : 'Selfie guardada en el teléfono',
+      );
+    } catch (error) {
+      if (!mounted) return;
+      final message = mensajeErrorGuardandoArchivos(error);
+      showSundaySnack(
+        context,
+        error is UnsupportedError || message.contains('Fotos')
+            ? message
+            : 'No se pudo guardar la selfie en el teléfono',
+      );
+    } finally {
+      if (mounted) setState(() => downloadingSelfie = false);
+    }
+  }
+
+  Future<bool> _confirmDeleteSelfie() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(22),
+          ),
+          title: const Text('Borrar selfie'),
+          content: const Text(
+            'Esta selfie se eliminará definitivamente, también de la nube. Esta acción no se puede deshacer.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancelar'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text(
+                'Sí, borrar',
+                style: TextStyle(
+                  color: Color(0xFFE74C3C),
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+
+    return confirmed == true;
+  }
+
+  Future<void> _deleteSelfie(SelfieViewerEntry entry) async {
+    if (deletingSelfie) return;
+
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null || user.uid != entry.postUid) {
+      showSundaySnack(context, 'Solo puedes borrar tus propias selfies');
+      return;
+    }
+
+    final confirmed = await _confirmDeleteSelfie();
+    if (!confirmed || !mounted) return;
+
+    setState(() => deletingSelfie = true);
+
+    var deleted = false;
+    try {
+      await borrarSelfie(
+        groupId: entry.groupId,
+        weekKey: entry.weekKey,
+        postUid: entry.postUid,
+      );
+      deleted = true;
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error borrando la selfie: $error');
+    } finally {
+      if (mounted && !deleted) setState(() => deletingSelfie = false);
+    }
+
+    if (!mounted || !deleted) return;
+    showSundaySnack(context, 'Selfie borrada definitivamente');
+    Navigator.pop(context);
+  }
+
+  void _handleSelfieAction(
+    _SelfieViewerAction action,
+    SelfieViewerEntry entry,
+  ) {
+    switch (action) {
+      case _SelfieViewerAction.downloadSelfie:
+        unawaited(_downloadSelfie(entry));
+        break;
+      case _SelfieViewerAction.replaceProfilePhoto:
+        unawaited(_replaceProfilePhoto(entry));
+        break;
+      case _SelfieViewerAction.report:
+        unawaited(_reportSelfie(entry));
+        break;
+      case _SelfieViewerAction.deleteSelfie:
+        unawaited(_deleteSelfie(entry));
+        break;
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final list = entries;
-    final entry = list[currentIndex.clamp(0, list.length - 1).toInt()];
     final currentUser = FirebaseAuth.instance.currentUser;
-    final groupId = entry.groupId;
-    final weekKey = entry.weekKey;
-    final postUid = entry.postUid;
-    final post = entry.post;
-    final authorName = formatUserDisplayName(post['authorName'] ?? 'Usuario');
-    final authorPhotoUrl = post['authorPhotoUrl'] as String?;
-    final imageUrl = (post['imageUrl'] ?? '').toString();
-    final weekLabel = obtenerEtiquetaSemana(weekKey);
 
-    final postRef = FirebaseFirestore.instance
-        .collection('groups')
-        .doc(groupId)
-        .collection('weeks')
-        .doc(weekKey)
-        .collection('posts')
-        .doc(postUid);
+    return Scaffold(
+      backgroundColor: ssBg,
+      body: PageView.builder(
+        controller: pageController,
+        scrollDirection: Axis.vertical,
+        physics: const PageScrollPhysics(parent: BouncingScrollPhysics()),
+        itemCount: list.length,
+        onPageChanged: _setCurrentIndex,
+        itemBuilder: (context, index) {
+          final entry = list[index];
+          final groupId = entry.groupId;
+          final weekKey = entry.weekKey;
+          final postUid = entry.postUid;
+          final post = entry.post;
+          final authorName = formatUserDisplayName(
+            post['authorName'] ?? 'Usuario',
+          );
+          final authorPhotoUrl = post['authorPhotoUrl'] as String?;
+          final weekLabel = obtenerEtiquetaSemana(weekKey);
+          final isOwnSelfie = currentUser?.uid == postUid;
+          final imageUrl = (post['imageUrl'] ?? post['thumbUrl'] ?? '')
+              .toString();
 
-    final reactionsRef = postRef
-        .collection('reactions')
-        .orderBy('updatedAt', descending: true);
-
-    final myPostRef = currentUser == null
-        ? null
-        : FirebaseFirestore.instance
+          final postRef = FirebaseFirestore.instance
               .collection('groups')
               .doc(groupId)
               .collection('weeks')
               .doc(weekKey)
               .collection('posts')
-              .doc(currentUser.uid);
-    final isOwnSelfie = currentUser?.uid == postUid;
+              .doc(postUid);
 
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-        stream: reactionsRef.snapshots(),
-        builder: (context, reactionsSnapshot) {
-          final reactions = reactionsSnapshot.data?.docs ?? [];
-          final myReaction = currentUser == null
+          final reactionsRef = postRef
+              .collection('reactions')
+              .orderBy('updatedAt', descending: true);
+
+          final myPostRef = currentUser == null
               ? null
-              : reactions
-                    .where((doc) => doc.id == currentUser.uid)
-                    .map((doc) => doc.data()['emoji'] as String?)
-                    .where((emoji) => emoji != null && emoji.isNotEmpty)
-                    .cast<String>()
-                    .firstOrNull;
+              : FirebaseFirestore.instance
+                    .collection('groups')
+                    .doc(groupId)
+                    .collection('weeks')
+                    .doc(weekKey)
+                    .collection('posts')
+                    .doc(currentUser.uid);
 
-          return GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onVerticalDragEnd: (details) {
-              final velocity = details.primaryVelocity ?? 0;
-              if (velocity < -220) _moveVertical(1);
-              if (velocity > 220) _moveVertical(-1);
+          return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+            stream: reactionsRef.snapshots(),
+            builder: (context, reactionsSnapshot) {
+              final reactions = reactionsSnapshot.data?.docs ?? [];
+              final myReaction = currentUser == null
+                  ? null
+                  : reactions
+                        .where((doc) => doc.id == currentUser.uid)
+                        .map((doc) => doc.data()['emoji'] as String?)
+                        .where((emoji) => emoji != null && emoji.isNotEmpty)
+                        .cast<String>()
+                        .firstOrNull;
+
+              Widget reactionPanel({
+                required bool canReact,
+                required String disabledMessage,
+                required String actionDisabledMessage,
+                bool reserveEmptySpace = false,
+              }) {
+                return FullScreenReactionPanel(
+                  reactions: reactions,
+                  myReaction: myReaction,
+                  canReact: canReact,
+                  isSending: sendingReaction,
+                  disabledMessage: disabledMessage,
+                  actionDisabledMessage: actionDisabledMessage,
+                  reserveEmptySpace: reserveEmptySpace,
+                  onAddReactionTap: () {
+                    unawaited(
+                      _openReactionPicker(
+                        currentReaction: myReaction,
+                        canReact: canReact,
+                        unavailableMessage: actionDisabledMessage,
+                        onReact: (emoji) =>
+                            unawaited(_sendReaction(entry, emoji)),
+                      ),
+                    );
+                  },
+                );
+              }
+
+              final panel = currentUser == null || myPostRef == null
+                  ? reactionPanel(
+                      canReact: false,
+                      disabledMessage: 'Inicia sesión para reaccionar',
+                      actionDisabledMessage: '',
+                    )
+                  : StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                      stream: myPostRef.snapshots(),
+                      builder: (context, myPostSnapshot) {
+                        final hasPublishedThisWeek =
+                            myPostSnapshot.data?.exists ?? false;
+                        final isCurrentSundayWeek =
+                            esDomingo() && weekKey == obtenerWeekKeyActual();
+                        final canReact =
+                            hasPublishedThisWeek &&
+                            !isOwnSelfie &&
+                            (isCurrentSundayWeek || myReaction == null);
+                        final missingCurrentSundaySelfie =
+                            !hasPublishedThisWeek &&
+                            !isOwnSelfie &&
+                            isCurrentSundayWeek;
+                        return reactionPanel(
+                          canReact: canReact,
+                          disabledMessage: '',
+                          actionDisabledMessage: missingCurrentSundaySelfie
+                              ? 'Sube tu selfie semanal para poder reaccionar'
+                              : '',
+                          reserveEmptySpace: isOwnSelfie,
+                        );
+                      },
+                    );
+
+              return SafeArea(
+                child: Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(
+                        12,
+                        ssHeaderTopPadding,
+                        14,
+                        0,
+                      ),
+                      child: _SelfieViewerHeader(
+                        authorName: authorName,
+                        authorPhotoUrl: authorPhotoUrl,
+                        subtitle: weekLabel,
+                        busy:
+                            replacingProfilePhoto ||
+                            downloadingSelfie ||
+                            sendingReport ||
+                            deletingSelfie,
+                        showOptions: currentUser != null,
+                        canReplaceProfilePhoto: isOwnSelfie,
+                        canReport: !isOwnSelfie,
+                        canDeleteSelfie: isOwnSelfie,
+                        onBack: () => Navigator.pop(context),
+                        onAuthorTap: () => _openAuthorSelfies(
+                          entry,
+                          authorName: authorName,
+                          authorPhotoUrl: authorPhotoUrl,
+                        ),
+                        onSelected: (action) =>
+                            _handleSelfieAction(action, entry),
+                      ),
+                    ),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(18, 6, 18, 4),
+                        child: FullScreenSelfieImage(
+                          imageUrl: imageUrl,
+                          thumbnailUrl: (post['thumbUrl'] ?? '').toString(),
+                          fallbackText: initialsFromName(authorName),
+                          onReactionHold: () => _handleImageReactionHold(
+                            entry,
+                            isOwnSelfie: isOwnSelfie,
+                            currentReaction: myReaction,
+                          ),
+                        ),
+                      ),
+                    ),
+                    panel,
+                  ],
+                ),
+              );
             },
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                Positioned.fill(
-                  child: FullScreenSelfieImage(
-                    imageUrl: imageUrl,
-                    fallbackText: initialsFromName(authorName),
-                  ),
-                ),
-                const Positioned.fill(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                        colors: [
-                          Color(0xAA000000),
-                          Color(0x00000000),
-                          Color(0x00000000),
-                          Color(0xDD000000),
-                        ],
-                        stops: [0.0, 0.24, 0.55, 1.0],
-                      ),
-                    ),
-                  ),
-                ),
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  top: 0,
-                  child: SafeArea(
-                    bottom: false,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.center,
-                        children: [
-                          CircleIconButton(
-                            icon: Icons.chevron_left_rounded,
-                            onTap: () => Navigator.pop(context),
-                            dark: true,
-                          ),
-                          const SizedBox(width: 12),
-                          CircleAvatar(
-                            radius: 22,
-                            backgroundColor: ssOrange,
-                            backgroundImage:
-                                authorPhotoUrl == null || authorPhotoUrl.isEmpty
-                                ? null
-                                : NetworkImage(authorPhotoUrl),
-                            child:
-                                authorPhotoUrl == null || authorPhotoUrl.isEmpty
-                                ? Text(
-                                    initialsFromName(authorName),
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w900,
-                                    ),
-                                  )
-                                : null,
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  authorName,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.w900,
-                                    fontSize: 18,
-                                  ),
-                                ),
-                                const SizedBox(height: 2),
-                                Text(
-                                  list.length > 1
-                                      ? '$weekLabel · ${currentIndex + 1}/${list.length}'
-                                      : weekLabel,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                    color: Colors.white.withValues(alpha: 0.72),
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          if (currentUser != null && !isOwnSelfie) ...[
-                            const SizedBox(width: 8),
-                            CircleIconButton(
-                              icon: sendingReport
-                                  ? Icons.hourglass_top_rounded
-                                  : Icons.flag_outlined,
-                              onTap: sendingReport
-                                  ? () {}
-                                  : () => _reportSelfie(entry),
-                              dark: true,
-                            ),
-                          ],
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                if (list.length > 1)
-                  Positioned(
-                    right: 16,
-                    top: MediaQuery.paddingOf(context).top + 86,
-                    child: Column(
-                      children: [
-                        _SelfiePagerHintButton(
-                          icon: Icons.keyboard_arrow_up_rounded,
-                          enabled: currentIndex > 0,
-                          onTap: () => _moveVertical(-1),
-                        ),
-                        const SizedBox(height: 8),
-                        _SelfiePagerHintButton(
-                          icon: Icons.keyboard_arrow_down_rounded,
-                          enabled: currentIndex < list.length - 1,
-                          onTap: () => _moveVertical(1),
-                        ),
-                      ],
-                    ),
-                  ),
-                Positioned(
-                  left: 20,
-                  right: 20,
-                  bottom: 16,
-                  child: SafeArea(
-                    top: false,
-                    child: currentUser == null || myPostRef == null
-                        ? FullScreenReactionPanel(
-                            reactions: reactions,
-                            myReaction: myReaction,
-                            canReact: false,
-                            isSending: sendingReaction,
-                            disabledMessage: 'Inicia sesión para reaccionar',
-                            onReact: (_) async {},
-                          )
-                        : StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-                            stream: myPostRef.snapshots(),
-                            builder: (context, myPostSnapshot) {
-                              final hasPublishedThisWeek =
-                                  myPostSnapshot.data?.exists ?? false;
-                              final canReact =
-                                  hasPublishedThisWeek && !isOwnSelfie;
-                              return FullScreenReactionPanel(
-                                reactions: reactions,
-                                myReaction: myReaction,
-                                canReact: canReact,
-                                isSending: sendingReaction,
-                                disabledMessage: isOwnSelfie
-                                    ? ''
-                                    : 'Sube tu selfie semanal para poder reaccionar',
-                                onReact: (emoji) async {
-                                  if (!canReact || sendingReaction) return;
-                                  setState(() => sendingReaction = true);
-                                  try {
-                                    await reaccionarASelfie(
-                                      groupId: groupId,
-                                      weekKey: weekKey,
-                                      postUid: postUid,
-                                      emoji: emoji,
-                                    );
-                                  } catch (error) {
-                                    if (mounted) {
-                                      showSundaySnack(
-                                        this.context,
-                                        'Error al reaccionar: $error',
-                                      );
-                                    }
-                                  } finally {
-                                    if (mounted) {
-                                      setState(() => sendingReaction = false);
-                                    }
-                                  }
-                                },
-                              );
-                            },
-                          ),
-                  ),
-                ),
-              ],
-            ),
           );
         },
       ),
@@ -9760,34 +20278,304 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
   }
 }
 
-class _SelfiePagerHintButton extends StatelessWidget {
-  final IconData icon;
-  final bool enabled;
-  final VoidCallback onTap;
+class _SelfieViewerHeader extends StatelessWidget {
+  final String authorName;
+  final String? authorPhotoUrl;
+  final String subtitle;
+  final bool busy;
+  final bool showOptions;
+  final bool canReplaceProfilePhoto;
+  final bool canReport;
+  final bool canDeleteSelfie;
+  final VoidCallback onBack;
+  final VoidCallback onAuthorTap;
+  final ValueChanged<_SelfieViewerAction> onSelected;
 
-  const _SelfiePagerHintButton({
-    required this.icon,
-    required this.enabled,
-    required this.onTap,
+  const _SelfieViewerHeader({
+    required this.authorName,
+    required this.authorPhotoUrl,
+    required this.subtitle,
+    required this.busy,
+    required this.showOptions,
+    required this.canReplaceProfilePhoto,
+    required this.canReport,
+    required this.canDeleteSelfie,
+    required this.onBack,
+    required this.onAuthorTap,
+    required this.onSelected,
   });
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: enabled ? onTap : null,
-      borderRadius: BorderRadius.circular(999),
-      child: Container(
-        width: 36,
-        height: 36,
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: enabled ? 0.42 : 0.18),
-          shape: BoxShape.circle,
-          border: Border.all(color: Colors.white.withValues(alpha: 0.16)),
+    return SizedBox(
+      height: ssHeaderActionSize + ssHeaderActionTop * 2,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          _SelfieHeaderBackButton(onTap: onBack),
+          const SizedBox(width: 10),
+          Expanded(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: onAuthorTap,
+              child: Row(
+                children: [
+                  MiniProfileAvatar(
+                    name: authorName,
+                    photoUrl: authorPhotoUrl,
+                    size: 38,
+                    borderColor: Colors.white,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          authorName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Color(0xFF17191D),
+                            fontSize: 18,
+                            fontWeight: FontWeight.w900,
+                            height: 1.02,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: ssText3,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w700,
+                            height: 1,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (showOptions) ...[
+            const SizedBox(width: 6),
+            _SelfieOptionsMenuButton(
+              busy: busy,
+              canReplaceProfilePhoto: canReplaceProfilePhoto,
+              canReport: canReport,
+              canDeleteSelfie: canDeleteSelfie,
+              onSelected: onSelected,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _SelfieHeaderBackButton extends StatelessWidget {
+  final VoidCallback onTap;
+
+  const _SelfieHeaderBackButton({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.square(
+      dimension: ssHeaderActionSize,
+      child: IconButton(
+        tooltip: 'Volver',
+        onPressed: onTap,
+        padding: EdgeInsets.zero,
+        constraints: const BoxConstraints.tightFor(
+          width: ssHeaderActionSize,
+          height: ssHeaderActionSize,
         ),
-        child: Icon(
-          icon,
-          color: Colors.white.withValues(alpha: enabled ? 0.95 : 0.35),
-          size: 25,
+        icon: const SundayHeaderBackIcon(),
+      ),
+    );
+  }
+}
+
+class _SelfieOptionsMenuButton extends StatelessWidget {
+  final bool busy;
+  final bool canReplaceProfilePhoto;
+  final bool canReport;
+  final bool canDeleteSelfie;
+  final ValueChanged<_SelfieViewerAction> onSelected;
+
+  const _SelfieOptionsMenuButton({
+    required this.busy,
+    required this.canReplaceProfilePhoto,
+    required this.canReport,
+    required this.canDeleteSelfie,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<_SelfieViewerAction>(
+      tooltip: 'Opciones',
+      enabled: !busy,
+      position: PopupMenuPosition.under,
+      color: Colors.white,
+      elevation: 8,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      onSelected: onSelected,
+      itemBuilder: (context) => [
+        if (canReplaceProfilePhoto)
+          PopupMenuItem(
+            value: _SelfieViewerAction.replaceProfilePhoto,
+            child: Row(
+              children: [
+                const Icon(Icons.account_circle_outlined, color: ssOrangeDark),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: const [
+                      Text(
+                        'Reemplazar foto de perfil',
+                        style: TextStyle(
+                          color: ssText,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      SizedBox(height: 2),
+                      Text(
+                        'Ver anuncio para confirmar',
+                        style: TextStyle(
+                          color: ssText3,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        PopupMenuItem(
+          value: _SelfieViewerAction.downloadSelfie,
+          child: Row(
+            children: [
+              const Icon(Icons.download_rounded, color: ssOrangeDark),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: const [
+                    Text(
+                      'Descargar selfie',
+                      style: TextStyle(
+                        color: ssText,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    SizedBox(height: 2),
+                    Text(
+                      'Guardar en galería',
+                      style: TextStyle(
+                        color: ssText3,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        if (canReport)
+          PopupMenuItem(
+            value: _SelfieViewerAction.report,
+            child: Row(
+              children: [
+                const Icon(Icons.flag_outlined, color: ssOrangeDark),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: const [
+                      Text(
+                        'Reportar selfie',
+                        style: TextStyle(
+                          color: ssText,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      SizedBox(height: 2),
+                      Text(
+                        'Enviar para revisión privada',
+                        style: TextStyle(
+                          color: ssText3,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        if (canDeleteSelfie)
+          PopupMenuItem(
+            value: _SelfieViewerAction.deleteSelfie,
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.delete_outline_rounded,
+                  color: Color(0xFFE74C3C),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: const [
+                      Text(
+                        'Borrar selfie',
+                        style: TextStyle(
+                          color: ssText,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      SizedBox(height: 2),
+                      Text(
+                        'Eliminar definitivamente',
+                        style: TextStyle(
+                          color: ssText3,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
+      child: SizedBox.square(
+        dimension: ssHeaderActionSize,
+        child: Center(
+          child: busy
+              ? const Icon(
+                  Icons.hourglass_top_rounded,
+                  color: ssText2,
+                  size: 20,
+                )
+              : const SundayHeaderMoreIcon(),
         ),
       ),
     );
@@ -9796,64 +20584,176 @@ class _SelfiePagerHintButton extends StatelessWidget {
 
 class FullScreenSelfieImage extends StatelessWidget {
   final String imageUrl;
+  final String thumbnailUrl;
   final String fallbackText;
+  final VoidCallback? onReactionHold;
 
   const FullScreenSelfieImage({
     super.key,
     required this.imageUrl,
+    this.thumbnailUrl = '',
     required this.fallbackText,
+    this.onReactionHold,
   });
 
   @override
   Widget build(BuildContext context) {
-    if (imageUrl.isEmpty) {
-      return Center(
-        child: Text(
-          fallbackText,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 72,
-            fontWeight: FontWeight.w900,
-          ),
-        ),
-      );
-    }
-
-    return InteractiveViewer(
-      minScale: 1,
-      maxScale: 4,
-      child: Image.network(
-        imageUrl,
-        fit: BoxFit.contain,
-        width: double.infinity,
-        height: double.infinity,
-        loadingBuilder: (context, child, loadingProgress) {
-          if (loadingProgress == null) return child;
-          return const Center(
-            child: CircularProgressIndicator(color: ssOrange),
-          );
-        },
-        errorBuilder: (context, error, stackTrace) {
-          return Center(
-            child: Container(
-              width: 170,
-              height: 170,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: Colors.white.withValues(alpha: 0.16),
-                shape: BoxShape.circle,
-              ),
-              child: Text(
-                fallbackText,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 54,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
+    final borderRadius = BorderRadius.circular(36);
+    final cleanThumbnailUrl = thumbnailUrl.trim();
+    final loadingPreview =
+        cleanThumbnailUrl.isEmpty || cleanThumbnailUrl == imageUrl.trim()
+        ? const DecoratedBox(
+            decoration: BoxDecoration(color: Color(0x33FFFFFF)),
+            child: Center(child: CircularProgressIndicator(color: ssOrange)),
+          )
+        : CachedRemoteImage(
+            imageUrl: cleanThumbnailUrl,
+            cacheVariant: 'thumbnail',
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+            alignment: Alignment.center,
+            filterQuality: FilterQuality.high,
+            loadingWidget: const DecoratedBox(
+              decoration: BoxDecoration(color: Color(0x33FFFFFF)),
+              child: Center(child: CircularProgressIndicator(color: ssOrange)),
+            ),
+            errorWidget: const DecoratedBox(
+              decoration: BoxDecoration(color: Color(0x33FFFFFF)),
+              child: Center(child: CircularProgressIndicator(color: ssOrange)),
             ),
           );
-        },
+
+    final image = DecoratedBox(
+      decoration: BoxDecoration(
+        borderRadius: borderRadius,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.055),
+            blurRadius: 24,
+            offset: const Offset(0, 13),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: borderRadius,
+        child: SizedBox(
+          width: double.infinity,
+          height: double.infinity,
+          child: imageUrl.isEmpty
+              ? _SelfieImageFallback(fallbackText: fallbackText)
+              : CachedRemoteImage(
+                  imageUrl: imageUrl,
+                  cacheVariant: 'original',
+                  fit: BoxFit.cover,
+                  width: double.infinity,
+                  height: double.infinity,
+                  alignment: Alignment.center,
+                  filterQuality: FilterQuality.high,
+                  loadingWidget: loadingPreview,
+                  errorWidget: _SelfieImageFallback(fallbackText: fallbackText),
+                ),
+        ),
+      ),
+    );
+
+    final holdCallback = onReactionHold;
+    if (holdCallback == null) return image;
+
+    return _TwoSecondHoldReactionGesture(
+      onTriggered: holdCallback,
+      child: image,
+    );
+  }
+}
+
+class _TwoSecondHoldReactionGesture extends StatefulWidget {
+  final Widget child;
+  final VoidCallback onTriggered;
+
+  const _TwoSecondHoldReactionGesture({
+    required this.child,
+    required this.onTriggered,
+  });
+
+  @override
+  State<_TwoSecondHoldReactionGesture> createState() =>
+      _TwoSecondHoldReactionGestureState();
+}
+
+class _TwoSecondHoldReactionGestureState
+    extends State<_TwoSecondHoldReactionGesture> {
+  Timer? holdTimer;
+  bool triggered = false;
+
+  void _startHold() {
+    _cancelHold();
+    triggered = false;
+    holdTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted || triggered) return;
+      triggered = true;
+      HapticFeedback.selectionClick();
+      widget.onTriggered();
+    });
+  }
+
+  void _cancelHold() {
+    holdTimer?.cancel();
+    holdTimer = null;
+  }
+
+  @override
+  void dispose() {
+    _cancelHold();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) => _startHold(),
+      onTapUp: (_) => _cancelHold(),
+      onTapCancel: _cancelHold,
+      child: widget.child,
+    );
+  }
+}
+
+class _SelfieImageFallback extends StatelessWidget {
+  final String fallbackText;
+
+  const _SelfieImageFallback({required this.fallbackText});
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Color(0xFF66B8AD), Color(0xFFB9DFD7)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+      ),
+      child: Center(
+        child: Container(
+          width: 132,
+          height: 132,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.30),
+            shape: BoxShape.circle,
+          ),
+          child: Text(
+            fallbackText,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 48,
+              fontWeight: FontWeight.w900,
+              height: 1,
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -9865,7 +20765,9 @@ class FullScreenReactionPanel extends StatelessWidget {
   final bool canReact;
   final bool isSending;
   final String disabledMessage;
-  final ValueChanged<String> onReact;
+  final String actionDisabledMessage;
+  final bool reserveEmptySpace;
+  final VoidCallback onAddReactionTap;
 
   const FullScreenReactionPanel({
     super.key,
@@ -9874,134 +20776,95 @@ class FullScreenReactionPanel extends StatelessWidget {
     required this.canReact,
     required this.isSending,
     required this.disabledMessage,
-    required this.onReact,
+    required this.actionDisabledMessage,
+    required this.reserveEmptySpace,
+    required this.onAddReactionTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    final counts = <String, int>{};
-    for (final reaction in reactions) {
-      final emoji = normalizarEmojiReaccion(
-        (reaction.data()['emoji'] ?? '').toString(),
-      );
-      if (emoji.isEmpty) continue;
-      counts[emoji] = (counts[emoji] ?? 0) + 1;
-    }
+    final cleanDisabledMessage = disabledMessage.trim();
+    final cleanActionDisabledMessage = actionDisabledMessage.trim();
+    final showReactionButton =
+        canReact || cleanActionDisabledMessage.isNotEmpty;
+    final visibleReactions = reactions
+        .where((reaction) {
+          final emoji = normalizarEmojiReaccion(
+            (reaction.data()['emoji'] ?? '').toString(),
+          );
+          return emoji.isNotEmpty;
+        })
+        .toList(growable: false);
 
-    if (counts.isEmpty && !canReact && disabledMessage.isEmpty) {
+    if (visibleReactions.isEmpty &&
+        !showReactionButton &&
+        cleanDisabledMessage.isEmpty &&
+        !reserveEmptySpace) {
       return const SizedBox.shrink();
     }
 
-    return ConstrainedBox(
-      constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.42,
-      ),
-      child: SingleChildScrollView(
-        physics: const BouncingScrollPhysics(),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+    final currentUid = FirebaseAuth.instance.currentUser?.uid;
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(18, 4, 18, math.max(8, bottomInset + 4)),
+      child: Container(
+        constraints: const BoxConstraints(minHeight: 54),
+        padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(32),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.065),
+              blurRadius: 20,
+              offset: const Offset(0, 8),
+            ),
+          ],
+        ),
+        child: Row(
           children: [
-            if (counts.isNotEmpty)
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  children: counts.entries.map((entry) {
-                    final selected = myReaction == entry.key;
-                    return InkWell(
-                      borderRadius: BorderRadius.circular(999),
-                      onTap: () => showReactionUsersSheet(
-                        context: context,
-                        emoji: entry.key,
-                        reactions: reactions,
-                      ),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 7,
-                        ),
-                        decoration: BoxDecoration(
-                          color: selected
-                              ? ssOrange.withValues(alpha: 0.96)
-                              : Colors.white.withValues(alpha: 0.90),
-                          borderRadius: BorderRadius.circular(999),
-                          border: Border.all(
-                            color: selected
-                                ? ssOrange
-                                : Colors.white.withValues(alpha: 0.55),
-                          ),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withValues(alpha: 0.12),
-                              blurRadius: 10,
-                              offset: const Offset(0, 3),
+            Expanded(
+              child: visibleReactions.isEmpty
+                  ? _SelfieReactionDisabledMessage(
+                      message: cleanDisabledMessage,
+                    )
+                  : SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      physics: const BouncingScrollPhysics(),
+                      child: Row(
+                        children: visibleReactions.map((reaction) {
+                          final data = reaction.data();
+                          final emoji = normalizarEmojiReaccion(
+                            (data['emoji'] ?? '').toString(),
+                          );
+                          final name = formatUserDisplayName(
+                            data['authorName'] ?? 'Usuario',
+                          );
+                          final photoUrl = data['authorPhotoUrl'] as String?;
+
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 12),
+                            child: _SelfieReactionAvatarPill(
+                              name: name,
+                              photoUrl: photoUrl,
+                              emoji: emoji,
+                              selected:
+                                  reaction.id == currentUid &&
+                                  myReaction == emoji,
                             ),
-                          ],
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              entry.key,
-                              style: const TextStyle(
-                                fontSize: 18,
-                                height: 1,
-                              ),
-                            ),
-                            if (entry.value > 1) ...[
-                              const SizedBox(width: 4),
-                              Text(
-                                '${entry.value}',
-                                style: TextStyle(
-                                  color: selected ? Colors.white : ssTitle,
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w900,
-                                  height: 1,
-                                  fontFeatures: const [FontFeature.tabularFigures()],
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
+                          );
+                        }).toList(),
                       ),
-                    );
-                  }).toList(),
-                ),
-              ),
-            if (counts.isNotEmpty && (canReact || disabledMessage.isNotEmpty))
-              const SizedBox(height: 12),
-            if (canReact)
-              EmojiReactionButton(
-                currentReaction: myReaction,
+                    ),
+            ),
+            if (showReactionButton) ...[
+              const SizedBox(width: 8),
+              _SelfieAddReactionButton(
                 isSending: isSending,
-                onReact: onReact,
-              )
-            else if (disabledMessage.isNotEmpty)
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 12,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(18),
-                  border: Border.all(
-                    color: Colors.white.withValues(alpha: 0.10),
-                  ),
-                ),
-                child: Text(
-                  disabledMessage,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: Colors.white70,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
+                onTap: onAddReactionTap,
               ),
+            ],
           ],
         ),
       ),
@@ -10009,79 +20872,178 @@ class FullScreenReactionPanel extends StatelessWidget {
   }
 }
 
-class EmojiReactionButton extends StatelessWidget {
-  final String? currentReaction;
-  final bool isSending;
-  final ValueChanged<String> onReact;
+class _SelfieReactionAvatarPill extends StatelessWidget {
+  final String name;
+  final String? photoUrl;
+  final String emoji;
+  final bool selected;
 
-  const EmojiReactionButton({
-    super.key,
-    required this.currentReaction,
-    required this.isSending,
-    required this.onReact,
+  const _SelfieReactionAvatarPill({
+    required this.name,
+    required this.photoUrl,
+    required this.emoji,
+    required this.selected,
   });
-
-  Future<void> _openPicker(BuildContext context) async {
-    if (isSending) return;
-
-    final selected = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
-      builder: (_) => EmojiReactionPickerSheet(currentReaction: currentReaction),
-    );
-
-    if (selected == null || selected.isEmpty) return;
-    onReact(selected);
-  }
 
   @override
   Widget build(BuildContext context) {
-    return ElevatedButton(
-      onPressed: isSending ? null : () => _openPicker(context),
-      style: ElevatedButton.styleFrom(
-        backgroundColor: ssOrange,
-        foregroundColor: Colors.white,
-        elevation: 0,
-        minimumSize: const Size.fromHeight(48),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(999),
+    return Container(
+      height: 38,
+      padding: const EdgeInsets.fromLTRB(6, 4, 10, 4),
+      decoration: BoxDecoration(
+        color: selected ? ssOrangeLight : Colors.white,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(
+          color: selected ? ssOrangeMid : ssBorder,
+          width: 1.6,
         ),
       ),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Text(
-            currentReaction == null || currentReaction!.isEmpty
-                ? '😊'
-                : currentReaction!,
-            style: const TextStyle(fontSize: 20, height: 1),
+          MiniProfileAvatar(
+            name: name,
+            photoUrl: photoUrl,
+            size: 25,
+            borderColor: Colors.white,
           ),
-          const SizedBox(width: 8),
-          Text(
-            isSending ? 'Guardando...' : 'Mi reacción',
-            style: const TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w900,
-            ),
-          ),
+          const SizedBox(width: 7),
+          Text(emoji, style: const TextStyle(fontSize: 19, height: 1)),
         ],
       ),
     );
   }
 }
 
-class EmojiReactionPickerSheet extends StatelessWidget {
+class _SelfieReactionDisabledMessage extends StatelessWidget {
+  final String message;
+
+  const _SelfieReactionDisabledMessage({required this.message});
+
+  @override
+  Widget build(BuildContext context) {
+    if (message.isEmpty) return const SizedBox.shrink();
+
+    return Text(
+      message,
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(
+        color: ssText3,
+        fontSize: 12,
+        fontWeight: FontWeight.w800,
+        height: 1.2,
+      ),
+    );
+  }
+}
+
+class _SelfieAddReactionButton extends StatelessWidget {
+  final bool isSending;
+  final VoidCallback onTap;
+
+  const _SelfieAddReactionButton({
+    required this.isSending,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: 'Añadir emoticono',
+      child: Material(
+        color: ssOrange,
+        shape: const CircleBorder(),
+        child: InkWell(
+          onTap: isSending ? null : onTap,
+          customBorder: const CircleBorder(),
+          child: Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: ssOrangeDark.withValues(alpha: 0.22),
+                  blurRadius: 12,
+                  offset: const Offset(0, 5),
+                ),
+              ],
+            ),
+            child: Center(
+              child: isSending
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                        color: Colors.white,
+                        strokeWidth: 2.3,
+                      ),
+                    )
+                  : const Icon(
+                      Icons.add_rounded,
+                      color: Colors.white,
+                      size: 28,
+                    ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class EmojiReactionPickerSheet extends StatefulWidget {
   final String? currentReaction;
 
   const EmojiReactionPickerSheet({super.key, required this.currentReaction});
 
   @override
+  State<EmojiReactionPickerSheet> createState() =>
+      _EmojiReactionPickerSheetState();
+}
+
+class _EmojiReactionPickerSheetState extends State<EmojiReactionPickerSheet> {
+  late int selectedSectionIndex;
+  String? expandedEmojiBase;
+
+  @override
+  void initState() {
+    super.initState();
+    selectedSectionIndex = _sectionIndexForEmoji(widget.currentReaction);
+  }
+
+  int _sectionIndexForEmoji(String? emoji) {
+    final cleanEmoji = normalizarEmojiReaccion(emoji ?? '');
+    if (cleanEmoji.isEmpty) return 0;
+
+    for (var index = 0; index < kSundayReactionEmojiSections.length; index++) {
+      if (kSundayReactionEmojiSections[index].emojis.contains(cleanEmoji)) {
+        return index;
+      }
+    }
+
+    return 0;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final height = math.min(MediaQuery.sizeOf(context).height * 0.76, 640.0);
+    final section = kSundayReactionEmojiSections[selectedSectionIndex];
+    final currentReaction = normalizarEmojiReaccion(
+      widget.currentReaction ?? '',
+    );
+    final emojiGroups = agruparEmojisReaccion(section.emojis);
+    final expandedGroup = expandedEmojiBase == null
+        ? null
+        : emojiGroups
+              .where((group) => group.key == expandedEmojiBase)
+              .firstOrNull;
+
     return SafeArea(
       top: false,
       child: Container(
-        height: MediaQuery.sizeOf(context).height * 0.62,
+        height: height,
         padding: const EdgeInsets.fromLTRB(18, 12, 18, 22),
         decoration: const BoxDecoration(
           color: Colors.white,
@@ -10109,46 +21071,176 @@ class EmojiReactionPickerSheet extends StatelessWidget {
                 fontWeight: FontWeight.w900,
               ),
             ),
-            const SizedBox(height: 4),
-            const Text(
-              'Elige un emoji. Solo se permiten reacciones, no texto.',
-              style: TextStyle(
-                color: ssText2,
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            const SizedBox(height: 14),
-            Expanded(
-              child: GridView.builder(
+            const SizedBox(height: 12),
+            SizedBox(
+              height: 46,
+              child: ListView.separated(
                 physics: const BouncingScrollPhysics(),
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 7,
-                  mainAxisSpacing: 8,
-                  crossAxisSpacing: 8,
-                ),
-                itemCount: kSundayReactionEmojis.length,
+                scrollDirection: Axis.horizontal,
+                itemCount: kSundayReactionEmojiSections.length,
+                separatorBuilder: (_, _) => const SizedBox(width: 8),
                 itemBuilder: (context, index) {
-                  final emoji = kSundayReactionEmojis[index];
-                  final selected = emoji == currentReaction;
-                  return InkWell(
-                    onTap: () => Navigator.pop(context, emoji),
-                    borderRadius: BorderRadius.circular(16),
-                    child: Container(
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: selected ? ssOrangeLight : ssBg,
-                        borderRadius: BorderRadius.circular(16),
-                        border: Border.all(
-                          color: selected ? ssOrange : ssBorder,
-                          width: selected ? 1.6 : 1,
+                  final option = kSundayReactionEmojiSections[index];
+                  final selected = index == selectedSectionIndex;
+
+                  return Tooltip(
+                    message: option.label,
+                    child: InkWell(
+                      onTap: () => setState(() {
+                        selectedSectionIndex = index;
+                        expandedEmojiBase = null;
+                      }),
+                      borderRadius: BorderRadius.circular(15),
+                      child: Container(
+                        width: 44,
+                        height: 44,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: selected ? ssOrangeLight : ssBg,
+                          borderRadius: BorderRadius.circular(15),
+                          border: Border.all(
+                            color: selected ? ssOrange : ssBorder,
+                            width: selected ? 1.6 : 1,
+                          ),
+                        ),
+                        child: Text(
+                          option.icon,
+                          style: const TextStyle(fontSize: 22, height: 1),
                         ),
                       ),
-                      child: Text(
-                        emoji,
-                        style: const TextStyle(fontSize: 24, height: 1),
+                    ),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              section.label,
+              style: const TextStyle(
+                color: ssText2,
+                fontSize: 13,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 160),
+              child: expandedGroup == null
+                  ? const SizedBox(height: 8)
+                  : Padding(
+                      key: ValueKey(expandedGroup.key),
+                      padding: const EdgeInsets.only(top: 8, bottom: 8),
+                      child: SizedBox(
+                        height: 44,
+                        child: ListView.separated(
+                          scrollDirection: Axis.horizontal,
+                          physics: const BouncingScrollPhysics(),
+                          itemCount: expandedGroup.variants.length,
+                          separatorBuilder: (_, _) => const SizedBox(width: 8),
+                          itemBuilder: (context, index) {
+                            final emoji = expandedGroup.variants[index];
+                            final selected = emoji == currentReaction;
+
+                            return InkWell(
+                              onTap: () => Navigator.pop(context, emoji),
+                              borderRadius: BorderRadius.circular(14),
+                              child: Container(
+                                width: 44,
+                                height: 44,
+                                alignment: Alignment.center,
+                                decoration: BoxDecoration(
+                                  color: selected ? ssOrangeLight : ssBg,
+                                  borderRadius: BorderRadius.circular(14),
+                                  border: Border.all(
+                                    color: selected ? ssOrange : ssBorder,
+                                    width: selected ? 1.6 : 1,
+                                  ),
+                                ),
+                                child: Text(
+                                  emoji,
+                                  style: const TextStyle(
+                                    fontSize: 24,
+                                    height: 1,
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
                       ),
                     ),
+            ),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final crossAxisCount = math.max(
+                    6,
+                    math.min(9, (constraints.maxWidth / 46).floor()),
+                  );
+
+                  return GridView.builder(
+                    key: ValueKey(section.label),
+                    physics: const BouncingScrollPhysics(),
+                    gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                      crossAxisCount: crossAxisCount,
+                      mainAxisSpacing: 8,
+                      crossAxisSpacing: 8,
+                    ),
+                    itemCount: emojiGroups.length,
+                    itemBuilder: (context, index) {
+                      final group = emojiGroups[index];
+                      final selected = group.variants.contains(currentReaction);
+                      final hasVariants = group.variants.length > 1;
+                      return InkWell(
+                        onTap: () {
+                          if (!hasVariants) {
+                            Navigator.pop(context, group.displayEmoji);
+                            return;
+                          }
+
+                          setState(() {
+                            expandedEmojiBase = expandedEmojiBase == group.key
+                                ? null
+                                : group.key;
+                          });
+                        },
+                        borderRadius: BorderRadius.circular(14),
+                        child: Container(
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: selected ? ssOrangeLight : ssBg,
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(
+                              color: selected ? ssOrange : ssBorder,
+                              width: selected ? 1.6 : 1,
+                            ),
+                          ),
+                          child: Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              Center(
+                                child: Text(
+                                  group.displayEmoji,
+                                  style: const TextStyle(
+                                    fontSize: 24,
+                                    height: 1,
+                                  ),
+                                ),
+                              ),
+                              if (hasVariants)
+                                const Positioned(
+                                  right: 4,
+                                  bottom: 3,
+                                  child: Icon(
+                                    Icons.expand_more_rounded,
+                                    color: ssText3,
+                                    size: 13,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
                   );
                 },
               ),
@@ -10173,9 +21265,7 @@ class _CameraTabScreenState extends State<CameraTabScreen> {
   bool uploading = false;
   String? uploadingGroupId;
 
-  void _openReplacementInfo({
-    required String groupName,
-  }) {
+  void _openReplacementInfo({required String groupName}) {
     Navigator.push(
       context,
       MaterialPageRoute(
@@ -10212,9 +21302,15 @@ class _CameraTabScreenState extends State<CameraTabScreen> {
     });
 
     try {
+      final validPhoto = await validarFotoSelfieParaSubida(context, foto);
+      if (!mounted || !validPhoto) return;
+
       await publicarSelfieReal(groupId: groupId, user: widget.user, foto: foto);
       if (!mounted) return;
       showSundaySnack(context, 'Selfie publicado en $groupName');
+    } on SelfiePhotoValidationException catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, error.message);
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'Error: $error');
@@ -10230,6 +21326,7 @@ class _CameraTabScreenState extends State<CameraTabScreen> {
 
   @override
   Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
     final groupsRef = FirebaseFirestore.instance
         .collection('users')
         .doc(widget.user.uid)
@@ -10316,11 +21413,15 @@ class CameraClosedContent extends StatelessWidget {
             ),
             children: [
               TextSpan(
-                text: 'Solo puedes subir tu selfie los domingos de 00:00 a 23:59 — ',
+                text:
+                    'Solo puedes subir tu selfie los domingos de 00:00 a 23:59 — ',
               ),
               TextSpan(
                 text: 'Europe/Madrid',
-                style: TextStyle(color: ssOrangeDark, fontWeight: FontWeight.w800),
+                style: TextStyle(
+                  color: ssOrangeDark,
+                  fontWeight: FontWeight.w800,
+                ),
               ),
             ],
           ),
@@ -10384,8 +21485,11 @@ class CameraOpenContent extends StatelessWidget {
   final List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs;
   final bool uploading;
   final String? uploadingGroupId;
-  final Future<void> Function({required String groupId, required String groupName})
-      onUpload;
+  final Future<void> Function({
+    required String groupId,
+    required String groupName,
+  })
+  onUpload;
   final void Function({required String groupName}) onReplaceRequested;
 
   const CameraOpenContent({
@@ -10440,11 +21544,15 @@ class CameraOpenContent extends StatelessWidget {
           final data = doc.data();
           final groupId = (data['groupId'] ?? doc.id).toString();
           final groupName = (data['displayNameSnapshot'] ?? 'Grupo').toString();
+          final groupPhotoUrl = nonEmptyStringOrNull(
+            data['groupPhotoUrlSnapshot'],
+          );
           final isUploading = uploading && uploadingGroupId == groupId;
 
           return CameraGroupUploadCard(
             groupId: groupId,
             groupName: groupName,
+            groupPhotoUrl: groupPhotoUrl,
             uploading: isUploading,
             locked: uploading && !isUploading,
             onTap: () => onUpload(groupId: groupId, groupName: groupName),
@@ -10459,6 +21567,7 @@ class CameraOpenContent extends StatelessWidget {
 class CameraGroupUploadCard extends StatelessWidget {
   final String groupId;
   final String groupName;
+  final String? groupPhotoUrl;
   final bool uploading;
   final bool locked;
   final VoidCallback onTap;
@@ -10468,6 +21577,7 @@ class CameraGroupUploadCard extends StatelessWidget {
     super.key,
     required this.groupId,
     required this.groupName,
+    required this.groupPhotoUrl,
     required this.uploading,
     required this.locked,
     required this.onTap,
@@ -10518,7 +21628,7 @@ class CameraGroupUploadCard extends StatelessWidget {
                 padding: const EdgeInsets.all(16),
                 child: Row(
                   children: [
-                    GroupIcon(name: groupName),
+                    GroupIcon(name: groupName, photoUrl: groupPhotoUrl),
                     const SizedBox(width: 14),
                     Expanded(
                       child: Column(
@@ -10537,7 +21647,7 @@ class CameraGroupUploadCard extends StatelessWidget {
                           const SizedBox(height: 2),
                           Text(
                             hasSelfie
-                                ? 'Selfie publicado · ver reemplazo excepcional'
+                                ? '✓ Selfie publicado'
                                 : uploading
                                 ? 'Publicando selfie...'
                                 : 'Toca para abrir la cámara',
@@ -10552,11 +21662,23 @@ class CameraGroupUploadCard extends StatelessWidget {
                     ),
                     const SizedBox(width: 10),
                     Container(
-                      width: 42,
-                      height: 42,
+                      width: hasSelfie ? 58 : 42,
+                      height: hasSelfie ? 46 : 42,
                       decoration: BoxDecoration(
-                        color: hasSelfie ? ssOrangeLight : ssOrange,
+                        color: hasSelfie ? Colors.white : ssOrange,
                         borderRadius: BorderRadius.circular(14),
+                        border: hasSelfie
+                            ? Border.all(color: ssOrangeMid, width: 1.5)
+                            : null,
+                        boxShadow: hasSelfie
+                            ? [
+                                BoxShadow(
+                                  color: ssOrangeDark.withValues(alpha: 0.10),
+                                  blurRadius: 10,
+                                  offset: const Offset(0, 3),
+                                ),
+                              ]
+                            : null,
                       ),
                       child: uploading
                           ? const Padding(
@@ -10566,11 +21688,31 @@ class CameraGroupUploadCard extends StatelessWidget {
                                 strokeWidth: 2.3,
                               ),
                             )
-                          : Icon(
-                              hasSelfie
-                                  ? Icons.replay_rounded
-                                  : Icons.photo_camera_rounded,
-                              color: hasSelfie ? ssOrangeDark : Colors.white,
+                          : hasSelfie
+                          ? const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.photo_camera_rounded,
+                                  color: ssOrangeDark,
+                                  size: 18,
+                                ),
+                                SizedBox(height: 1),
+                                Text(
+                                  'Rehacer',
+                                  maxLines: 1,
+                                  style: TextStyle(
+                                    color: ssOrangeDark,
+                                    fontSize: 9.2,
+                                    fontWeight: FontWeight.w900,
+                                    height: 1,
+                                  ),
+                                ),
+                              ],
+                            )
+                          : const Icon(
+                              Icons.photo_camera_rounded,
+                              color: Colors.white,
                               size: 22,
                             ),
                     ),
@@ -10588,10 +21730,7 @@ class CameraGroupUploadCard extends StatelessWidget {
 class SelfieReplacementInfoScreen extends StatelessWidget {
   final String groupName;
 
-  const SelfieReplacementInfoScreen({
-    super.key,
-    required this.groupName,
-  });
+  const SelfieReplacementInfoScreen({super.key, required this.groupName});
 
   @override
   Widget build(BuildContext context) {
@@ -10734,8 +21873,14 @@ class _CameraCountdownBadgeState extends State<CameraCountdownBadge> {
   Widget build(BuildContext context) {
     final days = remaining.inDays.toString().padLeft(2, '0');
     final hours = remaining.inHours.remainder(24).toString().padLeft(2, '0');
-    final minutes = remaining.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds = remaining.inSeconds.remainder(60).toString().padLeft(2, '0');
+    final minutes = remaining.inMinutes
+        .remainder(60)
+        .toString()
+        .padLeft(2, '0');
+    final seconds = remaining.inSeconds
+        .remainder(60)
+        .toString()
+        .padLeft(2, '0');
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
@@ -10774,6 +21919,8 @@ class _CameraCountdownBadgeState extends State<CameraCountdownBadge> {
 
 enum MySelfiesSortMode { newest, oldest, group, week }
 
+enum MemberGroupSelfiesSortMode { newest, oldest }
+
 class MySelfiesScreen extends StatefulWidget {
   final User user;
 
@@ -10787,6 +21934,10 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
   MySelfiesSortMode sortMode = MySelfiesSortMode.newest;
   String filterGroup = 'all';
 
+  bool _isDateSortMode(MySelfiesSortMode mode) {
+    return mode == MySelfiesSortMode.newest || mode == MySelfiesSortMode.oldest;
+  }
+
   Future<List<MySelfieHistoryItem>> _loadMySelfies(
     List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
   ) async {
@@ -10795,8 +21946,12 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
 
     for (final groupDoc in groupDocs) {
       final relationData = groupDoc.data();
-      final groupId = relationData['groupId'] ?? groupDoc.id;
-      final groupName = relationData['displayNameSnapshot'] ?? 'Grupo';
+      final groupId = (relationData['groupId'] ?? groupDoc.id).toString();
+      final groupName = (relationData['displayNameSnapshot'] ?? 'Grupo')
+          .toString();
+      final groupPhotoUrl = nonEmptyStringOrNull(
+        relationData['groupPhotoUrlSnapshot'],
+      );
 
       try {
         final weeksSnapshot = await firestore
@@ -10822,11 +21977,13 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
           if (imageUrl.isEmpty) continue;
 
           final weekData = weekDoc.data();
+          prefetchPostPhotoCache(postData, includeOriginal: true);
 
           items.add(
             MySelfieHistoryItem(
               groupId: groupId,
               groupName: groupName,
+              groupPhotoUrl: groupPhotoUrl,
               weekKey: weekDoc.id,
               isoYear: weekData['isoYear'] as int?,
               isoWeek: weekData['isoWeek'] as int?,
@@ -10956,15 +22113,14 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
                   return FutureBuilder<List<MySelfieHistoryItem>>(
                     future: _loadMySelfies(groupDocs),
                     builder: (context, selfiesSnapshot) {
-                      final loading = selfiesSnapshot.connectionState ==
+                      final loading =
+                          selfiesSnapshot.connectionState ==
                           ConnectionState.waiting;
                       final selfies = selfiesSnapshot.data ?? [];
                       final visible = _visibleItems(selfies);
-                      final groupNames = selfies
-                          .map((item) => item.groupName)
-                          .toSet()
-                          .toList()
-                        ..sort();
+                      final groupNames =
+                          selfies.map((item) => item.groupName).toSet().toList()
+                            ..sort();
 
                       return ListView(
                         padding: const EdgeInsets.fromLTRB(16, 0, 16, 28),
@@ -10975,7 +22131,9 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
                             const SizedBox(
                               height: 280,
                               child: Center(
-                                child: CircularProgressIndicator(color: ssOrange),
+                                child: CircularProgressIndicator(
+                                  color: ssOrange,
+                                ),
                               ),
                             )
                           else if (selfies.isEmpty)
@@ -10998,12 +22156,16 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
                               filterActive: filterGroup != 'all',
                               groupNames: groupNames,
                               sortMode: sortMode,
-                              onSortSelected: (mode) => setState(
-                                () => sortMode = mode,
-                              ),
-                              onFilterSelected: (group) => setState(
-                                () => filterGroup = group,
-                              ),
+                              dateSortsOnly: filterGroup != 'all',
+                              onSortSelected: (mode) =>
+                                  setState(() => sortMode = mode),
+                              onFilterSelected: (group) => setState(() {
+                                filterGroup = group;
+                                if (group != 'all' &&
+                                    !_isDateSortMode(sortMode)) {
+                                  sortMode = MySelfiesSortMode.newest;
+                                }
+                              }),
                             ),
                             const SizedBox(height: 18),
                             if (visible.isEmpty)
@@ -11020,7 +22182,9 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
                             else
                               _SelfiesGrid(
                                 items: visible,
-                                onTap: (item) => _openSelfie(context, item, visible),
+                                showGroupName: filterGroup == 'all',
+                                onTap: (item) =>
+                                    _openSelfie(context, item, visible),
                               ),
                           ],
                         ],
@@ -11043,6 +22207,12 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
     }
 
     return grouped.entries.map((entry) {
+      String? groupPhotoUrl;
+      for (final item in entry.value) {
+        groupPhotoUrl = nonEmptyStringOrNull(item.groupPhotoUrl);
+        if (groupPhotoUrl != null) break;
+      }
+
       return Padding(
         padding: const EdgeInsets.only(bottom: 22),
         child: Column(
@@ -11050,14 +22220,7 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
           children: [
             Row(
               children: [
-                Container(
-                  width: 10,
-                  height: 10,
-                  decoration: const BoxDecoration(
-                    color: ssOrange,
-                    shape: BoxShape.circle,
-                  ),
-                ),
+                _MySelfiesGroupAvatar(name: entry.key, photoUrl: groupPhotoUrl),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
@@ -11084,6 +22247,7 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
             const SizedBox(height: 10),
             _SelfiesGrid(
               items: entry.value,
+              showGroupName: false,
               onTap: (item) => _openSelfie(context, item, entry.value),
             ),
           ],
@@ -11109,6 +22273,8 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
       MaterialPageRoute(
         builder: (_) => SelfieFullScreen(
           groupId: item.groupId,
+          groupName: item.groupName,
+          groupPhotoUrl: item.groupPhotoUrl,
           weekKey: item.weekKey,
           postUid: item.postUid,
           post: item.post,
@@ -11116,12 +22282,441 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
           galleryEntries: galleryItems.map((candidate) {
             return SelfieViewerEntry(
               groupId: candidate.groupId,
+              groupName: candidate.groupName,
+              groupPhotoUrl: candidate.groupPhotoUrl,
               weekKey: candidate.weekKey,
               postUid: candidate.postUid,
               post: candidate.post,
             );
           }).toList(),
         ),
+      ),
+    );
+  }
+}
+
+class GroupMemberSelfiesScreen extends StatefulWidget {
+  final String groupId;
+  final String groupName;
+  final String? groupPhotoUrl;
+  final String memberUid;
+  final String memberName;
+  final String? memberPhotoUrl;
+
+  const GroupMemberSelfiesScreen({
+    super.key,
+    required this.groupId,
+    required this.groupName,
+    required this.groupPhotoUrl,
+    required this.memberUid,
+    required this.memberName,
+    required this.memberPhotoUrl,
+  });
+
+  @override
+  State<GroupMemberSelfiesScreen> createState() =>
+      _GroupMemberSelfiesScreenState();
+}
+
+class _GroupMemberSelfiesScreenState extends State<GroupMemberSelfiesScreen> {
+  MemberGroupSelfiesSortMode sortMode = MemberGroupSelfiesSortMode.newest;
+  late Future<List<MySelfieHistoryItem>> selfiesFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    selfiesFuture = _loadMemberSelfies();
+  }
+
+  @override
+  void didUpdateWidget(covariant GroupMemberSelfiesScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.groupId != widget.groupId ||
+        oldWidget.memberUid != widget.memberUid) {
+      selfiesFuture = _loadMemberSelfies();
+    }
+  }
+
+  DateTime _sortableDate(MySelfieHistoryItem item) {
+    return item.updatedAt ??
+        item.createdAt ??
+        DateTime.fromMillisecondsSinceEpoch(0);
+  }
+
+  int _compareByNewest(MySelfieHistoryItem a, MySelfieHistoryItem b) {
+    return _sortableDate(b).compareTo(_sortableDate(a));
+  }
+
+  int _compareByOldest(MySelfieHistoryItem a, MySelfieHistoryItem b) {
+    return _sortableDate(a).compareTo(_sortableDate(b));
+  }
+
+  List<MySelfieHistoryItem> _sortedItems(List<MySelfieHistoryItem> selfies) {
+    final items = [...selfies];
+    switch (sortMode) {
+      case MemberGroupSelfiesSortMode.oldest:
+        items.sort(_compareByOldest);
+        break;
+      case MemberGroupSelfiesSortMode.newest:
+        items.sort(_compareByNewest);
+        break;
+    }
+    return items;
+  }
+
+  String get _sortLabel {
+    switch (sortMode) {
+      case MemberGroupSelfiesSortMode.newest:
+        return 'Más recientes';
+      case MemberGroupSelfiesSortMode.oldest:
+        return 'Anteriores';
+    }
+  }
+
+  Future<List<MySelfieHistoryItem>> _loadMemberSelfies() async {
+    final groupRef = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(widget.groupId);
+    final groupSnapshot = await groupRef.get();
+    final groupData = groupSnapshot.data();
+
+    if (!groupSnapshot.exists || groupData?['deleted'] == true) {
+      throw Exception('Este grupo ya no está disponible');
+    }
+
+    final groupName = formatGroupDisplayName(
+      (groupData?['name'] ?? widget.groupName).toString(),
+    );
+    final groupPhotoUrl =
+        nonEmptyStringOrNull(groupData?['photoUrl']) ??
+        nonEmptyStringOrNull(widget.groupPhotoUrl);
+
+    final weeksSnapshot = await groupRef
+        .collection('weeks')
+        .orderBy('createdAt', descending: true)
+        .get();
+    final items = <MySelfieHistoryItem>[];
+
+    for (final weekDoc in weeksSnapshot.docs) {
+      final postDoc = await weekDoc.reference
+          .collection('posts')
+          .doc(widget.memberUid)
+          .get();
+
+      if (!postDoc.exists) continue;
+
+      final postData = postDoc.data();
+      if (postData == null) continue;
+
+      final imageUrl = (postData['imageUrl'] ?? '').toString();
+      if (imageUrl.isEmpty) continue;
+
+      final weekData = weekDoc.data();
+      prefetchPostPhotoCache(postData, includeOriginal: true);
+      items.add(
+        MySelfieHistoryItem(
+          groupId: widget.groupId,
+          groupName: groupName,
+          groupPhotoUrl: groupPhotoUrl,
+          weekKey: weekDoc.id,
+          isoYear: weekData['isoYear'] as int?,
+          isoWeek: weekData['isoWeek'] as int?,
+          postUid: postDoc.id,
+          post: postData,
+          imageUrl: imageUrl,
+          thumbUrl: (postData['thumbUrl'] ?? imageUrl).toString(),
+          createdAt: timestampToDate(postData['createdAt']),
+          updatedAt: timestampToDate(postData['updatedAt']),
+        ),
+      );
+    }
+
+    items.sort(_compareByNewest);
+    return items;
+  }
+
+  void _openSelfie(
+    BuildContext context,
+    MySelfieHistoryItem item,
+    List<MySelfieHistoryItem> galleryItems,
+  ) {
+    final initialIndex = galleryItems.indexWhere(
+      (candidate) =>
+          candidate.groupId == item.groupId &&
+          candidate.weekKey == item.weekKey &&
+          candidate.postUid == item.postUid,
+    );
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SelfieFullScreen(
+          groupId: item.groupId,
+          groupName: item.groupName,
+          groupPhotoUrl: item.groupPhotoUrl,
+          weekKey: item.weekKey,
+          postUid: item.postUid,
+          post: item.post,
+          initialIndex: initialIndex < 0 ? 0 : initialIndex,
+          galleryEntries: galleryItems.map((candidate) {
+            return SelfieViewerEntry(
+              groupId: candidate.groupId,
+              groupName: candidate.groupName,
+              groupPhotoUrl: candidate.groupPhotoUrl,
+              weekKey: candidate.weekKey,
+              postUid: candidate.postUid,
+              post: candidate.post,
+            );
+          }).toList(),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final displayName = formatUserDisplayName(widget.memberName);
+
+    return Scaffold(
+      backgroundColor: ssBg,
+      body: SafeArea(
+        child: Column(
+          children: [
+            AppHeader(onBack: () => Navigator.pop(context)),
+            Expanded(
+              child: FutureBuilder<List<MySelfieHistoryItem>>(
+                future: selfiesFuture,
+                builder: (context, snapshot) {
+                  final loading =
+                      snapshot.connectionState == ConnectionState.waiting;
+                  final selfies = snapshot.data ?? [];
+                  final visible = _sortedItems(selfies);
+
+                  return ListView(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 28),
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          MiniProfileAvatar(
+                            name: displayName,
+                            photoUrl: widget.memberPhotoUrl,
+                            size: 42,
+                            borderColor: ssBg,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Sunday selfies de $displayName',
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: ssTitle,
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w800,
+                                    height: 1.12,
+                                  ),
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  formatGroupDisplayName(widget.groupName),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: ssText3,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700,
+                                    height: 1.1,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 18),
+                      if (loading)
+                        const SizedBox(
+                          height: 280,
+                          child: Center(
+                            child: CircularProgressIndicator(color: ssOrange),
+                          ),
+                        )
+                      else if (snapshot.hasError)
+                        SundayCard(
+                          child: EmptyStateContent(
+                            icon: Icons.error_outline_rounded,
+                            title: 'No se pudieron cargar los selfies',
+                            subtitle: '${snapshot.error}',
+                          ),
+                        )
+                      else if (selfies.isEmpty)
+                        SundayCard(
+                          child: EmptyStateContent(
+                            icon: Icons.photo_camera_back_rounded,
+                            title: 'Aún no hay selfies',
+                            subtitle:
+                                '$displayName todavía no ha publicado selfies en este grupo.',
+                          ),
+                        )
+                      else ...[
+                        _MemberGroupSelfiesToolbar(
+                          count: visible.length,
+                          sortLabel: _sortLabel,
+                          sortMode: sortMode,
+                          onSortSelected: (mode) =>
+                              setState(() => sortMode = mode),
+                        ),
+                        const SizedBox(height: 18),
+                        _SelfiesGrid(
+                          items: visible,
+                          showGroupName: false,
+                          onTap: (item) => _openSelfie(context, item, visible),
+                        ),
+                      ],
+                    ],
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MemberGroupSelfiesToolbar extends StatelessWidget {
+  final int count;
+  final String sortLabel;
+  final MemberGroupSelfiesSortMode sortMode;
+  final ValueChanged<MemberGroupSelfiesSortMode> onSortSelected;
+
+  const _MemberGroupSelfiesToolbar({
+    required this.count,
+    required this.sortLabel,
+    required this.sortMode,
+    required this.onSortSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            '$count Sunday Selfie${count == 1 ? '' : 's'}',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: ssText3,
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        _MemberGroupSelfiesSortPill(
+          label: sortLabel,
+          selected: sortMode,
+          onSelected: onSortSelected,
+        ),
+      ],
+    );
+  }
+}
+
+class _MemberGroupSelfiesSortPill extends StatelessWidget {
+  final String label;
+  final MemberGroupSelfiesSortMode selected;
+  final ValueChanged<MemberGroupSelfiesSortMode> onSelected;
+
+  const _MemberGroupSelfiesSortPill({
+    required this.label,
+    required this.selected,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<MemberGroupSelfiesSortMode>(
+      tooltip: 'Ordenar',
+      onSelected: onSelected,
+      itemBuilder: (context) => const [
+        PopupMenuItem(
+          value: MemberGroupSelfiesSortMode.newest,
+          child: Text('Más recientes'),
+        ),
+        PopupMenuItem(
+          value: MemberGroupSelfiesSortMode.oldest,
+          child: Text('Anteriores'),
+        ),
+      ],
+      child: _ToolbarPill(
+        active: true,
+        icon: Icons.swap_vert_rounded,
+        label: label,
+      ),
+    );
+  }
+}
+
+class _MySelfiesGroupAvatar extends StatelessWidget {
+  final String name;
+  final String? photoUrl;
+
+  const _MySelfiesGroupAvatar({required this.name, required this.photoUrl});
+
+  @override
+  Widget build(BuildContext context) {
+    final resolvedPhotoUrl = nonEmptyStringOrNull(photoUrl);
+
+    return Container(
+      width: 20,
+      height: 20,
+      decoration: BoxDecoration(
+        color: resolvedPhotoUrl == null ? ssOrangeLight : Colors.white,
+        shape: BoxShape.circle,
+        border: Border.all(color: ssBorder, width: 1.2),
+      ),
+      clipBehavior: Clip.antiAlias,
+      alignment: Alignment.center,
+      child: resolvedPhotoUrl == null
+          ? _MySelfiesGroupAvatarFallback(name: name)
+          : CachedRemoteImage(
+              imageUrl: resolvedPhotoUrl,
+              cacheVariant: 'avatar',
+              width: 20,
+              height: 20,
+              fit: BoxFit.cover,
+              alignment: Alignment.center,
+              filterQuality: FilterQuality.high,
+              errorWidget: _MySelfiesGroupAvatarFallback(name: name),
+              loadingWidget: _MySelfiesGroupAvatarFallback(name: name),
+            ),
+    );
+  }
+}
+
+class _MySelfiesGroupAvatarFallback extends StatelessWidget {
+  final String name;
+
+  const _MySelfiesGroupAvatarFallback({required this.name});
+
+  @override
+  Widget build(BuildContext context) {
+    final emoji = extractLastEmoji(name);
+
+    return Text(
+      emoji ?? initialsFromName(name),
+      style: TextStyle(
+        color: ssOrangeDark,
+        fontSize: emoji == null ? 8 : 10,
+        fontWeight: FontWeight.w900,
+        height: 1,
       ),
     );
   }
@@ -11154,6 +22749,7 @@ class _MySelfiesToolbar extends StatelessWidget {
   final bool filterActive;
   final List<String> groupNames;
   final MySelfiesSortMode sortMode;
+  final bool dateSortsOnly;
   final ValueChanged<MySelfiesSortMode> onSortSelected;
   final ValueChanged<String> onFilterSelected;
 
@@ -11165,6 +22761,7 @@ class _MySelfiesToolbar extends StatelessWidget {
     required this.filterActive,
     required this.groupNames,
     required this.sortMode,
+    required this.dateSortsOnly,
     required this.onSortSelected,
     required this.onFilterSelected,
   });
@@ -11190,6 +22787,7 @@ class _MySelfiesToolbar extends StatelessWidget {
         _SortPill(
           label: sortLabel,
           selected: sortMode,
+          dateSortsOnly: dateSortsOnly,
           onSelected: onSortSelected,
         ),
         const SizedBox(width: 8),
@@ -11207,11 +22805,13 @@ class _MySelfiesToolbar extends StatelessWidget {
 class _SortPill extends StatelessWidget {
   final String label;
   final MySelfiesSortMode selected;
+  final bool dateSortsOnly;
   final ValueChanged<MySelfiesSortMode> onSelected;
 
   const _SortPill({
     required this.label,
     required this.selected,
+    required this.dateSortsOnly,
     required this.onSelected,
   });
 
@@ -11220,23 +22820,25 @@ class _SortPill extends StatelessWidget {
     return PopupMenuButton<MySelfiesSortMode>(
       tooltip: 'Ordenar',
       onSelected: onSelected,
-      itemBuilder: (context) => const [
-        PopupMenuItem(
+      itemBuilder: (context) => [
+        const PopupMenuItem(
           value: MySelfiesSortMode.newest,
           child: Text('Más recientes'),
         ),
-        PopupMenuItem(
+        const PopupMenuItem(
           value: MySelfiesSortMode.oldest,
           child: Text('Más antiguas'),
         ),
-        PopupMenuItem(
-          value: MySelfiesSortMode.group,
-          child: Text('Por grupo'),
-        ),
-        PopupMenuItem(
-          value: MySelfiesSortMode.week,
-          child: Text('Por semana'),
-        ),
+        if (!dateSortsOnly) ...const [
+          PopupMenuItem(
+            value: MySelfiesSortMode.group,
+            child: Text('Por grupo'),
+          ),
+          PopupMenuItem(
+            value: MySelfiesSortMode.week,
+            child: Text('Por semana'),
+          ),
+        ],
       ],
       child: _ToolbarPill(
         active: true,
@@ -11327,9 +22929,14 @@ class _ToolbarPill extends StatelessWidget {
 
 class _SelfiesGrid extends StatelessWidget {
   final List<MySelfieHistoryItem> items;
+  final bool showGroupName;
   final ValueChanged<MySelfieHistoryItem> onTap;
 
-  const _SelfiesGrid({required this.items, required this.onTap});
+  const _SelfiesGrid({
+    required this.items,
+    this.showGroupName = true,
+    required this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -11345,7 +22952,11 @@ class _SelfiesGrid extends StatelessWidget {
       ),
       itemBuilder: (context, index) {
         final item = items[index];
-        return MySelfieHistoryCard(item: item, onTap: () => onTap(item));
+        return MySelfieHistoryCard(
+          item: item,
+          showGroupName: showGroupName,
+          onTap: () => onTap(item),
+        );
       },
     );
   }
@@ -11354,6 +22965,7 @@ class _SelfiesGrid extends StatelessWidget {
 class MySelfieHistoryItem {
   final String groupId;
   final String groupName;
+  final String? groupPhotoUrl;
   final String weekKey;
   final int? isoYear;
   final int? isoWeek;
@@ -11367,6 +22979,7 @@ class MySelfieHistoryItem {
   const MySelfieHistoryItem({
     required this.groupId,
     required this.groupName,
+    required this.groupPhotoUrl,
     required this.weekKey,
     required this.isoYear,
     required this.isoWeek,
@@ -11426,15 +23039,12 @@ class MySelfieHeroCard extends StatelessWidget {
           child: Stack(
             fit: StackFit.expand,
             children: [
-              Image.network(
-                item.thumbUrl,
+              CachedRemoteImage(
+                imageUrl: item.thumbUrl,
+                cacheVariant: 'thumbnail',
                 fit: BoxFit.cover,
-                loadingBuilder: (context, child, progress) {
-                  if (progress == null) return child;
-                  return const _ImageLoadingFill();
-                },
-                errorBuilder: (context, error, stackTrace) =>
-                    const _ImageErrorFill(),
+                loadingWidget: const _ImageLoadingFill(),
+                errorWidget: const _ImageErrorFill(),
               ),
               const _PhotoGradientOverlay(),
               Positioned(
@@ -11517,17 +23127,18 @@ class MySelfieHeroCard extends StatelessWidget {
 
 class MySelfieHistoryCard extends StatelessWidget {
   final MySelfieHistoryItem item;
+  final bool showGroupName;
   final VoidCallback onTap;
 
   const MySelfieHistoryCard({
     super.key,
     required this.item,
+    this.showGroupName = true,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-
     return GestureDetector(
       onTap: onTap,
       child: ClipRRect(
@@ -11535,66 +23146,43 @@ class MySelfieHistoryCard extends StatelessWidget {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            Image.network(
-              item.thumbUrl,
+            CachedRemoteImage(
+              imageUrl: item.thumbUrl,
+              cacheVariant: 'thumbnail',
               fit: BoxFit.cover,
-              loadingBuilder: (context, child, progress) {
-                if (progress == null) return child;
-                return const _ImageLoadingFill();
-              },
-              errorBuilder: (context, error, stackTrace) =>
-                  const _ImageErrorFill(),
+              loadingWidget: const _ImageLoadingFill(),
+              errorWidget: const _ImageErrorFill(),
             ),
             const _PhotoGradientOverlay(),
-            Positioned(
-              top: 8,
-              left: 8,
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.40),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  item.shortWeekLabel,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 10.5,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: 0.2,
-                  ),
-                ),
-              ),
-            ),
-            Positioned(
-              left: 10,
-              right: 10,
-              bottom: 10,
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    formatGroupDisplayName(item.groupName),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w800,
-                      height: 1.1,
+            if (showGroupName)
+              Positioned(
+                left: 10,
+                right: 10,
+                bottom: 10,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      formatGroupDisplayName(item.groupName),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w800,
+                        height: 1.1,
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
-            ),
           ],
         ),
       ),
     );
   }
 }
-
 
 class _PhotoGradientOverlay extends StatelessWidget {
   const _PhotoGradientOverlay();
@@ -11739,11 +23327,13 @@ class MontageScreen extends StatefulWidget {
   State<MontageScreen> createState() => _MontageScreenState();
 }
 
-
 class _MontageScreenState extends State<MontageScreen> {
   int selectedGroupIndex = 0;
   int montageShuffleSeed = 0;
   String? selectedMontageWeekKey;
+  MontageStyle selectedMontageStyle = MontageStyle.classic;
+  bool exportingMontage = false;
+  bool preparingMontageAction = false;
   final GlobalKey montageBoundaryKey = GlobalKey();
 
   Future<XFile?> _captureMontageFile({
@@ -11751,39 +23341,51 @@ class _MontageScreenState extends State<MontageScreen> {
     required String groupName,
     required String weekKey,
   }) async {
-    await Future<void>.delayed(const Duration(milliseconds: 30));
-
-    final boundary = montageBoundaryKey.currentContext?.findRenderObject()
-        as RenderRepaintBoundary?;
-
-    if (boundary == null) {
-      if (context.mounted) {
-        showSundaySnack(context, 'No se pudo preparar el montaje');
-      }
-      return null;
+    if (mounted) {
+      setState(() => exportingMontage = true);
     }
 
-    final image = await boundary.toImage(pixelRatio: 3);
-    final byteData = await image.toByteData(format: ImageByteFormat.png);
+    try {
+      await WidgetsBinding.instance.endOfFrame;
+      await Future<void>.delayed(const Duration(milliseconds: 30));
 
-    if (byteData == null) {
-      if (context.mounted) {
-        showSundaySnack(context, 'No se pudo generar la imagen del montaje');
+      final boundary =
+          montageBoundaryKey.currentContext?.findRenderObject()
+              as RenderRepaintBoundary?;
+
+      if (boundary == null) {
+        if (context.mounted) {
+          showSundaySnack(context, 'No se pudo preparar el montaje');
+        }
+        return null;
       }
-      return null;
+
+      final image = await boundary.toImage(pixelRatio: 3);
+      final byteData = await image.toByteData(format: ImageByteFormat.png);
+
+      if (byteData == null) {
+        if (context.mounted) {
+          showSundaySnack(context, 'No se pudo generar la imagen del montaje');
+        }
+        return null;
+      }
+
+      final bytes = byteData.buffer.asUint8List();
+      final safeGroupName = formatGroupDisplayName(groupName)
+          .replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_')
+          .replaceAll(RegExp(r'_+'), '_')
+          .trim();
+      final fileName =
+          'montaje_${safeGroupName.isEmpty ? 'grupo' : safeGroupName}_$weekKey.png';
+      final file = File('${Directory.systemTemp.path}/$fileName');
+      await file.writeAsBytes(bytes, flush: true);
+
+      return XFile(file.path, mimeType: 'image/png', name: fileName);
+    } finally {
+      if (mounted) {
+        setState(() => exportingMontage = false);
+      }
     }
-
-    final bytes = byteData.buffer.asUint8List();
-    final safeGroupName = formatGroupDisplayName(groupName)
-        .replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_')
-        .replaceAll(RegExp(r'_+'), '_')
-        .trim();
-    final fileName =
-        'montaje_${safeGroupName.isEmpty ? 'grupo' : safeGroupName}_$weekKey.png';
-    final file = File('${Directory.systemTemp.path}/$fileName');
-    await file.writeAsBytes(bytes, flush: true);
-
-    return XFile(file.path, mimeType: 'image/png', name: fileName);
   }
 
   Future<void> _shareMontage({
@@ -11791,23 +23393,34 @@ class _MontageScreenState extends State<MontageScreen> {
     required String groupName,
     required String weekKey,
   }) async {
-    final file = await _captureMontageFile(
-      context: context,
-      groupName: groupName,
-      weekKey: weekKey,
-    );
+    if (preparingMontageAction) return;
+    setState(() => preparingMontageAction = true);
+    try {
+      final unlocked = await prepararMontajeConAnuncio(
+        context,
+        accion: 'compartir',
+      );
+      if (!mounted || !context.mounted || !unlocked) return;
 
-    if (file == null) return;
+      final file = await _captureMontageFile(
+        context: context,
+        groupName: groupName,
+        weekKey: weekKey,
+      );
 
-    await SharePlus.instance.share(
-      ShareParams(
-        files: [file],
-        text:
-            'Montaje Sunday Selfie de ${formatGroupDisplayName(groupName)} · ${obtenerEtiquetaSemana(weekKey)}',
-        subject: 'Montaje Sunday Selfie',
-        sharePositionOrigin: const Rect.fromLTWH(0, 0, 1, 1),
-      ),
-    );
+      if (file == null) return;
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [file],
+          text:
+              'Montaje Sunday Selfie de ${formatGroupDisplayName(groupName)} · ${obtenerEtiquetaSemana(weekKey)}',
+          subject: 'Montaje Sunday Selfie',
+          sharePositionOrigin: const Rect.fromLTWH(0, 0, 1, 1),
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => preparingMontageAction = false);
+    }
   }
 
   Future<void> _downloadMontage({
@@ -11815,22 +23428,48 @@ class _MontageScreenState extends State<MontageScreen> {
     required String groupName,
     required String weekKey,
   }) async {
-    final file = await _captureMontageFile(
-      context: context,
-      groupName: groupName,
-      weekKey: weekKey,
-    );
+    if (preparingMontageAction) return;
+    setState(() => preparingMontageAction = true);
+    try {
+      final unlocked = await prepararMontajeConAnuncio(
+        context,
+        accion: 'descargar',
+      );
+      if (!mounted || !context.mounted || !unlocked) return;
 
-    if (file == null) return;
+      showSundaySnack(context, 'Guardando montaje...');
 
-    await SharePlus.instance.share(
-      ShareParams(
+      final file = await _captureMontageFile(
+        context: context,
+        groupName: groupName,
+        weekKey: weekKey,
+      );
+
+      if (file == null) return;
+
+      final savedCount = await guardarArchivosDescargadosEnTelefono(
         files: [file],
-        text: 'Descargar montaje Sunday Selfie',
-        subject: 'Montaje Sunday Selfie',
-        sharePositionOrigin: const Rect.fromLTWH(0, 0, 1, 1),
-      ),
-    );
+      );
+
+      if (!context.mounted) return;
+      showSundaySnack(
+        context,
+        savedCount == 0
+            ? 'No se pudo guardar el montaje'
+            : 'Montaje guardado en el teléfono',
+      );
+    } catch (error) {
+      if (!context.mounted) return;
+      final message = mensajeErrorGuardandoArchivos(error);
+      showSundaySnack(
+        context,
+        message.contains('Fotos')
+            ? message
+            : 'No se pudo guardar el montaje en el teléfono',
+      );
+    } finally {
+      if (mounted) setState(() => preparingMontageAction = false);
+    }
   }
 
   @override
@@ -11880,75 +23519,52 @@ class _MontageScreenState extends State<MontageScreen> {
 
                   final selectedDoc = groupDocs[selectedGroupIndex];
                   final selectedData = selectedDoc.data();
-                  final groupId =
-                      (selectedData['groupId'] ?? selectedDoc.id).toString();
+                  final groupId = (selectedData['groupId'] ?? selectedDoc.id)
+                      .toString();
                   final groupName =
-                      (selectedData['displayNameSnapshot'] ?? 'Grupo').toString();
-                  final weeksRef = FirebaseFirestore.instance
+                      (selectedData['displayNameSnapshot'] ?? 'Grupo')
+                          .toString();
+                  final groupRef = FirebaseFirestore.instance
                       .collection('groups')
-                      .doc(groupId)
-                      .collection('weeks')
-                      .orderBy('createdAt', descending: true);
+                      .doc(groupId);
 
-                  return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                    stream: weeksRef.snapshots(),
-                    builder: (context, weeksSnapshot) {
-                      final weekDocs = weeksSnapshot.data?.docs ?? [];
-                      final weekKeys = <String>{
-                        if (esDomingo()) obtenerWeekKeyActual(),
-                        ...weekDocs.map((doc) => doc.id),
-                      }.toList();
-
-                      if (weekKeys.isEmpty) {
-                        selectedMontageWeekKey = null;
-                        return ListView(
-                          padding: EdgeInsets.zero,
-                          children: [
-                            _MontageGroupSelector(
-                              groupDocs: groupDocs,
-                              selectedGroupIndex: selectedGroupIndex,
-                              onSelected: (index) => setState(() {
-                                selectedGroupIndex = index;
-                                selectedMontageWeekKey = null;
-                                montageShuffleSeed = 0;
-                              }),
-                            ),
-                            const Padding(
-                              padding: EdgeInsets.fromLTRB(16, 42, 16, 28),
-                              child: SundayCard(
-                                child: EmptyStateContent(
-                                  icon: Icons.photo_library_outlined,
-                                  title: 'Aún no hay semanas anteriores',
-                                  subtitle:
-                                      'Cuando haya publicaciones de domingos anteriores aparecerán aquí.',
-                                ),
-                              ),
-                            ),
-                          ],
-                        );
-                      }
-
-                      if (selectedMontageWeekKey == null ||
-                          !weekKeys.contains(selectedMontageWeekKey)) {
-                        selectedMontageWeekKey = weekKeys.first;
-                      }
-
-                      final weekKey = selectedMontageWeekKey!;
-                      final postsRef = FirebaseFirestore.instance
-                          .collection('groups')
-                          .doc(groupId)
+                  return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+                    stream: groupRef.snapshots(),
+                    builder: (context, groupSnapshot) {
+                      final groupData =
+                          groupSnapshot.data?.data() ??
+                          const <String, dynamic>{};
+                      final effectiveGroupName =
+                          (groupData['name'] ?? groupName).toString();
+                      final groupCreatedAt =
+                          groupData['createdAt'] ?? selectedData['joinedAt'];
+                      final memberCountRaw = groupData['memberCount'] ?? 0;
+                      final memberCount = memberCountRaw is int
+                          ? memberCountRaw
+                          : int.tryParse('$memberCountRaw') ?? 0;
+                      final weeksRef = groupRef
                           .collection('weeks')
-                          .doc(weekKey)
-                          .collection('posts')
                           .orderBy('createdAt', descending: true);
 
-                      return ListView(
-                        padding: EdgeInsets.zero,
-                        children: [
-                          Container(
-                            color: ssBg,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
+                      return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                        stream: weeksRef.snapshots(),
+                        builder: (context, weeksSnapshot) {
+                          final weekDocs = weeksSnapshot.data?.docs ?? [];
+                          final weekKeys = obtenerWeekKeysCalendarioGrupo(
+                            groupCreatedAt: groupCreatedAt,
+                            existingWeekKeys: weekDocs.map((doc) => doc.id),
+                          );
+                          final calendarEntries =
+                              construirEntradasCalendarioSemanas(
+                                weekKeys: weekKeys,
+                                weekDocs: weekDocs,
+                                memberCount: memberCount,
+                              );
+
+                          if (weekKeys.isEmpty) {
+                            selectedMontageWeekKey = null;
+                            return ListView(
+                              padding: EdgeInsets.zero,
                               children: [
                                 _MontageGroupSelector(
                                   groupDocs: groupDocs,
@@ -11959,157 +23575,306 @@ class _MontageScreenState extends State<MontageScreen> {
                                     montageShuffleSeed = 0;
                                   }),
                                 ),
-                                SizedBox(
-                                  height: 37,
-                                  child: ListView.separated(
-                                    scrollDirection: Axis.horizontal,
-                                    padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
-                                    itemCount: weekKeys.length,
-                                    separatorBuilder: (_, _) => const SizedBox(width: 8),
-                                    itemBuilder: (context, index) {
-                                      final key = weekKeys[index];
-                                      final selected = key == selectedMontageWeekKey;
-                                      return MontageWeekChip(
-                                        key: ValueKey('montage_week_${key}_$selected'),
-                                        label: obtenerEtiquetaSemana(key),
-                                        selected: selected,
-                                        onTap: () => setState(() {
-                                          selectedMontageWeekKey = key;
-                                          montageShuffleSeed = 0;
-                                        }),
-                                      );
-                                    },
+                                const Padding(
+                                  padding: EdgeInsets.fromLTRB(16, 42, 16, 28),
+                                  child: SundayCard(
+                                    child: EmptyStateContent(
+                                      icon: Icons.photo_library_outlined,
+                                      title: 'Aún no hay semanas anteriores',
+                                      subtitle:
+                                          'Cuando haya publicaciones de domingos anteriores aparecerán aquí.',
+                                    ),
                                   ),
                                 ),
-                                const SizedBox(height: 10),
-                                FutureBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                                  future: postsRef.get(),
-                                  builder: (context, postsSnapshot) {
-                                    if (postsSnapshot.connectionState ==
-                                        ConnectionState.waiting) {
-                                      return const Padding(
-                                        padding: EdgeInsets.only(top: 80),
-                                        child: Center(
-                                          child: CircularProgressIndicator(
-                                            color: ssOrange,
-                                          ),
-                                        ),
-                                      );
-                                    }
+                              ],
+                            );
+                          }
 
-                                    final posts = postsSnapshot.data?.docs ?? [];
-                                    if (posts.isEmpty) {
-                                      return const Padding(
-                                        padding: EdgeInsets.fromLTRB(16, 42, 16, 28),
-                                        child: SundayCard(
-                                          child: EmptyStateContent(
-                                            icon: Icons.photo_library_outlined,
-                                            title: 'Aún no hay selfies esta semana',
-                                            subtitle:
-                                                'El montaje se completará cuando el grupo tenga publicaciones.',
-                                          ),
-                                        ),
-                                      );
-                                    }
+                          if (selectedMontageWeekKey == null ||
+                              !weekKeys.contains(selectedMontageWeekKey)) {
+                            selectedMontageWeekKey = weekKeys.first;
+                          }
 
-                                    return Padding(
-                                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 28),
-                                      child: Column(
+                          final weekSelectorItems =
+                              construirItemsSelectorSemanas(weekKeys);
+                          final weekKey = selectedMontageWeekKey!;
+                          final postsRef = groupRef
+                              .collection('weeks')
+                              .doc(weekKey)
+                              .collection('posts')
+                              .orderBy('createdAt', descending: true);
+
+                          return ListView(
+                            padding: EdgeInsets.zero,
+                            children: [
+                              Container(
+                                color: ssBg,
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    _MontageGroupSelector(
+                                      groupDocs: groupDocs,
+                                      selectedGroupIndex: selectedGroupIndex,
+                                      onSelected: (index) => setState(() {
+                                        selectedGroupIndex = index;
+                                        selectedMontageWeekKey = null;
+                                        montageShuffleSeed = 0;
+                                      }),
+                                    ),
+                                    SizedBox(
+                                      height: 37,
+                                      child: Row(
                                         children: [
-                                          RepaintBoundary(
-                                            key: montageBoundaryKey,
-                                            child: MontagePoster(
-                                              posts: posts,
-                                              groupName: groupName,
-                                              weekKey: weekKey,
-                                              shuffleSeed: montageShuffleSeed,
+                                          Padding(
+                                            padding: const EdgeInsets.fromLTRB(
+                                              16,
+                                              6,
+                                              0,
+                                              6,
+                                            ),
+                                            child: WeekCalendarButton(
+                                              onTap: () async {
+                                                final selected =
+                                                    await showWeekCalendarSheet(
+                                                      context: context,
+                                                      entries: calendarEntries,
+                                                      selectedWeekKey:
+                                                          selectedMontageWeekKey ??
+                                                          '',
+                                                    );
+
+                                                if (!mounted ||
+                                                    selected == null) {
+                                                  return;
+                                                }
+
+                                                setState(() {
+                                                  selectedMontageWeekKey =
+                                                      selected;
+                                                  montageShuffleSeed = 0;
+                                                });
+                                              },
                                             ),
                                           ),
-                                          if (posts.length > 1) ...[
-                                            const SizedBox(height: 10),
-                                            const Text(
-                                              'Toca una foto para moverla o cambiar su altura',
-                                              textAlign: TextAlign.center,
-                                              style: TextStyle(
-                                                color: ssText3,
-                                                fontSize: 9.4,
-                                                height: 1.35,
-                                                fontWeight: FontWeight.w500,
-                                              ),
-                                            ),
-                                          ],
-                                          const SizedBox(height: 18),
-                                          if (posts.length > 1)
-                                            OutlinedButton.icon(
-                                              onPressed: () => setState(() {
-                                                montageShuffleSeed =
-                                                    DateTime.now().millisecondsSinceEpoch;
-                                              }),
-                                              icon: const Icon(
-                                                Icons.shuffle_rounded,
-                                                size: 18,
-                                              ),
-                                              label: const Text('Aleatorio'),
-                                              style: OutlinedButton.styleFrom(
-                                                minimumSize: const Size.fromHeight(48),
-                                                foregroundColor: ssOrangeDark,
-                                                side: const BorderSide(
-                                                  color: ssOrangeMid,
-                                                  width: 1.5,
-                                                ),
-                                                shape: RoundedRectangleBorder(
-                                                  borderRadius:
-                                                      BorderRadius.circular(14),
-                                                ),
-                                              ),
-                                            ),
-                                          if (posts.length > 1) const SizedBox(height: 10),
-                                          Row(
-                                            children: [
-                                              Expanded(
-                                                child: SundayButton(
-                                                  text: 'Compartir',
-                                                  onPressed: () => _shareMontage(
-                                                    context: context,
-                                                    groupName: groupName,
-                                                    weekKey: weekKey,
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: ListView.separated(
+                                              scrollDirection: Axis.horizontal,
+                                              padding:
+                                                  const EdgeInsets.fromLTRB(
+                                                    0,
+                                                    6,
+                                                    16,
+                                                    6,
                                                   ),
-                                                ),
-                                              ),
-                                              const SizedBox(width: 10),
-                                              Expanded(
-                                                child: SundayButton(
-                                                  text: 'Descargar',
-                                                  variant: SundayButtonVariant.outline,
-                                                  onPressed: () => _downloadMontage(
-                                                    context: context,
-                                                    groupName: groupName,
-                                                    weekKey: weekKey,
+                                              itemCount:
+                                                  weekSelectorItems.length,
+                                              separatorBuilder: (_, _) =>
+                                                  const SizedBox(width: 8),
+                                              itemBuilder: (context, index) {
+                                                final item =
+                                                    weekSelectorItems[index];
+                                                if (item.startsWith('year:')) {
+                                                  return WeekYearSeparatorChip(
+                                                    year: item.substring(5),
+                                                  );
+                                                }
+
+                                                final key = item.substring(5);
+                                                final selected =
+                                                    key ==
+                                                    selectedMontageWeekKey;
+                                                return MontageWeekChip(
+                                                  key: ValueKey(
+                                                    'montage_week_${key}_$selected',
                                                   ),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                          const SizedBox(height: 14),
-                                          const Text(
-                                            'Tu montaje se genera solo cada domingo a medianoche 🌙',
-                                            textAlign: TextAlign.center,
-                                            style: TextStyle(
-                                              color: ssText3,
-                                              fontSize: 9.4,
-                                              height: 1.5,
-                                              fontWeight: FontWeight.w500,
+                                                  label:
+                                                      obtenerEtiquetaSemanaCorta(
+                                                        key,
+                                                      ),
+                                                  selected: selected,
+                                                  onTap: () => setState(() {
+                                                    selectedMontageWeekKey =
+                                                        key;
+                                                    montageShuffleSeed = 0;
+                                                  }),
+                                                );
+                                              },
                                             ),
                                           ),
                                         ],
                                       ),
-                                    );
-                                  },
+                                    ),
+                                    const SizedBox(height: 10),
+                                    FutureBuilder<
+                                      QuerySnapshot<Map<String, dynamic>>
+                                    >(
+                                      future: postsRef.get(),
+                                      builder: (context, postsSnapshot) {
+                                        if (postsSnapshot.connectionState ==
+                                            ConnectionState.waiting) {
+                                          return const Padding(
+                                            padding: EdgeInsets.only(top: 80),
+                                            child: Center(
+                                              child: CircularProgressIndicator(
+                                                color: ssOrange,
+                                              ),
+                                            ),
+                                          );
+                                        }
+
+                                        final posts =
+                                            postsSnapshot.data?.docs ?? [];
+                                        for (final postDoc in posts) {
+                                          prefetchPostPhotoCache(
+                                            postDoc.data(),
+                                          );
+                                        }
+                                        if (posts.isEmpty) {
+                                          return const Padding(
+                                            padding: EdgeInsets.fromLTRB(
+                                              16,
+                                              42,
+                                              16,
+                                              28,
+                                            ),
+                                            child: SundayCard(
+                                              child: EmptyStateContent(
+                                                icon: Icons
+                                                    .photo_library_outlined,
+                                                title:
+                                                    'Aún no hay selfies esta semana',
+                                                subtitle:
+                                                    'El montaje se completará cuando el grupo tenga publicaciones.',
+                                              ),
+                                            ),
+                                          );
+                                        }
+
+                                        return Padding(
+                                          padding: const EdgeInsets.fromLTRB(
+                                            16,
+                                            0,
+                                            16,
+                                            28,
+                                          ),
+                                          child: Column(
+                                            children: [
+                                              RepaintBoundary(
+                                                key: montageBoundaryKey,
+                                                child: MontagePoster(
+                                                  posts: posts,
+                                                  groupName: effectiveGroupName,
+                                                  weekKey: weekKey,
+                                                  shuffleSeed:
+                                                      montageShuffleSeed,
+                                                  style: selectedMontageStyle,
+                                                  showEditingControls:
+                                                      !exportingMontage,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 18),
+                                              MontageStyleSelector(
+                                                selectedStyle:
+                                                    selectedMontageStyle,
+                                                onSelected: (style) =>
+                                                    setState(() {
+                                                      selectedMontageStyle =
+                                                          style;
+                                                    }),
+                                              ),
+                                              const SizedBox(height: 10),
+                                              if (posts.length > 1)
+                                                OutlinedButton.icon(
+                                                  onPressed:
+                                                      preparingMontageAction
+                                                      ? null
+                                                      : () => setState(() {
+                                                          montageShuffleSeed =
+                                                              DateTime.now()
+                                                                  .millisecondsSinceEpoch;
+                                                          selectedMontageStyle =
+                                                              MontageStyle
+                                                                  .values[montageShuffleSeed %
+                                                                  MontageStyle
+                                                                      .values
+                                                                      .length];
+                                                        }),
+                                                  icon: const Icon(
+                                                    Icons.auto_awesome_rounded,
+                                                    size: 18,
+                                                  ),
+                                                  label: const Text(
+                                                    'Sorpréndeme',
+                                                  ),
+                                                  style: OutlinedButton.styleFrom(
+                                                    minimumSize:
+                                                        const Size.fromHeight(
+                                                          48,
+                                                        ),
+                                                    foregroundColor:
+                                                        ssOrangeDark,
+                                                    side: const BorderSide(
+                                                      color: ssOrangeMid,
+                                                      width: 1.5,
+                                                    ),
+                                                    shape: RoundedRectangleBorder(
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                            14,
+                                                          ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              if (posts.length > 1)
+                                                const SizedBox(height: 10),
+                                              Row(
+                                                children: [
+                                                  Expanded(
+                                                    child: SundayButton(
+                                                      text: 'Compartir',
+                                                      onPressed:
+                                                          preparingMontageAction
+                                                          ? null
+                                                          : () => _shareMontage(
+                                                              context: context,
+                                                              groupName:
+                                                                  effectiveGroupName,
+                                                              weekKey: weekKey,
+                                                            ),
+                                                    ),
+                                                  ),
+                                                  const SizedBox(width: 10),
+                                                  Expanded(
+                                                    child: SundayButton(
+                                                      text: 'Descargar',
+                                                      variant:
+                                                          SundayButtonVariant
+                                                              .outline,
+                                                      onPressed:
+                                                          preparingMontageAction
+                                                          ? null
+                                                          : () => _downloadMontage(
+                                                              context: context,
+                                                              groupName:
+                                                                  effectiveGroupName,
+                                                              weekKey: weekKey,
+                                                            ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                            ],
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ],
                                 ),
-                              ],
-                            ),
-                          ),
-                        ],
+                              ),
+                            ],
+                          );
+                        },
                       );
                     },
                   );
@@ -12137,10 +23902,10 @@ class _MontageGroupSelector extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: 44,
+      height: 37,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+        padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
         itemBuilder: (context, index) {
           final doc = groupDocs[index];
           final data = doc.data();
@@ -12148,7 +23913,6 @@ class _MontageGroupSelector extends StatelessWidget {
           final selected = index == selectedGroupIndex;
           return MontageSelectorChip(
             label: formatGroupDisplayName(name),
-            emoji: fallbackGroupEmoji(name) ?? 'SS',
             selected: selected,
             onTap: () => onSelected(index),
           );
@@ -12162,63 +23926,47 @@ class _MontageGroupSelector extends StatelessWidget {
 
 class MontageSelectorChip extends StatelessWidget {
   final String label;
-  final String emoji;
   final bool selected;
   final VoidCallback onTap;
 
   const MontageSelectorChip({
     super.key,
     required this.label,
-    required this.emoji,
     required this.selected,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(4, 4, 13, 4),
-        decoration: BoxDecoration(
-          color: selected ? ssOrange : Colors.white,
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(
-            color: selected ? ssOrange : ssBorder,
-            width: 1.2,
+    final borderRadius = BorderRadius.circular(999);
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: borderRadius,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Ink(
+          height: 25,
+          padding: const EdgeInsets.symmetric(horizontal: 15),
+          decoration: BoxDecoration(
+            color: selected ? ssOrange : Colors.white,
+            borderRadius: borderRadius,
+            border: selected ? null : Border.all(color: ssBorder, width: 1.2),
           ),
-          boxShadow: selected
-              ? [
-                  BoxShadow(
-                    color: ssOrange.withValues(alpha: 0.22),
-                    blurRadius: 12,
-                    offset: const Offset(0, 5),
-                  ),
-                ]
-              : null,
-        ),
-        child: Row(
-          children: [
-            Container(
-              width: 28,
-              height: 28,
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: selected ? Colors.white.withValues(alpha: 0.20) : ssOrangeLight,
-                shape: BoxShape.circle,
-              ),
-              child: Text(emoji, style: const TextStyle(fontSize: 13)),
-            ),
-            const SizedBox(width: 7),
-            Text(
+          child: Center(
+            child: Text(
               label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 color: selected ? Colors.white : ssText2,
                 fontSize: 13,
                 fontWeight: FontWeight.w800,
+                height: 1,
               ),
             ),
-          ],
+          ),
         ),
       ),
     );
@@ -12267,12 +24015,104 @@ class MontageWeekChip extends StatelessWidget {
   }
 }
 
+enum MontageStyle { classic, polaroid, stickers }
+
+extension MontageStyleMeta on MontageStyle {
+  String get label => switch (this) {
+    MontageStyle.classic => 'Clásico',
+    MontageStyle.polaroid => 'Polaroid',
+    MontageStyle.stickers => 'Stickers',
+  };
+
+  IconData get icon => switch (this) {
+    MontageStyle.classic => Icons.dashboard_customize_rounded,
+    MontageStyle.polaroid => Icons.photo_size_select_actual_rounded,
+    MontageStyle.stickers => Icons.interests_rounded,
+  };
+
+  Color get accent => ssOrange;
+
+  Color get softBackground => ssBg;
+}
+
+class MontageStyleSelector extends StatelessWidget {
+  final MontageStyle selectedStyle;
+  final ValueChanged<MontageStyle> onSelected;
+
+  const MontageStyleSelector({
+    super.key,
+    required this.selectedStyle,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 44,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: EdgeInsets.zero,
+        itemCount: MontageStyle.values.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, index) {
+          final style = MontageStyle.values[index];
+          final selected = style == selectedStyle;
+          final accent = style.accent;
+
+          return Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(999),
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: () => onSelected(style),
+              child: Ink(
+                height: 44,
+                padding: const EdgeInsets.symmetric(horizontal: 13),
+                decoration: BoxDecoration(
+                  color: selected
+                      ? accent.withValues(alpha: 0.12)
+                      : Colors.white,
+                  borderRadius: BorderRadius.circular(999),
+                  border: Border.all(
+                    color: selected ? accent : ssBorder,
+                    width: selected ? 1.6 : 1.1,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      style.icon,
+                      size: 17,
+                      color: selected ? accent : ssText3,
+                    ),
+                    const SizedBox(width: 7),
+                    Text(
+                      style.label,
+                      style: TextStyle(
+                        color: selected ? ssText : ssText2,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
 
 class MontagePoster extends StatefulWidget {
   final List<QueryDocumentSnapshot<Map<String, dynamic>>> posts;
   final String groupName;
   final String weekKey;
   final int shuffleSeed;
+  final MontageStyle style;
+  final bool showEditingControls;
 
   const MontagePoster({
     super.key,
@@ -12280,15 +24120,40 @@ class MontagePoster extends StatefulWidget {
     required this.groupName,
     required this.weekKey,
     required this.shuffleSeed,
+    required this.style,
+    this.showEditingControls = true,
   });
 
   @override
   State<MontagePoster> createState() => _MontagePosterState();
 }
 
+class _MontageDragPayload {
+  final String postId;
+  final int fromIndex;
+
+  const _MontageDragPayload({required this.postId, required this.fromIndex});
+}
+
+enum _MontageResizeEdge { top, bottom, left, right }
+
+extension _MontageResizeEdgeDirection on _MontageResizeEdge {
+  bool get isHorizontal =>
+      this == _MontageResizeEdge.left || this == _MontageResizeEdge.right;
+}
+
+const double _montageTileGap = 8;
+const double _classicFullWidthThreshold = 2 / 3;
+
 class _MontagePosterState extends State<MontagePoster> {
   late List<QueryDocumentSnapshot<Map<String, dynamic>>> orderedPosts;
   final Map<String, double> customHeights = {};
+  final Map<String, double> customWidthFractions = {};
+  String? draggingPostId;
+  String? resizingPostId;
+  _MontageResizeEdge? activeResizeEdge;
+  double resizeStartHeight = 0;
+  double resizeStartWidthFraction = 0.5;
 
   @override
   void initState() {
@@ -12324,130 +24189,337 @@ class _MontagePosterState extends State<MontagePoster> {
     return customHeights[postId] ?? baseHeights[index % baseHeights.length];
   }
 
-  void _movePost(int index, int delta) {
-    final newIndex = (index + delta).clamp(0, orderedPosts.length - 1).toInt();
-    if (newIndex == index) return;
+  double _widthFractionFor(String postId) {
+    return customWidthFractions[postId] ?? 0.5;
+  }
+
+  bool _hasCustomWidth(String postId) {
+    return customWidthFractions.containsKey(postId);
+  }
+
+  bool _usesWideClassicRow(String postId) {
+    return _widthFractionFor(postId) > _classicFullWidthThreshold;
+  }
+
+  double _normalizeWidthFraction(double value) {
+    final clamped = value.clamp(0.5, 1.0).toDouble();
+    return clamped <= 0.515 ? 0.5 : clamped;
+  }
+
+  void _movePostToIndex(_MontageDragPayload payload, int targetIndex) {
+    final currentIndex = orderedPosts.indexWhere(
+      (doc) => doc.id == payload.postId,
+    );
+    final sourceIndex = currentIndex >= 0 ? currentIndex : payload.fromIndex;
+    if (sourceIndex < 0 || sourceIndex >= orderedPosts.length) return;
+
+    final newIndex = targetIndex.clamp(0, orderedPosts.length - 1).toInt();
+    if (newIndex == sourceIndex) return;
 
     setState(() {
-      final item = orderedPosts.removeAt(index);
-      orderedPosts.insert(newIndex, item);
+      final item = orderedPosts.removeAt(sourceIndex);
+      final insertIndex = newIndex.clamp(0, orderedPosts.length).toInt();
+      orderedPosts.insert(insertIndex, item);
     });
   }
 
-  void _changeHeight(String postId, double delta) {
+  void _startResize(String postId, _MontageResizeEdge edge) {
     final index = orderedPosts.indexWhere((doc) => doc.id == postId);
-    final current = _heightFor(postId, index < 0 ? 0 : index);
+    HapticFeedback.selectionClick();
     setState(() {
-      customHeights[postId] = (current + delta).clamp(120.0, 320.0).toDouble();
+      resizingPostId = postId;
+      activeResizeEdge = edge;
+      resizeStartHeight = _heightFor(postId, index < 0 ? 0 : index);
+      resizeStartWidthFraction = _widthFractionFor(postId);
     });
   }
 
-  Future<void> _openPhotoOptions(int index) async {
-    final post = orderedPosts[index];
-    final name = formatUserDisplayName(post.data()['authorName'] ?? 'Usuario');
+  void _updateResize(
+    String postId,
+    _MontageResizeEdge edge,
+    Offset dragDelta,
+    double resizeWidthBasis,
+  ) {
+    if (resizingPostId != postId || activeResizeEdge != edge) return;
 
-    await showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (_) => SafeArea(
-        top: false,
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
-          decoration: const BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Center(
-                child: Container(
-                  width: 38,
-                  height: 4,
-                  margin: const EdgeInsets.only(bottom: 18),
-                  decoration: BoxDecoration(
-                    color: ssBorder,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                ),
-              ),
-              Text(
-                name,
-                style: const TextStyle(
-                  color: ssTitle,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-              const SizedBox(height: 14),
-              InviteActionButton(
-                text: '⬆️ Mover antes',
-                variant: InviteActionButtonVariant.secondary,
-                onTap: () {
-                  Navigator.pop(context);
-                  _movePost(index, -1);
-                },
-              ),
-              const SizedBox(height: 8),
-              InviteActionButton(
-                text: '⬇️ Mover después',
-                variant: InviteActionButtonVariant.secondary,
-                onTap: () {
-                  Navigator.pop(context);
-                  _movePost(index, 1);
-                },
-              ),
-              const SizedBox(height: 8),
-              InviteActionButton(
-                text: '↕️ Hacer más alta',
-                variant: InviteActionButtonVariant.primary,
-                onTap: () {
-                  Navigator.pop(context);
-                  _changeHeight(post.id, 28);
-                },
-              ),
-              const SizedBox(height: 8),
-              InviteActionButton(
-                text: '↕️ Hacer más baja',
-                variant: InviteActionButtonVariant.outline,
-                onTap: () {
-                  Navigator.pop(context);
-                  _changeHeight(post.id, -28);
-                },
-              ),
-            ],
-          ),
+    if (edge.isHorizontal) {
+      final widthDelta = edge == _MontageResizeEdge.left
+          ? -dragDelta.dx
+          : dragDelta.dx;
+      final nextWidthFraction = _normalizeWidthFraction(
+        resizeStartWidthFraction + widthDelta / math.max(resizeWidthBasis, 1),
+      );
+
+      setState(() {
+        if (nextWidthFraction == 0.5) {
+          customWidthFractions.remove(postId);
+        } else {
+          customWidthFractions[postId] = nextWidthFraction;
+        }
+      });
+      return;
+    }
+
+    final heightDelta = edge == _MontageResizeEdge.top
+        ? -dragDelta.dy
+        : dragDelta.dy;
+    setState(() {
+      customHeights[postId] = (resizeStartHeight + heightDelta)
+          .clamp(120.0, 320.0)
+          .toDouble();
+    });
+  }
+
+  void _endResize() {
+    if (resizingPostId == null) return;
+
+    setState(() {
+      resizingPostId = null;
+      activeResizeEdge = null;
+      resizeStartHeight = 0;
+      resizeStartWidthFraction = 0.5;
+    });
+  }
+
+  void _setDraggingPost(String? postId) {
+    if (draggingPostId == postId) return;
+    setState(() => draggingPostId = postId);
+  }
+
+  List<_MontageEntry> _buildEntries() {
+    return [
+      for (var i = 0; i < orderedPosts.length; i += 1)
+        _MontageEntry(
+          post: orderedPosts[i],
+          index: i,
+          height: _heightFor(orderedPosts[i].id, i),
         ),
-      ),
+    ];
+  }
+
+  Widget _buildColumn(List<_MontageEntry> entries) {
+    return _MontageColumn(
+      entries: entries,
+      style: widget.style,
+      draggingPostId: draggingPostId,
+      resizingPostId: resizingPostId,
+      activeResizeEdge: activeResizeEdge,
+      showEditingControls: widget.showEditingControls,
+      onDrop: _movePostToIndex,
+      onDragStarted: (postId) => _setDraggingPost(postId),
+      onDragEnded: () => _setDraggingPost(null),
+      onResizeStart: _startResize,
+      onResizeUpdate: _updateResize,
+      onResizeEnd: _endResize,
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
+  Widget _buildMasonryLayout(List<_MontageEntry> entries) {
     final left = <_MontageEntry>[];
     final right = <_MontageEntry>[];
 
-    for (var i = 0; i < orderedPosts.length; i += 1) {
-      final entry = _MontageEntry(
-        post: orderedPosts[i],
-        index: i,
-        height: _heightFor(orderedPosts[i].id, i),
-      );
-
-      if (i.isEven) {
+    for (final entry in entries) {
+      if (entry.index.isEven) {
         left.add(entry);
       } else {
         right.add(entry);
       }
     }
 
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(child: _buildColumn(left)),
+        const SizedBox(width: _montageTileGap),
+        Expanded(child: _buildColumn(right)),
+      ],
+    );
+  }
+
+  Widget _buildClassicTile({
+    required _MontageEntry entry,
+    required double width,
+    required double resizeWidthBasis,
+  }) {
+    return SizedBox(
+      width: width,
+      child: _MontageSelfieTile(
+        post: entry.post,
+        index: entry.index,
+        height: entry.height,
+        style: widget.style,
+        isDragging: draggingPostId == entry.post.id,
+        isResizing:
+            widget.showEditingControls && resizingPostId == entry.post.id,
+        activeResizeEdge:
+            widget.showEditingControls && resizingPostId == entry.post.id
+            ? activeResizeEdge
+            : null,
+        showEditingControls: widget.showEditingControls,
+        allowHorizontalResize: true,
+        horizontalResizeBasis: resizeWidthBasis,
+        onDrop: _movePostToIndex,
+        onDragStarted: (postId) => _setDraggingPost(postId),
+        onDragEnded: () => _setDraggingPost(null),
+        onResizeStart: _startResize,
+        onResizeUpdate: _updateResize,
+        onResizeEnd: _endResize,
+      ),
+    );
+  }
+
+  Widget _buildClassicWideRow(_MontageEntry entry, double maxWidth) {
+    final fraction = _widthFractionFor(entry.post.id).clamp(0.5, 1.0);
+    final alignment =
+        resizingPostId == entry.post.id &&
+            activeResizeEdge == _MontageResizeEdge.left
+        ? Alignment.centerRight
+        : Alignment.centerLeft;
+
+    return Align(
+      alignment: alignment,
+      child: _buildClassicTile(
+        entry: entry,
+        width: maxWidth * fraction,
+        resizeWidthBasis: maxWidth,
+      ),
+    );
+  }
+
+  Widget _buildClassicSingleRow(_MontageEntry entry, double maxWidth) {
+    final fraction = _widthFractionFor(entry.post.id).clamp(0.5, 1.0);
+    final width = maxWidth * fraction;
+
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: _buildClassicTile(
+        entry: entry,
+        width: width,
+        resizeWidthBasis: maxWidth,
+      ),
+    );
+  }
+
+  Widget _buildClassicPairRow({
+    required _MontageEntry leftEntry,
+    required _MontageEntry rightEntry,
+    required double maxWidth,
+    required double leftFraction,
+  }) {
+    final pairWidth = math.max(0.0, maxWidth - _montageTileGap);
+    final rightFraction = 1 - leftFraction;
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildClassicTile(
+          entry: leftEntry,
+          width: pairWidth * leftFraction,
+          resizeWidthBasis: pairWidth,
+        ),
+        const SizedBox(width: _montageTileGap),
+        _buildClassicTile(
+          entry: rightEntry,
+          width: pairWidth * rightFraction,
+          resizeWidthBasis: pairWidth,
+        ),
+      ],
+    );
+  }
+
+  double _classicPairLeftFraction(
+    _MontageEntry leftEntry,
+    _MontageEntry rightEntry,
+  ) {
+    final leftCustom = _hasCustomWidth(leftEntry.post.id);
+    final rightCustom = _hasCustomWidth(rightEntry.post.id);
+    final leftFraction = _widthFractionFor(leftEntry.post.id);
+    final rightFraction = _widthFractionFor(rightEntry.post.id);
+
+    final resolved = switch ((leftCustom, rightCustom)) {
+      (true, false) => leftFraction,
+      (false, true) => 1 - rightFraction,
+      (true, true) =>
+        resizingPostId == rightEntry.post.id ? 1 - rightFraction : leftFraction,
+      (false, false) => 0.5,
+    };
+
+    return resolved.clamp(
+      1 - _classicFullWidthThreshold,
+      _classicFullWidthThreshold,
+    );
+  }
+
+  Widget _buildClassicLayout(List<_MontageEntry> entries) {
+    if (entries.isEmpty) return const SizedBox.shrink();
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final maxWidth = constraints.maxWidth;
+        final rows = <Widget>[];
+        var index = 0;
+
+        while (index < entries.length) {
+          final entry = entries[index];
+
+          if (_usesWideClassicRow(entry.post.id)) {
+            rows.add(_buildClassicWideRow(entry, maxWidth));
+            index += 1;
+            continue;
+          }
+
+          if (index + 1 >= entries.length) {
+            rows.add(_buildClassicSingleRow(entry, maxWidth));
+            index += 1;
+            continue;
+          }
+
+          final nextEntry = entries[index + 1];
+          if (_usesWideClassicRow(nextEntry.post.id)) {
+            rows.add(_buildClassicWideRow(nextEntry, maxWidth));
+            rows.add(_buildClassicSingleRow(entry, maxWidth));
+            index += 2;
+            continue;
+          }
+
+          rows.add(
+            _buildClassicPairRow(
+              leftEntry: entry,
+              rightEntry: nextEntry,
+              maxWidth: maxWidth,
+              leftFraction: _classicPairLeftFraction(entry, nextEntry),
+            ),
+          );
+          index += 2;
+        }
+
+        return Column(children: rows);
+      },
+    );
+  }
+
+  Widget _buildPosterLayout(List<_MontageEntry> entries) {
+    return switch (widget.style) {
+      MontageStyle.classic => _buildClassicLayout(entries),
+      MontageStyle.polaroid => _buildMasonryLayout(entries),
+      MontageStyle.stickers => _StickerMontage(
+        entries: entries,
+        style: widget.style,
+      ),
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final entries = _buildEntries();
+    final accent = widget.style.accent;
+
     return Container(
-      padding: const EdgeInsets.all(14),
+      padding: EdgeInsets.all(widget.style == MontageStyle.polaroid ? 16 : 14),
       decoration: BoxDecoration(
-        color: ssBg,
+        color: widget.style.softBackground,
         borderRadius: BorderRadius.circular(22),
-        border: Border.all(color: ssSeparator),
+        border: Border.all(color: accent.withValues(alpha: 0.18)),
         boxShadow: [
           BoxShadow(
             color: const Color(0xFF78501E).withValues(alpha: 0.13),
@@ -12458,60 +24530,13 @@ class _MontagePosterState extends State<MontagePoster> {
       ),
       child: Column(
         children: [
-          const SizedBox(height: 6),
-          const SundayLogo(size: 26),
-          const SizedBox(height: 12),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: _MontageColumn(
-                  entries: left,
-                  onTapEntry: _openPhotoOptions,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: _MontageColumn(
-                  entries: right,
-                  onTapEntry: _openPhotoOptions,
-                ),
-              ),
-            ],
+          _MontagePosterHeader(
+            groupName: widget.groupName,
+            weekKey: widget.weekKey,
+            style: widget.style,
           ),
-          const SizedBox(height: 12),
-          const Divider(height: 1, color: ssSeparator),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      formatGroupDisplayName(widget.groupName),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: ssTitle,
-                        fontSize: 14,
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
-                    const SizedBox(height: 1),
-                    Text(
-                      weekBadgeText(widget.weekKey),
-                      style: const TextStyle(
-                        color: ssText3,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
+          const SizedBox(height: 14),
+          _buildPosterLayout(entries),
         ],
       ),
     );
@@ -12530,97 +24555,1166 @@ class _MontageEntry {
   });
 }
 
+class _MontagePosterHeader extends StatelessWidget {
+  final String groupName;
+  final String weekKey;
+  final MontageStyle style;
+
+  const _MontagePosterHeader({
+    required this.groupName,
+    required this.weekKey,
+    required this.style,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = style.accent;
+
+    return Column(
+      children: [
+        const SundayLogo(size: 30),
+        const SizedBox(height: 10),
+        Text(
+          formatGroupDisplayName(groupName),
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+            color: ssTitle,
+            fontSize: 20,
+            height: 1.05,
+            fontWeight: FontWeight.w900,
+            letterSpacing: 0,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Align(
+          alignment: Alignment.center,
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 260),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.76),
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(color: accent.withValues(alpha: 0.22)),
+              boxShadow: [
+                BoxShadow(
+                  color: const Color(0xFF78501E).withValues(alpha: 0.06),
+                  blurRadius: 12,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.calendar_month_rounded, color: accent, size: 14),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(
+                    weekBadgeText(weekKey),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: accent,
+                      fontSize: 11,
+                      height: 1,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 0,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 2),
+        SizedBox(
+          width: 46,
+          height: 16,
+          child: Center(
+            child: Container(
+              height: 2,
+              decoration: BoxDecoration(
+                color: accent.withValues(alpha: 0.24),
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _StickerSelfieData {
+  final _MontageEntry entry;
+  final File file;
+
+  const _StickerSelfieData({required this.entry, required this.file});
+}
+
+class _StickerCropData {
+  final image_lib.Image image;
+  final Rect faceBounds;
+
+  const _StickerCropData({required this.image, required this.faceBounds});
+}
+
+const int _stickerOutputWidth = 540;
+const int _stickerOutputHeight = 636;
+const double _stickerAspect = _stickerOutputWidth / _stickerOutputHeight;
+const double _stickerOutlineGrow = 6;
+
+class _StickerMontage extends StatefulWidget {
+  final List<_MontageEntry> entries;
+  final MontageStyle style;
+
+  const _StickerMontage({required this.entries, required this.style});
+
+  @override
+  State<_StickerMontage> createState() => _StickerMontageState();
+}
+
+class _StickerMontageState extends State<_StickerMontage> {
+  late Future<List<_StickerSelfieData>> stickersFuture;
+  late String entriesSignature;
+
+  @override
+  void initState() {
+    super.initState();
+    _configureFuture();
+  }
+
+  @override
+  void didUpdateWidget(covariant _StickerMontage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final nextSignature = _signatureFor(widget.entries);
+    if (nextSignature != entriesSignature) {
+      _configureFuture();
+    }
+  }
+
+  String _signatureFor(List<_MontageEntry> entries) {
+    return entries.map((entry) => entry.post.id).join('|');
+  }
+
+  void _configureFuture() {
+    entriesSignature = _signatureFor(widget.entries);
+    stickersFuture = _loadStickerSelfies(widget.entries);
+  }
+
+  Future<List<_StickerSelfieData>> _loadStickerSelfies(
+    List<_MontageEntry> entries,
+  ) async {
+    if (!LocalPhotoCache.instance.isSupported) return const [];
+
+    final detector = FaceDetector(
+      options: FaceDetectorOptions(
+        performanceMode: FaceDetectorMode.accurate,
+        enableClassification: false,
+        enableContours: false,
+        enableLandmarks: true,
+        enableTracking: false,
+        minFaceSize: 0.06,
+      ),
+    );
+
+    final stickers = <_StickerSelfieData>[];
+    try {
+      for (final entry in entries) {
+        final data = entry.post.data();
+        final imageUrl = (data['imageUrl'] ?? data['thumbUrl'] ?? '')
+            .toString()
+            .trim();
+        if (imageUrl.isEmpty) continue;
+
+        final file = await LocalPhotoCache.instance.getOrDownload(
+          imageUrl,
+          variant: 'sticker',
+        );
+        if (file == null) continue;
+
+        try {
+          final faces = await detector.processImage(
+            InputImage.fromFilePath(file.path),
+          );
+          final stickerFile = await _createCutoutStickerFile(
+            sourceFile: file,
+            faces: faces,
+            postId: entry.post.id,
+          );
+          if (stickerFile != null) {
+            stickers.add(_StickerSelfieData(entry: entry, file: stickerFile));
+          }
+        } on PlatformException catch (error) {
+          logDebug('No se pudo detectar caras para sticker: $error');
+        } catch (error) {
+          logDebug('No se pudo crear el recorte de sticker: $error');
+        }
+      }
+    } on MissingPluginException catch (error) {
+      logDebug('Detector de stickers no disponible: $error');
+    } finally {
+      await detector.close();
+    }
+
+    return stickers;
+  }
+
+  Future<File?> _createCutoutStickerFile({
+    required File sourceFile,
+    required List<Face> faces,
+    required String postId,
+  }) async {
+    final bytes = await sourceFile.readAsBytes();
+    final decoded = image_lib.decodeImage(bytes);
+    if (decoded == null) return null;
+
+    final image = image_lib.bakeOrientation(decoded);
+    final face = _selectStickerFace(faces, image);
+    final crop = _cropPersonSticker(
+      image,
+      face?.boundingBox ?? _fallbackFaceBounds(image),
+    );
+    final resized = image_lib.copyResize(
+      crop.image,
+      width: _stickerOutputWidth,
+      height: _stickerOutputHeight,
+      interpolation: image_lib.Interpolation.cubic,
+    );
+    final scaleX = _stickerOutputWidth / crop.image.width;
+    final scaleY = _stickerOutputHeight / crop.image.height;
+    final resizedFaceBounds = Rect.fromLTWH(
+      crop.faceBounds.left * scaleX,
+      crop.faceBounds.top * scaleY,
+      crop.faceBounds.width * scaleX,
+      crop.faceBounds.height * scaleY,
+    );
+    final sticker = _buildStickerCutout(resized, resizedFaceBounds);
+    final safePostId = postId.replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_');
+    final file = File(
+      '${Directory.systemTemp.path}/sunday_sticker_${safePostId}_${sourceFile.lastModifiedSync().microsecondsSinceEpoch}.png',
+    );
+    await file.writeAsBytes(image_lib.encodePng(sticker), flush: true);
+    return file;
+  }
+
+  Face? _selectStickerFace(List<Face> faces, image_lib.Image image) {
+    if (faces.isEmpty) return null;
+
+    final imageW = image.width.toDouble();
+    final imageH = image.height.toDouble();
+    final preferredCenter = Offset(imageW * 0.5, imageH * 0.36);
+    Face? bestFace;
+    var bestScore = -double.maxFinite;
+
+    for (final face in faces) {
+      final bounds = _clampRectToImage(face.boundingBox, imageW, imageH);
+      if (bounds.width < 1 || bounds.height < 1) continue;
+
+      final area = (bounds.width * bounds.height) / (imageW * imageH);
+      final dx = (bounds.center.dx - preferredCenter.dx) / imageW;
+      final dy = (bounds.center.dy - preferredCenter.dy) / imageH;
+      final centered = 1 - math.sqrt(dx * dx + dy * dy).clamp(0.0, 1.0);
+      final verticalBias = bounds.center.dy < imageH * 0.76 ? 0.22 : 0.0;
+      final score =
+          math.sqrt(area).clamp(0.0, 1.0).toDouble() * 3.2 +
+          centered.toDouble() * 1.4 +
+          verticalBias;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestFace = face;
+      }
+    }
+
+    return bestFace ?? faces.first;
+  }
+
+  Rect _fallbackFaceBounds(image_lib.Image image) {
+    final imageW = image.width.toDouble();
+    final imageH = image.height.toDouble();
+    final faceH = math.min(imageH * 0.24, imageW * 0.38);
+    final faceW = faceH * 0.78;
+
+    return Rect.fromCenter(
+      center: Offset(imageW * 0.5, imageH * 0.30),
+      width: faceW,
+      height: faceH,
+    );
+  }
+
+  _StickerCropData _cropPersonSticker(
+    image_lib.Image image,
+    Rect rawFaceBounds,
+  ) {
+    final imageW = image.width.toDouble();
+    final imageH = image.height.toDouble();
+    final faceBounds = _clampRectToImage(rawFaceBounds, imageW, imageH);
+    final faceW = math.max(faceBounds.width, imageW * 0.10);
+    final faceH = math.max(faceBounds.height, imageH * 0.10);
+    final faceCenterX = faceBounds.left + faceBounds.width / 2;
+
+    var cropW = math.max(faceW * 3.18, imageW * 0.48);
+    var cropH = cropW / _stickerAspect;
+    final bodyCropH = faceH * 4.45;
+    if (cropH < bodyCropH) {
+      cropH = bodyCropH;
+      cropW = cropH * _stickerAspect;
+    }
+
+    if (cropW > imageW || cropH > imageH) {
+      final scale = math.min(imageW / cropW, imageH / cropH);
+      cropW *= scale;
+      cropH *= scale;
+    }
+
+    var cropX = faceCenterX - cropW / 2;
+    var cropY = faceBounds.top - faceH * 0.88;
+    final preferredBodyBottom = faceBounds.bottom + faceH * 3.28;
+    if (cropY + cropH < preferredBodyBottom) {
+      cropY = preferredBodyBottom - cropH;
+    }
+
+    cropX = cropX.clamp(0.0, math.max(0.0, imageW - cropW)).toDouble();
+    cropY = cropY.clamp(0.0, math.max(0.0, imageH - cropH)).toDouble();
+
+    final cropXInt = cropX.round().clamp(0, image.width - 1).toInt();
+    final cropYInt = cropY.round().clamp(0, image.height - 1).toInt();
+    final cropWidth = cropW.round().clamp(1, image.width - cropXInt).toInt();
+    final cropHeight = cropH.round().clamp(1, image.height - cropYInt).toInt();
+    final croppedFaceBounds = Rect.fromLTRB(
+      (faceBounds.left - cropXInt).clamp(0.0, cropWidth.toDouble()).toDouble(),
+      (faceBounds.top - cropYInt).clamp(0.0, cropHeight.toDouble()).toDouble(),
+      (faceBounds.right - cropXInt).clamp(0.0, cropWidth.toDouble()).toDouble(),
+      (faceBounds.bottom - cropYInt)
+          .clamp(0.0, cropHeight.toDouble())
+          .toDouble(),
+    );
+
+    return _StickerCropData(
+      image: image_lib.copyCrop(
+        image,
+        x: cropXInt,
+        y: cropYInt,
+        width: cropWidth,
+        height: cropHeight,
+      ),
+      faceBounds: croppedFaceBounds,
+    );
+  }
+
+  Rect _clampRectToImage(Rect rect, double imageW, double imageH) {
+    final safeImageW = math.max(imageW, 1.0);
+    final safeImageH = math.max(imageH, 1.0);
+    final left = rect.left.clamp(0.0, safeImageW - 1).toDouble();
+    final top = rect.top.clamp(0.0, safeImageH - 1).toDouble();
+    final right = rect.right.clamp(left + 1, safeImageW).toDouble();
+    final bottom = rect.bottom.clamp(top + 1, safeImageH).toDouble();
+
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  image_lib.Image _buildStickerCutout(image_lib.Image source, Rect faceBounds) {
+    final width = source.width;
+    final height = source.height;
+    final output = image_lib.Image(width: width, height: height, numChannels: 4)
+      ..clear(image_lib.ColorRgba8(0, 0, 0, 0));
+
+    for (var y = 0; y < height; y += 1) {
+      for (var x = 0; x < width; x += 1) {
+        final outerAlpha = _stickerSilhouetteAlpha(
+          x: x.toDouble(),
+          y: y.toDouble(),
+          width: width.toDouble(),
+          height: height.toDouble(),
+          faceBounds: faceBounds,
+          grow: _stickerOutlineGrow,
+        );
+        if (outerAlpha <= 0.01) continue;
+
+        final innerAlpha = _stickerSilhouetteAlpha(
+          x: x.toDouble(),
+          y: y.toDouble(),
+          width: width.toDouble(),
+          height: height.toDouble(),
+          faceBounds: faceBounds,
+          grow: 0,
+        ).clamp(0.0, 1.0).toDouble();
+        final borderAlpha = (outerAlpha - innerAlpha).clamp(0.0, 1.0);
+        final pixel = source.getPixel(x, y);
+        final opacity = math
+            .max(innerAlpha, borderAlpha * 0.72)
+            .clamp(0.0, 1.0)
+            .toDouble();
+        final imageAmount = innerAlpha > 0.01
+            ? 1.0
+            : (1.0 - borderAlpha * 0.45).clamp(0.0, 1.0).toDouble();
+
+        output.setPixelRgba(
+          x,
+          y,
+          _blendStickerChannel(pixel.r, imageAmount),
+          _blendStickerChannel(pixel.g, imageAmount),
+          _blendStickerChannel(pixel.b, imageAmount),
+          _alphaByte(opacity),
+        );
+      }
+    }
+
+    return output;
+  }
+
+  double _stickerSilhouetteAlpha({
+    required double x,
+    required double y,
+    required double width,
+    required double height,
+    required Rect faceBounds,
+    required double grow,
+  }) {
+    final faceW = math.max(faceBounds.width, width * 0.13);
+    final faceH = math.max(faceBounds.height, height * 0.14);
+    final faceCenterX = faceBounds.center.dx.clamp(width * 0.16, width * 0.84);
+    final faceCenterY = faceBounds.center.dy;
+    final feather = math.max(2.8, math.min(width, height) * 0.008);
+    final shoulderHalfWidth = math.max(faceW * 1.48, width * 0.30);
+    final torsoHalfWidth = math.max(faceW * 1.04, width * 0.23);
+    final bodyTop = faceBounds.bottom - faceH * 0.02;
+    final bodyBottom = math.min(height - 8, faceBounds.bottom + faceH * 3.16);
+
+    var alpha = 0.0;
+    alpha = math.max(
+      alpha,
+      _ellipseAlpha(
+        x,
+        y,
+        faceCenterX,
+        faceCenterY - faceH * 0.04,
+        faceW * 0.64 + grow,
+        faceH * 0.72 + grow,
+        feather,
+      ),
+    );
+    alpha = math.max(
+      alpha,
+      _ellipseAlpha(
+        x,
+        y,
+        faceCenterX,
+        faceBounds.bottom + faceH * 0.18,
+        faceW * 0.29 + grow * 0.54,
+        faceH * 0.38 + grow,
+        feather,
+      ),
+    );
+    alpha = math.max(
+      alpha,
+      _ellipseAlpha(
+        x,
+        y,
+        faceCenterX,
+        faceBounds.bottom + faceH * 0.78,
+        shoulderHalfWidth + grow,
+        faceH * 0.66 + grow,
+        feather,
+      ),
+    );
+    alpha = math.max(
+      alpha,
+      _taperedBodyAlpha(
+        x: x,
+        y: y,
+        centerX: faceCenterX,
+        top: bodyTop,
+        bottom: bodyBottom,
+        topHalfWidth: faceW * 0.46,
+        shoulderHalfWidth: shoulderHalfWidth,
+        bottomHalfWidth: torsoHalfWidth,
+        grow: grow,
+        feather: feather,
+      ),
+    );
+    alpha = math.max(
+      alpha,
+      _ellipseAlpha(
+        x,
+        y,
+        faceCenterX,
+        faceBounds.bottom + faceH * 2.34,
+        torsoHalfWidth + grow,
+        faceH * 1.18 + grow,
+        feather,
+      ),
+    );
+
+    return alpha.clamp(0.0, 1.0).toDouble();
+  }
+
+  double _ellipseAlpha(
+    double x,
+    double y,
+    double centerX,
+    double centerY,
+    double radiusX,
+    double radiusY,
+    double feather,
+  ) {
+    final safeRadiusX = math.max(radiusX, 1.0);
+    final safeRadiusY = math.max(radiusY, 1.0);
+    final dx = (x - centerX) / safeRadiusX;
+    final dy = (y - centerY) / safeRadiusY;
+    final normalizedDistance = math.sqrt(dx * dx + dy * dy);
+    final edgeDistance =
+        (1 - normalizedDistance) * math.min(safeRadiusX, safeRadiusY);
+
+    return _smoothStep(0, feather, edgeDistance);
+  }
+
+  double _taperedBodyAlpha({
+    required double x,
+    required double y,
+    required double centerX,
+    required double top,
+    required double bottom,
+    required double topHalfWidth,
+    required double shoulderHalfWidth,
+    required double bottomHalfWidth,
+    required double grow,
+    required double feather,
+  }) {
+    if (bottom <= top) return 0;
+
+    final expandedTop = top - grow;
+    final expandedBottom = bottom + grow;
+    final verticalEdge = math.min(y - expandedTop, expandedBottom - y);
+    final t = ((y - top) / (bottom - top)).clamp(0.0, 1.0).toDouble();
+    final shoulderEase = _smoothStep(0, 0.34, t);
+    final lowerEase = _smoothStep(0.34, 1, t);
+    final upperWidth = _lerp(topHalfWidth, shoulderHalfWidth, shoulderEase);
+    final halfWidth = _lerp(upperWidth, bottomHalfWidth, lowerEase) + grow;
+    final horizontalEdge = halfWidth - (x - centerX).abs();
+
+    return math
+        .min(
+          _smoothStep(0, feather, horizontalEdge),
+          _smoothStep(0, feather, verticalEdge),
+        )
+        .clamp(0.0, 1.0)
+        .toDouble();
+  }
+
+  double _smoothStep(double edge0, double edge1, double value) {
+    if (value <= edge0) return 0;
+    if (value >= edge1) return 1;
+
+    final t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0).toDouble();
+    return t * t * (3 - 2 * t);
+  }
+
+  double _lerp(double start, double end, double amount) {
+    return start + (end - start) * amount;
+  }
+
+  int _blendStickerChannel(num channel, double imageAmount) {
+    final amount = imageAmount.clamp(0.0, 1.0).toDouble();
+    final blended = channel.toDouble() * amount + 255 * (1 - amount);
+    return blended.round().clamp(0, 255).toInt();
+  }
+
+  int _alphaByte(double alpha) {
+    return (alpha.clamp(0.0, 1.0) * 255).round().clamp(0, 255).toInt();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = widget.style.accent;
+
+    return FutureBuilder<List<_StickerSelfieData>>(
+      future: stickersFuture,
+      builder: (context, snapshot) {
+        final waiting = snapshot.connectionState != ConnectionState.done;
+        final stickers = snapshot.data ?? const <_StickerSelfieData>[];
+
+        if (waiting) {
+          return SizedBox(
+            height: 244,
+            child: Center(
+              child: CircularProgressIndicator(color: accent, strokeWidth: 2.4),
+            ),
+          );
+        }
+
+        if (stickers.isEmpty) {
+          return Container(
+            height: 220,
+            alignment: Alignment.center,
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.72),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: accent.withValues(alpha: 0.16)),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(
+                  Icons.face_retouching_off_rounded,
+                  color: accent,
+                  size: 34,
+                ),
+                const SizedBox(height: 10),
+                const Text(
+                  'No hay selfies individuales para este estilo',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: ssText2,
+                    fontSize: 13,
+                    height: 1.3,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+          );
+        }
+
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final width = constraints.maxWidth;
+            final columns = width < 280 || stickers.length == 1 ? 1 : 2;
+            final size = columns == 1 ? 196.0 : math.min(150.0, width * 0.45);
+            final stickerHeight = size * 1.18;
+            final rowStride = size * 0.82;
+            final rows = (stickers.length / columns).ceil();
+            final height = columns == 1
+                ? stickerHeight + 42.0
+                : stickerHeight + math.max(0, rows - 1) * rowStride + 48.0;
+
+            return SizedBox(
+              height: height,
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Positioned.fill(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.38),
+                        borderRadius: BorderRadius.circular(22),
+                        border: Border.all(
+                          color: accent.withValues(alpha: 0.10),
+                        ),
+                      ),
+                    ),
+                  ),
+                  for (var i = 0; i < stickers.length; i += 1)
+                    _PositionedStickerSelfie(
+                      sticker: stickers[i],
+                      index: i,
+                      columns: columns,
+                      size: size,
+                      width: width,
+                    ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+class _PositionedStickerSelfie extends StatelessWidget {
+  final _StickerSelfieData sticker;
+  final int index;
+  final int columns;
+  final double size;
+  final double width;
+
+  const _PositionedStickerSelfie({
+    required this.sticker,
+    required this.index,
+    required this.columns,
+    required this.size,
+    required this.width,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final row = index ~/ columns;
+    final col = index % columns;
+    final singleColumn = columns == 1;
+    final stickerHeight = size * 1.18;
+    final rowStride = size * 0.82;
+    final left = singleColumn
+        ? (width - size) / 2
+        : col == 0
+        ? 12.0
+        : width - size - 12.0;
+    final top = singleColumn
+        ? 18.0
+        : 18.0 + row * rowStride + (col.isOdd ? size * 0.18 : 0.0);
+    final rotation = const [-0.12, 0.09, -0.06, 0.11, -0.09, 0.07][index % 6];
+
+    return Positioned(
+      left: left,
+      top: top,
+      child: Transform.rotate(
+        angle: rotation,
+        child: SizedBox(
+          width: size,
+          height: stickerHeight,
+          child: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Positioned(
+                left: 16,
+                right: 16,
+                bottom: 12,
+                child: Container(
+                  height: 24,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF593449).withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(999),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xFF593449).withValues(alpha: 0.18),
+                        blurRadius: 18,
+                        offset: const Offset(0, 8),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              Positioned.fill(
+                child: Image.file(
+                  sticker.file,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, _, _) => const _ImageErrorFill(),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _MontageColumn extends StatelessWidget {
   final List<_MontageEntry> entries;
-  final ValueChanged<int> onTapEntry;
+  final MontageStyle style;
+  final String? draggingPostId;
+  final String? resizingPostId;
+  final _MontageResizeEdge? activeResizeEdge;
+  final bool showEditingControls;
+  final void Function(_MontageDragPayload payload, int targetIndex) onDrop;
+  final ValueChanged<String> onDragStarted;
+  final VoidCallback onDragEnded;
+  final void Function(String postId, _MontageResizeEdge edge) onResizeStart;
+  final void Function(
+    String postId,
+    _MontageResizeEdge edge,
+    Offset dragDelta,
+    double resizeWidthBasis,
+  )
+  onResizeUpdate;
+  final VoidCallback onResizeEnd;
 
   const _MontageColumn({
     required this.entries,
-    required this.onTapEntry,
+    required this.style,
+    required this.draggingPostId,
+    required this.resizingPostId,
+    required this.activeResizeEdge,
+    required this.showEditingControls,
+    required this.onDrop,
+    required this.onDragStarted,
+    required this.onDragEnded,
+    required this.onResizeStart,
+    required this.onResizeUpdate,
+    required this.onResizeEnd,
   });
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: entries.map((entry) {
-        return MontageSelfieTile(
+        return _MontageSelfieTile(
           post: entry.post,
+          index: entry.index,
           height: entry.height,
-          onTap: () => onTapEntry(entry.index),
+          style: style,
+          isDragging: draggingPostId == entry.post.id,
+          isResizing: showEditingControls && resizingPostId == entry.post.id,
+          activeResizeEdge:
+              showEditingControls && resizingPostId == entry.post.id
+              ? activeResizeEdge
+              : null,
+          showEditingControls: showEditingControls,
+          allowHorizontalResize: false,
+          horizontalResizeBasis: 0,
+          onDrop: onDrop,
+          onDragStarted: onDragStarted,
+          onDragEnded: onDragEnded,
+          onResizeStart: onResizeStart,
+          onResizeUpdate: onResizeUpdate,
+          onResizeEnd: onResizeEnd,
         );
       }).toList(),
     );
   }
 }
 
-class MontageSelfieTile extends StatelessWidget {
+class _MontageSelfieTile extends StatelessWidget {
   final QueryDocumentSnapshot<Map<String, dynamic>> post;
+  final int index;
   final double height;
-  final VoidCallback onTap;
+  final MontageStyle style;
+  final bool isDragging;
+  final bool isResizing;
+  final _MontageResizeEdge? activeResizeEdge;
+  final bool showEditingControls;
+  final void Function(_MontageDragPayload payload, int targetIndex) onDrop;
+  final ValueChanged<String> onDragStarted;
+  final VoidCallback onDragEnded;
+  final void Function(String postId, _MontageResizeEdge edge) onResizeStart;
+  final void Function(
+    String postId,
+    _MontageResizeEdge edge,
+    Offset dragDelta,
+    double resizeWidthBasis,
+  )
+  onResizeUpdate;
+  final VoidCallback onResizeEnd;
+  final bool allowHorizontalResize;
+  final double horizontalResizeBasis;
 
-  const MontageSelfieTile({
-    super.key,
+  const _MontageSelfieTile({
     required this.post,
+    required this.index,
     required this.height,
-    required this.onTap,
+    required this.style,
+    required this.isDragging,
+    required this.isResizing,
+    required this.activeResizeEdge,
+    required this.showEditingControls,
+    required this.allowHorizontalResize,
+    required this.horizontalResizeBasis,
+    required this.onDrop,
+    required this.onDragStarted,
+    required this.onDragEnded,
+    required this.onResizeStart,
+    required this.onResizeUpdate,
+    required this.onResizeEnd,
   });
 
-  @override
-  Widget build(BuildContext context) {
+  Widget _buildPhoto({
+    required bool highlighted,
+    required bool lifted,
+    required bool showReactions,
+  }) {
     final data = post.data();
     final imageUrl = (data['thumbUrl'] ?? data['imageUrl'] ?? '').toString();
+    final isPolaroid = style == MontageStyle.polaroid;
+    final accent = style.accent;
+    final photoRadius = isPolaroid ? 6.0 : 14.0;
+    final outerRadius = isPolaroid ? 8.0 : 14.0;
+    final rotation = isPolaroid
+        ? const [-0.025, 0.018, -0.012, 0.024, -0.018, 0.014][index % 6]
+        : 0.0;
+    final polaroidBottomPadding = showReactions ? 31.0 : 24.0;
 
-    final reactionsRef = post.reference
-        .collection('reactions')
-        .orderBy('updatedAt', descending: true);
+    Widget reactionsStrip({required bool overlay, required bool plain}) {
+      return GroupAggregatedReactionsStrip(
+        reactionsRef: post.reference
+            .collection('reactions')
+            .orderBy('updatedAt', descending: true),
+        compact: true,
+        overlay: overlay,
+        plain: plain,
+        hideWhenEmpty: true,
+      );
+    }
 
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        height: height,
-        margin: const EdgeInsets.only(bottom: 7),
-        clipBehavior: Clip.antiAlias,
-        decoration: BoxDecoration(
-          color: ssOrangeLight,
-          borderRadius: BorderRadius.circular(14),
-        ),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            if (imageUrl.isNotEmpty)
-              Image.network(
-                imageUrl,
-                fit: BoxFit.cover,
-                loadingBuilder: (context, child, progress) {
-                  if (progress == null) return child;
-                  return const _ImageLoadingFill();
-                },
-                errorBuilder: (_, _, _) => const _ImageErrorFill(),
-              )
-            else
-              Container(
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    colors: [ssOrange, ssOrangeMid],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
+    final imageStack = ClipRRect(
+      borderRadius: BorderRadius.circular(photoRadius),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          if (imageUrl.isNotEmpty)
+            CachedRemoteImage(
+              imageUrl: imageUrl,
+              cacheVariant: 'thumbnail',
+              fit: BoxFit.cover,
+              loadingWidget: const _ImageLoadingFill(),
+              errorWidget: const _ImageErrorFill(),
+            )
+          else
+            Container(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [accent, ssOrangeMid],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
                 ),
               ),
-            const _PhotoGradientOverlay(),
+            ),
+          const _PhotoGradientOverlay(),
+          if (highlighted)
+            DecoratedBox(
+              decoration: BoxDecoration(
+                color: accent.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(photoRadius),
+              ),
+            ),
+          if (showReactions && !isPolaroid)
             Positioned(
               left: 7,
               right: 7,
               bottom: 7,
-              child: GroupAggregatedReactionsStrip(
-                reactionsRef: reactionsRef,
-                compact: true,
-                overlay: true,
-              ),
+              child: reactionsStrip(overlay: true, plain: false),
             ),
+        ],
+      ),
+    );
+    final photoContent = isPolaroid && showReactions
+        ? Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Positioned.fill(child: imageStack),
+              Positioned(
+                left: 4,
+                right: 4,
+                bottom: -polaroidBottomPadding + 2,
+                child: reactionsStrip(overlay: false, plain: true),
+              ),
+            ],
+          )
+        : imageStack;
+
+    return Transform.rotate(
+      angle: lifted ? 0 : rotation,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOutCubic,
+        height: height + (isPolaroid ? 7 + polaroidBottomPadding : 0),
+        margin: EdgeInsets.fromLTRB(
+          isPolaroid ? 3 : 0,
+          isPolaroid ? 3 : 0,
+          isPolaroid ? 3 : 0,
+          isPolaroid ? 13 : 7,
+        ),
+        padding: isPolaroid
+            ? EdgeInsets.fromLTRB(7, 7, 7, polaroidBottomPadding)
+            : EdgeInsets.zero,
+        clipBehavior: Clip.antiAlias,
+        decoration: BoxDecoration(
+          color: isPolaroid ? Colors.white : ssOrangeLight,
+          borderRadius: BorderRadius.circular(outerRadius),
+          border: Border.all(
+            color: highlighted || isResizing
+                ? accent
+                : isPolaroid
+                ? const Color(0xFFF2ECE4)
+                : Colors.white.withValues(alpha: 0),
+            width: highlighted || isResizing
+                ? 2
+                : isPolaroid
+                ? 1
+                : 0,
+          ),
+          boxShadow: [
+            if (isPolaroid)
+              BoxShadow(
+                color: const Color(0xFF6B4A2E).withValues(alpha: 0.09),
+                blurRadius: isPolaroid ? 18 : 14,
+                offset: const Offset(0, 7),
+              ),
+            if (lifted || highlighted)
+              BoxShadow(
+                color: Colors.black.withValues(alpha: lifted ? 0.28 : 0.14),
+                blurRadius: lifted ? 24 : 14,
+                offset: Offset(0, lifted ? 10 : 4),
+              ),
           ],
         ),
+        child: photoContent,
       ),
+    );
+  }
+
+  Widget _buildResizeHandle(_MontageResizeEdge edge, double resizeWidthBasis) {
+    final active = activeResizeEdge == edge;
+    final horizontal = edge.isHorizontal;
+    final alignedTop = edge == _MontageResizeEdge.top;
+    final alignedLeft = edge == _MontageResizeEdge.left;
+
+    if (horizontal) {
+      return Positioned(
+        left: alignedLeft ? 0 : null,
+        right: alignedLeft ? null : 0,
+        top: 12,
+        bottom: 19,
+        width: 34,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onLongPressStart: (_) => onResizeStart(post.id, edge),
+          onLongPressMoveUpdate: (details) => onResizeUpdate(
+            post.id,
+            edge,
+            details.offsetFromOrigin,
+            resizeWidthBasis,
+          ),
+          onLongPressEnd: (_) => onResizeEnd(),
+          onLongPressCancel: onResizeEnd,
+          child: Align(
+            alignment: alignedLeft
+                ? Alignment.centerLeft
+                : Alignment.centerRight,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 130),
+              width: active ? 5 : 4,
+              height: active ? 58 : 42,
+              margin: EdgeInsets.only(left: alignedLeft ? 7 : 0, right: 7),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: active ? 0.46 : 0.22),
+                borderRadius: BorderRadius.circular(999),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: active ? 0.10 : 0.04),
+                    blurRadius: active ? 8 : 4,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Positioned(
+      left: 0,
+      right: 0,
+      top: alignedTop ? 0 : null,
+      bottom: alignedTop ? null : 7,
+      height: 34,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onLongPressStart: (_) => onResizeStart(post.id, edge),
+        onLongPressMoveUpdate: (details) => onResizeUpdate(
+          post.id,
+          edge,
+          details.offsetFromOrigin,
+          resizeWidthBasis,
+        ),
+        onLongPressEnd: (_) => onResizeEnd(),
+        onLongPressCancel: onResizeEnd,
+        child: Align(
+          alignment: alignedTop ? Alignment.topCenter : Alignment.bottomCenter,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 130),
+            width: active ? 58 : 42,
+            height: active ? 5 : 4,
+            margin: EdgeInsets.only(top: alignedTop ? 7 : 0, bottom: 7),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: active ? 0.46 : 0.22),
+              borderRadius: BorderRadius.circular(999),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: active ? 0.10 : 0.04),
+                  blurRadius: active ? 8 : 4,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInteractiveTile({
+    required bool highlighted,
+    required bool dimmed,
+    required double resizeWidthBasis,
+  }) {
+    return AnimatedOpacity(
+      duration: const Duration(milliseconds: 120),
+      opacity: dimmed ? 0.34 : 1,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          _buildPhoto(
+            highlighted: highlighted,
+            lifted: false,
+            showReactions: true,
+          ),
+          if (showEditingControls) ...[
+            _buildResizeHandle(_MontageResizeEdge.top, resizeWidthBasis),
+            _buildResizeHandle(_MontageResizeEdge.bottom, resizeWidthBasis),
+            if (allowHorizontalResize) ...[
+              _buildResizeHandle(_MontageResizeEdge.left, resizeWidthBasis),
+              _buildResizeHandle(_MontageResizeEdge.right, resizeWidthBasis),
+            ],
+          ],
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DragTarget<_MontageDragPayload>(
+      onWillAcceptWithDetails: (details) => details.data.postId != post.id,
+      onAcceptWithDetails: (details) => onDrop(details.data, index),
+      builder: (context, candidateData, rejectedData) {
+        final highlighted = candidateData.isNotEmpty;
+
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final resizeWidthBasis = allowHorizontalResize
+                ? horizontalResizeBasis
+                : constraints.maxWidth;
+
+            return LongPressDraggable<_MontageDragPayload>(
+              data: _MontageDragPayload(postId: post.id, fromIndex: index),
+              delay: const Duration(seconds: 1),
+              rootOverlay: true,
+              maxSimultaneousDrags: isResizing || !showEditingControls ? 0 : 1,
+              onDragStarted: () => onDragStarted(post.id),
+              onDragEnd: (_) => onDragEnded(),
+              feedback: SizedBox(
+                width: constraints.maxWidth,
+                child: Transform.scale(
+                  scale: 1.03,
+                  child: Material(
+                    type: MaterialType.transparency,
+                    child: _buildPhoto(
+                      highlighted: true,
+                      lifted: true,
+                      showReactions: false,
+                    ),
+                  ),
+                ),
+              ),
+              childWhenDragging: _buildInteractiveTile(
+                highlighted: highlighted,
+                dimmed: true,
+                resizeWidthBasis: resizeWidthBasis,
+              ),
+              child: _buildInteractiveTile(
+                highlighted: highlighted,
+                dimmed: isDragging,
+                resizeWidthBasis: resizeWidthBasis,
+              ),
+            );
+          },
+        );
+      },
     );
   }
 }
@@ -12635,46 +25729,9 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
-  Future<void> _confirmSignOut() async {
-    final shouldSignOut = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          backgroundColor: Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(22),
-          ),
-          title: const Text('Cerrar sesión'),
-          content: const Text(
-            '¿Quieres salir de Sunday Selfie en este dispositivo?',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancelar'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text(
-                'Salir',
-                style: TextStyle(
-                  color: ssOrangeDark,
-                  fontWeight: FontWeight.w800,
-                ),
-              ),
-            ),
-          ],
-        );
-      },
-    );
-
-    if (shouldSignOut == true) {
-      await FirebaseAuth.instance.signOut();
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
     final userRef = FirebaseFirestore.instance
         .collection('users')
         .doc(widget.user.uid);
@@ -12716,6 +25773,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   final profileBottomPadding = compactProfile ? 14.0 : 24.0;
                   final profileMainGap = compactProfile ? 12.0 : 20.0;
                   final profileMenuGap = compactProfile ? 10.0 : 16.0;
+                  void openEditProfile() {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => EditProfileScreen(user: widget.user),
+                      ),
+                    );
+                  }
 
                   return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
                     stream: userGroupsRef.snapshots(),
@@ -12729,7 +25794,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           final selfiesCount = selfiesSnapshot.data ?? 0;
 
                           return ListView(
-                            padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
+                            padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
                             children: [
                               Padding(
                                 padding: EdgeInsets.fromLTRB(
@@ -12744,6 +25809,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                       name: baseName,
                                       photoUrl: basePhotoUrl,
                                       size: profileAvatarSize,
+                                      onTap: openEditProfile,
                                     ),
                                     SizedBox(height: compactProfile ? 12 : 16),
                                     Text(
@@ -12790,7 +25856,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                               ),
                               SizedBox(height: profileMenuGap),
                               ProfileMenuRow(
-                                iconText: '🔔',
+                                icon: ProfileLineIconKind.notifications,
                                 label: 'Notificaciones',
                                 onTap: () {
                                   Navigator.push(
@@ -12805,20 +25871,27 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                 },
                               ),
                               ProfileMenuRow(
-                                iconText: '👤',
+                                icon: ProfileLineIconKind.editProfile,
                                 label: 'Editar perfil',
+                                onTap: openEditProfile,
+                              ),
+                              ProfileMenuRow(
+                                icon: ProfileLineIconKind.suggestions,
+                                label: 'Sugerencias',
                                 onTap: () {
                                   Navigator.push(
                                     context,
                                     MaterialPageRoute(
-                                      builder: (_) =>
-                                          EditProfileScreen(user: widget.user),
+                                      builder: (_) => SuggestionsScreen(
+                                        user: widget.user,
+                                        authorName: baseName,
+                                      ),
                                     ),
                                   );
                                 },
                               ),
                               ProfileMenuRow(
-                                iconText: '⚙️',
+                                icon: ProfileLineIconKind.settings,
                                 label: 'Ajustes',
                                 onTap: () {
                                   Navigator.push(
@@ -12829,18 +25902,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                     ),
                                   );
                                 },
-                              ),
-                              const SizedBox(height: 16),
-                              TextButton(
-                                onPressed: _confirmSignOut,
-                                child: const Text(
-                                  'Cerrar sesión',
-                                  style: TextStyle(
-                                    color: Color(0xFFE74C3C),
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w700,
-                                  ),
-                                ),
                               ),
                             ],
                           );
@@ -12873,7 +25934,6 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   bool saved = false;
   bool nameInitialized = false;
   XFile? selectedPhoto;
-  bool selectedPhotoFilterApplied = false;
 
   @override
   void dispose() {
@@ -12902,15 +25962,17 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
       final photo = await Navigator.push<XFile>(
         context,
         MaterialPageRoute(
-          builder: (_) => const CameraCaptureScreen(groupName: 'Foto de perfil'),
+          builder: (_) =>
+              const CameraCaptureScreen(groupName: 'Foto de perfil'),
         ),
       );
 
       if (!mounted || photo == null) return;
+      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
+      if (!mounted || !validPhoto) return;
 
       setState(() {
         selectedPhoto = photo;
-        selectedPhotoFilterApplied = true;
         saved = false;
       });
       return;
@@ -12925,10 +25987,11 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
       );
 
       if (!mounted || photo == null) return;
+      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
+      if (!mounted || !validPhoto) return;
 
       setState(() {
         selectedPhoto = photo;
-        selectedPhotoFilterApplied = true;
         saved = false;
       });
     } catch (error) {
@@ -12961,12 +26024,9 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
       return;
     }
 
-    if (photoChanged && !selectedPhotoFilterApplied) {
-      showSundaySnack(
-        context,
-        'Aplica el filtro Sunday Selfie antes de guardar',
-      );
-      return;
+    if (photoChanged) {
+      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
+      if (!mounted || !validPhoto) return;
     }
 
     if (saving) return;
@@ -12990,13 +26050,15 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
       FocusScope.of(context).unfocus();
       setState(() {
         selectedPhoto = null;
-        selectedPhotoFilterApplied = false;
         saved = true;
         nameInitialized = false;
       });
       showSundaySnack(context, 'Perfil actualizado');
       await Future<void>.delayed(const Duration(milliseconds: 700));
       if (mounted) Navigator.pop(context);
+    } on SelfiePhotoValidationException catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, error.message);
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'Error: $error');
@@ -13007,6 +26069,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
 
   @override
   Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
     final userRef = FirebaseFirestore.instance
         .collection('users')
         .doc(widget.user.uid);
@@ -13060,10 +26123,8 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                           newName.isNotEmpty && newName != baseName;
                       final photoChanged = selectedPhoto != null;
                       final hasChanges = nameChanged || photoChanged;
-                      final canSave = hasChanges &&
-                          !saving &&
-                          newName.isNotEmpty &&
-                          (!photoChanged || selectedPhotoFilterApplied);
+                      final canSave =
+                          hasChanges && !saving && newName.isNotEmpty;
 
                       return ListView(
                         padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
@@ -13085,7 +26146,6 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                                   name: newName.isEmpty ? baseName : newName,
                                   photoUrl: basePhotoUrl,
                                   selectedPhoto: selectedPhoto,
-                                  filterApplied: selectedPhotoFilterApplied,
                                   canChangePhoto: esDomingo(),
                                   onTap: saving ? null : _choosePhotoSource,
                                 ),
@@ -13143,10 +26203,10 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                                 : SundayButtonVariant.primary,
                             onPressed: canSave
                                 ? () => _saveProfile(
-                                      currentName: baseName,
-                                      currentPhotoStoragePath:
-                                          profilePhotoStoragePath,
-                                    )
+                                    currentName: baseName,
+                                    currentPhotoStoragePath:
+                                        profilePhotoStoragePath,
+                                  )
                                 : null,
                           ),
                         ],
@@ -13163,11 +26223,183 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   }
 }
 
+class SuggestionsScreen extends StatefulWidget {
+  final User user;
+  final String authorName;
+
+  const SuggestionsScreen({
+    super.key,
+    required this.user,
+    required this.authorName,
+  });
+
+  @override
+  State<SuggestionsScreen> createState() => _SuggestionsScreenState();
+}
+
+class _SuggestionsScreenState extends State<SuggestionsScreen> {
+  final TextEditingController suggestionController = TextEditingController();
+  bool sending = false;
+  bool sent = false;
+
+  @override
+  void dispose() {
+    suggestionController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _sendSuggestion() async {
+    final text = suggestionController.text.trim();
+
+    if (text.length < 5) {
+      showSundaySnack(context, 'Escribe un poco más para enviar la sugerencia');
+      return;
+    }
+
+    if (text.length > 1000) {
+      showSundaySnack(
+        context,
+        'La sugerencia no puede superar 1000 caracteres',
+      );
+      return;
+    }
+
+    if (sending) return;
+
+    setState(() => sending = true);
+
+    try {
+      await enviarSugerenciaUsuario(
+        user: widget.user,
+        authorName: widget.authorName,
+        text: text,
+      );
+
+      if (!mounted) return;
+      FocusScope.of(context).unfocus();
+      suggestionController.clear();
+      setState(() => sent = true);
+      showSundaySnack(context, 'Sugerencia enviada. ¡Gracias!');
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error enviando sugerencia: $error');
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: ssBg,
+      body: SafeArea(
+        child: Column(
+          children: [
+            AppHeader(onBack: () => Navigator.pop(context)),
+            Expanded(
+              child: ValueListenableBuilder<TextEditingValue>(
+                valueListenable: suggestionController,
+                builder: (context, value, _) {
+                  final suggestion = value.text.trim();
+                  final canSend =
+                      suggestion.length >= 5 &&
+                      suggestion.length <= 1000 &&
+                      !sending;
+
+                  return ListView(
+                    padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
+                    children: [
+                      const Text(
+                        'Sugerencias',
+                        style: TextStyle(
+                          color: ssTitle,
+                          fontSize: 22,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      SundayCard(
+                        padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
+                        child: TextField(
+                          controller: suggestionController,
+                          enabled: !sending,
+                          minLines: 7,
+                          maxLines: 10,
+                          maxLength: 1000,
+                          keyboardType: TextInputType.multiline,
+                          textCapitalization: TextCapitalization.sentences,
+                          cursorColor: ssOrange,
+                          onChanged: (_) {
+                            if (sent) setState(() => sent = false);
+                          },
+                          style: const TextStyle(
+                            color: ssText,
+                            fontSize: 15.5,
+                            fontWeight: FontWeight.w600,
+                            height: 1.35,
+                          ),
+                          decoration: InputDecoration(
+                            hintText: 'Cuéntanos qué mejorarías',
+                            hintStyle: const TextStyle(
+                              color: ssText3,
+                              fontWeight: FontWeight.w500,
+                            ),
+                            filled: true,
+                            fillColor: ssBg,
+                            counterStyle: const TextStyle(color: ssText3),
+                            contentPadding: const EdgeInsets.all(14),
+                            enabledBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(14),
+                              borderSide: const BorderSide(
+                                color: ssBorder,
+                                width: 1.5,
+                              ),
+                            ),
+                            focusedBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(14),
+                              borderSide: const BorderSide(
+                                color: ssOrange,
+                                width: 1.5,
+                              ),
+                            ),
+                            disabledBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(14),
+                              borderSide: const BorderSide(
+                                color: ssBorder,
+                                width: 1.5,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      SundayButton(
+                        text: sent
+                            ? 'Sugerencia enviada'
+                            : sending
+                            ? 'Enviando...'
+                            : 'Enviar sugerencia',
+                        variant: sent
+                            ? SundayButtonVariant.secondary
+                            : SundayButtonVariant.primary,
+                        onPressed: canSend ? _sendSuggestion : null,
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class EditableProfileAvatar extends StatelessWidget {
   final String name;
   final String? photoUrl;
   final XFile? selectedPhoto;
-  final bool filterApplied;
   final bool canChangePhoto;
   final VoidCallback? onTap;
 
@@ -13176,7 +26408,6 @@ class EditableProfileAvatar extends StatelessWidget {
     required this.name,
     required this.photoUrl,
     required this.selectedPhoto,
-    required this.filterApplied,
     required this.canChangePhoto,
     required this.onTap,
   });
@@ -13196,16 +26427,37 @@ class EditableProfileAvatar extends StatelessWidget {
         fit: BoxFit.cover,
         alignment: Alignment.center,
         filterQuality: FilterQuality.high,
+        errorBuilder: (_, _, _) => Center(
+          child: Text(
+            initialsFromName(name),
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 34,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+        ),
       );
     } else if (hasRemotePhoto) {
-      avatarContent = Image.network(
-        photoUrl!,
+      avatarContent = CachedRemoteImage(
+        imageUrl: photoUrl!,
+        cacheVariant: 'avatar',
         width: 96,
         height: 96,
         fit: BoxFit.cover,
         alignment: Alignment.center,
         filterQuality: FilterQuality.high,
-        errorBuilder: (_, _, _) => Center(
+        loadingWidget: Center(
+          child: Text(
+            initialsFromName(name),
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 34,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+        ),
+        errorWidget: Center(
           child: Text(
             initialsFromName(name),
             style: const TextStyle(
@@ -13252,31 +26504,7 @@ class EditableProfileAvatar extends StatelessWidget {
             child: ClipOval(
               child: Stack(
                 fit: StackFit.expand,
-                children: [
-                  Container(color: ssOrange, child: avatarContent),
-                  if (hasSelectedPhoto && filterApplied)
-                    DecoratedBox(
-                      decoration: BoxDecoration(
-                        color: ssOrange.withValues(alpha: 0.16),
-                        backgroundBlendMode: BlendMode.softLight,
-                      ),
-                    ),
-                  if (hasSelectedPhoto && filterApplied)
-                    DecoratedBox(
-                      decoration: BoxDecoration(
-                        gradient: RadialGradient(
-                          center: const Alignment(-0.45, -0.55),
-                          radius: 1.2,
-                          colors: [
-                            Colors.white.withValues(alpha: 0.10),
-                            Colors.transparent,
-                            ssOrangeDark.withValues(alpha: 0.20),
-                          ],
-                          stops: const [0, 0.58, 1],
-                        ),
-                      ),
-                    ),
-                ],
+                children: [Container(color: ssOrange, child: avatarContent)],
               ),
             ),
           ),
@@ -13327,10 +26555,7 @@ class ProfileInfoCard extends StatelessWidget {
       decoration: BoxDecoration(
         color: accent ? ssOrangeLight : Colors.white,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: accent ? ssOrangeMid : ssBorder,
-          width: 1.5,
-        ),
+        border: Border.all(color: accent ? ssOrangeMid : ssBorder, width: 1.5),
       ),
       child: Row(
         children: [
@@ -13388,11 +26613,24 @@ class NotificationsSettingsScreen extends StatefulWidget {
 class _NotificationsSettingsScreenState
     extends State<NotificationsSettingsScreen> {
   bool saving = false;
+  late Stream<DocumentSnapshot<Map<String, dynamic>>> userStream;
+  late Stream<QuerySnapshot<Map<String, dynamic>>> groupsStream;
 
-  DocumentReference<Map<String, dynamic>> get userRef => FirebaseFirestore
-      .instance
+  DocumentReference<Map<String, dynamic>> get userRef =>
+      FirebaseFirestore.instance.collection('users').doc(widget.user.uid);
+
+  Query<Map<String, dynamic>> get groupsRef => FirebaseFirestore.instance
       .collection('users')
-      .doc(widget.user.uid);
+      .doc(widget.user.uid)
+      .collection('groups')
+      .orderBy('joinedAt', descending: true);
+
+  @override
+  void initState() {
+    super.initState();
+    userStream = userRef.snapshots();
+    groupsStream = groupsRef.snapshots();
+  }
 
   Future<void> _setUserNotificationSetting(String key, bool value) async {
     if (saving) return;
@@ -13448,12 +26686,6 @@ class _NotificationsSettingsScreenState
 
   @override
   Widget build(BuildContext context) {
-    final groupsRef = FirebaseFirestore.instance
-        .collection('users')
-        .doc(widget.user.uid)
-        .collection('groups')
-        .orderBy('joinedAt', descending: true);
-
     return Scaffold(
       backgroundColor: ssBg,
       body: SafeArea(
@@ -13462,7 +26694,7 @@ class _NotificationsSettingsScreenState
             AppHeader(onBack: () => Navigator.pop(context)),
             Expanded(
               child: StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-                stream: userRef.snapshots(),
+                stream: userStream,
                 builder: (context, userSnapshot) {
                   final userData = userSnapshot.data?.data();
                   final settings = resolvedNotificationSettings(userData);
@@ -13496,9 +26728,9 @@ class _NotificationsSettingsScreenState
                             onChanged: saving
                                 ? null
                                 : (value) => _setUserNotificationSetting(
-                                      'globalEnabled',
-                                      value,
-                                    ),
+                                    'globalEnabled',
+                                    value,
+                                  ),
                           ),
                         ],
                       ),
@@ -13512,14 +26744,15 @@ class _NotificationsSettingsScreenState
                             children: [
                               SettingsToggleRow(
                                 title: 'Recordatorio del domingo',
-                                subtitle: 'Aviso el domingo para subir tu selfie',
+                                subtitle:
+                                    'Aviso el domingo para subir tu selfie',
                                 value: settings['sundayTimeEnabled'] ?? true,
                                 onChanged: saving
                                     ? null
                                     : (value) => _setUserNotificationSetting(
-                                          'sundayTimeEnabled',
-                                          value,
-                                        ),
+                                        'sundayTimeEnabled',
+                                        value,
+                                      ),
                               ),
                               const SettingsDivider(),
                               SettingsToggleRow(
@@ -13530,58 +26763,76 @@ class _NotificationsSettingsScreenState
                                 onChanged: saving
                                     ? null
                                     : (value) => _setUserNotificationSetting(
-                                          'newSelfiesEnabled',
-                                          value,
-                                        ),
+                                        'newSelfiesEnabled',
+                                        value,
+                                      ),
                               ),
                               const SettingsDivider(),
                               SettingsToggleRow(
                                 title: 'Recordatorios de amigos',
                                 subtitle:
                                     'Cuando un amigo te envía un zumbido para recordarte subir tu selfie',
-                                value: settings['friendRemindersEnabled'] ?? true,
+                                value:
+                                    settings['friendRemindersEnabled'] ?? true,
                                 onChanged: saving
                                     ? null
                                     : (value) => _setUserNotificationSetting(
-                                          'friendRemindersEnabled',
-                                          value,
-                                        ),
+                                        'friendRemindersEnabled',
+                                        value,
+                                      ),
                               ),
                               const SettingsDivider(),
                               SettingsToggleRow(
                                 title: 'Nuevas reacciones',
-                                subtitle: 'Cuando alguien reacciona a tu selfie',
+                                subtitle:
+                                    'Cuando alguien reacciona a tu selfie',
                                 value: settings['reactionsEnabled'] ?? true,
                                 onChanged: saving
                                     ? null
                                     : (value) => _setUserNotificationSetting(
-                                          'reactionsEnabled',
-                                          value,
-                                        ),
+                                        'reactionsEnabled',
+                                        value,
+                                      ),
                               ),
                               const SettingsDivider(),
                               SettingsToggleRow(
-                                title: 'Nuevos miembros',
-                                subtitle: 'Cuando alguien se une a tu grupo',
+                                title: 'Miembros y solicitudes',
+                                subtitle:
+                                    'Cuando alguien solicita entrar, se une o te aceptan',
                                 value: settings['newMembersEnabled'] ?? true,
                                 onChanged: saving
                                     ? null
                                     : (value) => _setUserNotificationSetting(
-                                          'newMembersEnabled',
-                                          value,
-                                        ),
+                                        'newMembersEnabled',
+                                        value,
+                                      ),
                               ),
                               const SettingsDivider(),
                               SettingsToggleRow(
                                 title: 'Resumen semanal',
-                                subtitle: 'Cada lunes con las fotos de la semana',
-                                value: settings['weeklySummaryEnabled'] ?? false,
+                                subtitle:
+                                    'Cada lunes con las fotos de la semana',
+                                value:
+                                    settings['weeklySummaryEnabled'] ?? false,
                                 onChanged: saving
                                     ? null
                                     : (value) => _setUserNotificationSetting(
-                                          'weeklySummaryEnabled',
-                                          value,
-                                        ),
+                                        'weeklySummaryEnabled',
+                                        value,
+                                      ),
+                              ),
+                              const SettingsDivider(),
+                              SettingsToggleRow(
+                                title: 'Mensajes del chat',
+                                subtitle:
+                                    'Cuando alguien escribe o envía un GIF en un chat de grupo',
+                                value: settings['chatMessagesEnabled'] ?? false,
+                                onChanged: saving
+                                    ? null
+                                    : (value) => _setUserNotificationSetting(
+                                        'chatMessagesEnabled',
+                                        value,
+                                      ),
                               ),
                             ],
                           ),
@@ -13593,9 +26844,8 @@ class _NotificationsSettingsScreenState
                         opacity: globalOn ? 1 : 0.4,
                         child: IgnorePointer(
                           ignoring: !globalOn,
-                          child: StreamBuilder<
-                              QuerySnapshot<Map<String, dynamic>>>(
-                            stream: groupsRef.snapshots(),
+                          child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                            stream: groupsStream,
                             builder: (context, snapshot) {
                               final groups = snapshot.data?.docs ?? [];
                               if (groups.isEmpty) {
@@ -13611,21 +26861,30 @@ class _NotificationsSettingsScreenState
                               }
 
                               return SettingsSectionCard(
-                                children: List.generate(groups.length * 2 - 1,
-                                    (index) {
-                                  if (index.isOdd) return const SettingsDivider();
+                                children: List.generate(groups.length * 2 - 1, (
+                                  index,
+                                ) {
+                                  if (index.isOdd) {
+                                    return const SettingsDivider();
+                                  }
                                   final doc = groups[index ~/ 2];
                                   final data = doc.data();
-                                  final groupId = (data['groupId'] ?? doc.id).toString();
+                                  final groupId = (data['groupId'] ?? doc.id)
+                                      .toString();
                                   final groupName =
                                       data['displayNameSnapshot'] ?? 'Grupo';
-                                  final rawGroupPhotoUrl = data['groupPhotoUrlSnapshot'];
-                                  final groupPhotoUrl = rawGroupPhotoUrl is String
+                                  final rawGroupPhotoUrl =
+                                      data['groupPhotoUrlSnapshot'];
+                                  final groupPhotoUrl =
+                                      rawGroupPhotoUrl is String
                                       ? rawGroupPhotoUrl
                                       : null;
                                   final value =
                                       data['notificationsOverride'] ?? 'on';
                                   return GroupNotificationRow(
+                                    key: ValueKey(
+                                      'group_notification_$groupId',
+                                    ),
                                     groupId: groupId,
                                     groupName: groupName,
                                     groupPhotoUrl: groupPhotoUrl,
@@ -13660,9 +26919,9 @@ class _NotificationsSettingsScreenState
                                 onChanged: saving
                                     ? null
                                     : (value) => _setUserNotificationSetting(
-                                          'soundEnabled',
-                                          value,
-                                        ),
+                                        'soundEnabled',
+                                        value,
+                                      ),
                               ),
                               const SettingsDivider(),
                               SettingsToggleRow(
@@ -13673,19 +26932,13 @@ class _NotificationsSettingsScreenState
                                 onChanged: saving
                                     ? null
                                     : (value) => _setUserNotificationSetting(
-                                          'vibrationEnabled',
-                                          value,
-                                        ),
+                                        'vibrationEnabled',
+                                        value,
+                                      ),
                               ),
                             ],
                           ),
                         ),
-                      ),
-                      const SizedBox(height: 14),
-                      const SettingsInfoRow(
-                        title: 'Guardado automático',
-                        subtitle:
-                            'Estos ajustes se guardan en tu perfil y quedan preparados para que las Cloud Functions filtren los envíos.',
                       ),
                     ],
                   );
@@ -13709,8 +26962,8 @@ class AppSettingsScreen extends StatefulWidget {
 }
 
 class _AppSettingsScreenState extends State<AppSettingsScreen> {
-  bool autoDownload = true;
   bool clearDone = false;
+  bool clearingCache = false;
   bool deletingAccount = false;
 
   Future<void> _confirmClearCache() async {
@@ -13772,9 +27025,27 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
     );
 
     if (confirmed == true) {
-      setState(() => clearDone = true);
-      await Future<void>.delayed(const Duration(seconds: 3));
-      if (mounted) setState(() => clearDone = false);
+      setState(() => clearingCache = true);
+      try {
+        final deletedCount = await LocalPhotoCache.instance.clear();
+        if (!mounted) return;
+        setState(() {
+          clearingCache = false;
+          clearDone = true;
+        });
+        showSundaySnack(
+          context,
+          deletedCount == 0
+              ? 'La caché local ya estaba vacía'
+              : 'Caché local borrada',
+        );
+        await Future<void>.delayed(const Duration(seconds: 3));
+        if (mounted) setState(() => clearDone = false);
+      } catch (error) {
+        if (!mounted) return;
+        setState(() => clearingCache = false);
+        showSundaySnack(context, 'No se pudo borrar la caché local: $error');
+      }
     }
   }
 
@@ -13872,6 +27143,56 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
     }
   }
 
+  Future<void> _confirmSignOut() async {
+    final shouldSignOut = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(22),
+          ),
+          title: const Text('Cerrar sesión'),
+          content: const Text(
+            '¿Quieres salir de Sunday Selfie en este dispositivo?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancelar'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text(
+                'Salir',
+                style: TextStyle(
+                  color: ssOrangeDark,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (shouldSignOut == true) {
+      await FirebaseAuth.instance.signOut();
+    }
+  }
+
+  void _openLegalScreen({
+    required String title,
+    required List<LegalTextSection> sections,
+  }) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => LegalTextScreen(title: title, sections: sections),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -13882,7 +27203,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
             AppHeader(onBack: () => Navigator.pop(context)),
             Expanded(
               child: ListView(
-                padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 14),
                 children: [
                   const Text(
                     'Ajustes',
@@ -13896,25 +27217,20 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                   const SettingsSectionTitle('ALMACENAMIENTO'),
                   SettingsSectionCard(
                     children: [
-                      SettingsToggleRow(
-                        title: 'Descarga automática',
-                        subtitle:
-                            'Solo aplica a selfies nuevos desde que te unes',
-                        value: autoDownload,
-                        onChanged: (value) =>
-                            setState(() => autoDownload = value),
-                      ),
-                      const SettingsDivider(),
                       SettingsNavigationRow(
-                        title: clearDone
+                        title: clearingCache
+                            ? 'Borrando caché...'
+                            : clearDone
                             ? '✅ Caché borrada'
                             : 'Borrar caché local',
                         subtitle: 'Libera espacio descargado localmente',
                         titleColor: clearDone
                             ? const Color(0xFF4CAF50)
                             : ssText,
-                        showChevron: !clearDone,
-                        onTap: clearDone ? null : _confirmClearCache,
+                        showChevron: !clearDone && !clearingCache,
+                        onTap: clearDone || clearingCache
+                            ? null
+                            : _confirmClearCache,
                       ),
                     ],
                   ),
@@ -13936,17 +27252,17 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                     children: [
                       SettingsNavigationRow(
                         title: 'Política de privacidad',
-                        onTap: () => showSundaySnack(
-                          context,
-                          'Pendiente de añadir enlace legal',
+                        onTap: () => _openLegalScreen(
+                          title: 'Política de privacidad',
+                          sections: kPrivacyPolicySections,
                         ),
                       ),
                       const SettingsDivider(),
                       SettingsNavigationRow(
                         title: 'Términos de uso',
-                        onTap: () => showSundaySnack(
-                          context,
-                          'Pendiente de añadir enlace legal',
+                        onTap: () => _openLegalScreen(
+                          title: 'Términos de uso',
+                          sections: kTermsOfUseSections,
                         ),
                       ),
                     ],
@@ -13964,6 +27280,14 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                         titleColor: const Color(0xFFE74C3C),
                         showChevron: false,
                         onTap: deletingAccount ? null : _confirmDeleteAccount,
+                      ),
+                      const SettingsDivider(),
+                      SettingsNavigationRow(
+                        title: 'Cerrar sesión',
+                        subtitle: 'Sale de Sunday Selfie en este dispositivo',
+                        titleColor: const Color(0xFFE74C3C),
+                        showChevron: false,
+                        onTap: deletingAccount ? null : _confirmSignOut,
                       ),
                     ],
                   ),
@@ -13987,23 +27311,224 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
   }
 }
 
+class LegalTextSection {
+  final String title;
+  final String body;
+
+  const LegalTextSection({required this.title, required this.body});
+}
+
+const List<LegalTextSection> kPrivacyPolicySections = [
+  LegalTextSection(title: 'Última actualización', body: '22 de junio de 2026.'),
+  LegalTextSection(
+    title: 'Quién gestiona Sunday Selfie',
+    body:
+        'Sunday Selfie es la app del proyecto Sunday Selfie. Para consultas de privacidad puedes escribir a sundayselfie2026@gmail.com.',
+  ),
+  LegalTextSection(
+    title: 'Datos que tratamos',
+    body:
+        'Tratamos los datos necesarios para que la app funcione: identificador de usuario, nombre, correo de inicio de sesión cuando el proveedor lo facilita, foto de perfil, grupos a los que perteneces, selfies, miniaturas, reacciones, mensajes del chat semanal, reportes, sugerencias, preferencias de notificaciones, tokens de notificación y datos técnicos básicos de uso y seguridad.',
+  ),
+  LegalTextSection(
+    title: 'Fotos, cámara y validación',
+    body:
+        'Usamos la cámara o la galería solo cuando decides hacer o subir una selfie. La comprobación facial se realiza para validar que la publicación es una selfie. Guardamos la foto y una miniatura para mostrarla en tus grupos y en tu historial.',
+  ),
+  LegalTextSection(
+    title: 'Para qué usamos los datos',
+    body:
+        'Usamos tus datos para crear y proteger tu cuenta, mostrar tus selfies dentro de los grupos, calcular rachas, permitir reacciones y chats, enviar notificaciones, revisar reportes, responder sugerencias, prevenir abusos y mantener la seguridad de la app.',
+  ),
+  LegalTextSection(
+    title: 'Servicios externos',
+    body:
+        'La app usa servicios de Firebase y Google para autenticación, base de datos, almacenamiento, funciones en la nube, notificaciones, analítica técnica y anuncios recompensados. Si envías sugerencias, podemos recibirlas por correo en la dirección del proyecto.',
+  ),
+  LegalTextSection(
+    title: 'Quién puede ver tu contenido',
+    body:
+        'Los miembros de un grupo pueden ver las selfies, nombre, foto de perfil, reacciones y mensajes compartidos dentro de ese grupo. Los reportes se tratan de forma privada para revisión. No vendemos tus datos personales.',
+  ),
+  LegalTextSection(
+    title: 'Conservación y borrado',
+    body:
+        'Conservamos el contenido mientras mantengas tu cuenta o mientras sea necesario para prestar el servicio. Desde Ajustes puedes borrar la caché local o solicitar el borrado definitivo de tu cuenta y contenido personal. Algunos registros de seguridad o reportes pueden conservarse durante el tiempo necesario para proteger a la comunidad y cumplir obligaciones legales.',
+  ),
+  LegalTextSection(
+    title: 'Tus derechos',
+    body:
+        'Puedes pedir acceso, corrección, oposición, limitación, portabilidad o eliminación de tus datos escribiendo a sundayselfie2026@gmail.com. También puedes retirar permisos del dispositivo desde los ajustes del sistema.',
+  ),
+  LegalTextSection(
+    title: 'Cambios',
+    body:
+        'Si actualizamos esta política, cambiaremos la fecha de actualización y publicaremos la nueva versión dentro de la app.',
+  ),
+];
+
+const List<LegalTextSection> kTermsOfUseSections = [
+  LegalTextSection(title: 'Última actualización', body: '22 de junio de 2026.'),
+  LegalTextSection(
+    title: 'Aceptación',
+    body:
+        'Al usar Sunday Selfie aceptas estos términos. Si no estás de acuerdo, no uses la app.',
+  ),
+  LegalTextSection(
+    title: 'Uso de la app',
+    body:
+        'Sunday Selfie está pensada para compartir una selfie semanal con tus grupos. Debes usar la app de forma respetuosa, mantener tu cuenta protegida y no intentar acceder a grupos, cuentas o contenido que no te correspondan.',
+  ),
+  LegalTextSection(
+    title: 'Tu contenido',
+    body:
+        'Tú conservas tus derechos sobre las selfies, mensajes, reacciones y sugerencias que compartes. Nos autorizas a alojar, procesar y mostrar ese contenido dentro de la app para prestar el servicio, crear miniaturas, notificaciones, rachas e historial.',
+  ),
+  LegalTextSection(
+    title: 'Contenido no permitido',
+    body:
+        'No publiques contenido ilegal, ofensivo, acosador, discriminatorio, sexual explícito, violento, que vulnere derechos de otras personas o que exponga datos personales de terceros sin permiso. Podemos retirar contenido, limitar funciones o cerrar cuentas cuando sea necesario para proteger la app y sus usuarios.',
+  ),
+  LegalTextSection(
+    title: 'Grupos y reportes',
+    body:
+        'Los administradores gestionan la participación en sus grupos. Cualquier miembro puede reportar contenido para revisión privada. Los reportes falsos o abusivos también pueden dar lugar a restricciones.',
+  ),
+  LegalTextSection(
+    title: 'Anuncios y funciones beta',
+    body:
+        'Algunas funciones pueden requerir ver un anuncio recompensado o estar disponibles solo en beta. Podemos cambiar, pausar o retirar funciones mientras mejoramos Sunday Selfie.',
+  ),
+  LegalTextSection(
+    title: 'Disponibilidad',
+    body:
+        'Trabajamos para que Sunday Selfie funcione bien, pero no garantizamos disponibilidad continua ni ausencia total de errores. No nos hacemos responsables de pérdidas derivadas de interrupciones, fallos técnicos o uso indebido de la app.',
+  ),
+  LegalTextSection(
+    title: 'Baja',
+    body:
+        'Puedes cerrar sesión o solicitar el borrado definitivo de tu cuenta desde Ajustes. Al borrar la cuenta perderás acceso a tu perfil y contenido personal asociado.',
+  ),
+  LegalTextSection(
+    title: 'Contacto',
+    body:
+        'Para dudas, sugerencias o reclamaciones sobre estos términos, escribe a sundayselfie2026@gmail.com.',
+  ),
+];
+
+class LegalTextScreen extends StatelessWidget {
+  final String title;
+  final List<LegalTextSection> sections;
+
+  const LegalTextScreen({
+    super.key,
+    required this.title,
+    required this.sections,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: ssBg,
+      body: SafeArea(
+        child: Column(
+          children: [
+            AppHeader(onBack: () => Navigator.pop(context)),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      color: ssText,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  SundayCard(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        for (var index = 0; index < sections.length; index++)
+                          LegalTextSectionBlock(
+                            section: sections[index],
+                            isLast: index == sections.length - 1,
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class LegalTextSectionBlock extends StatelessWidget {
+  final LegalTextSection section;
+  final bool isLast;
+
+  const LegalTextSectionBlock({
+    super.key,
+    required this.section,
+    required this.isLast,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(bottom: isLast ? 0 : 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            section.title,
+            style: const TextStyle(
+              color: ssTitle,
+              fontSize: 15,
+              fontWeight: FontWeight.w900,
+            ),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            section.body,
+            style: const TextStyle(
+              color: ssText2,
+              fontSize: 13.5,
+              height: 1.42,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class ProfileAvatar extends StatelessWidget {
   final String name;
   final String? photoUrl;
   final double size;
+  final VoidCallback? onTap;
 
   const ProfileAvatar({
     super.key,
     required this.name,
     required this.photoUrl,
     required this.size,
+    this.onTap,
   });
 
   bool get hasPhoto => photoUrl != null && photoUrl!.isNotEmpty;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    final avatar = Container(
       width: size,
       height: size,
       decoration: BoxDecoration(
@@ -14024,12 +27549,23 @@ class ProfileAvatar extends StatelessWidget {
               ? Stack(
                   fit: StackFit.expand,
                   children: [
-                    Image.network(
-                      photoUrl!,
+                    CachedRemoteImage(
+                      imageUrl: photoUrl!,
+                      cacheVariant: 'avatar',
                       fit: BoxFit.cover,
                       alignment: Alignment.center,
                       filterQuality: FilterQuality.high,
-                      errorBuilder: (_, _, _) => Center(
+                      loadingWidget: Center(
+                        child: Text(
+                          initialsFromName(name),
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: size * 0.36,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                      errorWidget: Center(
                         child: Text(
                           initialsFromName(name),
                           style: TextStyle(
@@ -14073,6 +27609,18 @@ class ProfileAvatar extends StatelessWidget {
                   ),
                 ),
         ),
+      ),
+    );
+
+    if (onTap == null) return avatar;
+
+    return Semantics(
+      button: true,
+      label: 'Editar perfil',
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: MouseRegion(cursor: SystemMouseCursors.click, child: avatar),
       ),
     );
   }
@@ -14147,6 +27695,155 @@ class ProfileStatsBar extends StatelessWidget {
   }
 }
 
+enum ProfileLineIconKind {
+  notifications,
+  editProfile,
+  suggestions,
+  settings,
+  selfies,
+}
+
+class ProfileLineIcon extends StatelessWidget {
+  final ProfileLineIconKind icon;
+  final Color color;
+  final double size;
+
+  const ProfileLineIcon({
+    super.key,
+    required this.icon,
+    required this.color,
+    this.size = 30,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox.square(
+      dimension: size,
+      child: CustomPaint(painter: _ProfileLineIconPainter(icon, color)),
+    );
+  }
+}
+
+class _ProfileLineIconPainter extends CustomPainter {
+  final ProfileLineIconKind icon;
+  final Color color;
+
+  const _ProfileLineIconPainter(this.icon, this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final side = size.shortestSide;
+    final offset = Offset((size.width - side) / 2, (size.height - side) / 2);
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 4.6
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round;
+
+    canvas.save();
+    canvas.translate(offset.dx, offset.dy);
+    canvas.scale(side / 100);
+
+    switch (icon) {
+      case ProfileLineIconKind.notifications:
+        _paintBell(canvas, paint);
+        break;
+      case ProfileLineIconKind.editProfile:
+        _paintUser(canvas, paint);
+        break;
+      case ProfileLineIconKind.suggestions:
+        _paintBulb(canvas, paint);
+        break;
+      case ProfileLineIconKind.settings:
+        _paintSunSettings(canvas, paint);
+        break;
+      case ProfileLineIconKind.selfies:
+        _paintSelfiesGrid(canvas, paint);
+        break;
+    }
+
+    canvas.restore();
+  }
+
+  void _paintBell(Canvas canvas, Paint paint) {
+    final bell = Path()
+      ..moveTo(25, 63)
+      ..lineTo(75, 63)
+      ..moveTo(32, 63)
+      ..lineTo(32, 43)
+      ..cubicTo(32, 29, 40, 20, 50, 20)
+      ..cubicTo(60, 20, 68, 29, 68, 43)
+      ..lineTo(68, 63);
+    canvas.drawPath(bell, paint);
+    canvas.drawArc(
+      const Rect.fromLTWH(42, 59, 16, 20),
+      0,
+      math.pi,
+      false,
+      paint,
+    );
+  }
+
+  void _paintUser(Canvas canvas, Paint paint) {
+    canvas.drawCircle(const Offset(50, 34), 14, paint);
+
+    final shoulders = Path()
+      ..moveTo(23, 80)
+      ..cubicTo(23, 63, 34, 54, 50, 54)
+      ..cubicTo(66, 54, 77, 63, 77, 80);
+    canvas.drawPath(shoulders, paint);
+  }
+
+  void _paintBulb(Canvas canvas, Paint paint) {
+    final bulb = Path()
+      ..moveTo(50, 18)
+      ..cubicTo(36, 18, 26, 28, 26, 42)
+      ..cubicTo(26, 52, 32, 59, 39, 64)
+      ..cubicTo(43, 67, 44, 70, 44, 73)
+      ..lineTo(56, 73)
+      ..cubicTo(56, 70, 57, 67, 61, 64)
+      ..cubicTo(68, 59, 74, 52, 74, 42)
+      ..cubicTo(74, 28, 64, 18, 50, 18);
+    canvas.drawPath(bulb, paint);
+    canvas.drawLine(const Offset(42, 80), const Offset(58, 80), paint);
+    canvas.drawLine(const Offset(46, 87), const Offset(54, 87), paint);
+  }
+
+  void _paintSunSettings(Canvas canvas, Paint paint) {
+    canvas.drawCircle(const Offset(50, 50), 5, paint);
+
+    for (var index = 0; index < 8; index += 1) {
+      final angle = math.pi * 2 * index / 8;
+      final direction = Offset(math.cos(angle), math.sin(angle));
+      canvas.drawLine(
+        Offset(50 + direction.dx * 18, 50 + direction.dy * 18),
+        Offset(50 + direction.dx * 29, 50 + direction.dy * 29),
+        paint,
+      );
+    }
+  }
+
+  void _paintSelfiesGrid(Canvas canvas, Paint paint) {
+    const radius = Radius.circular(8);
+    const rects = [
+      Rect.fromLTWH(17, 17, 26, 26),
+      Rect.fromLTWH(57, 17, 26, 26),
+      Rect.fromLTWH(17, 57, 26, 26),
+      Rect.fromLTWH(57, 57, 26, 26),
+    ];
+
+    for (final rect in rects) {
+      canvas.drawRRect(RRect.fromRectAndRadius(rect, radius), paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _ProfileLineIconPainter oldDelegate) {
+    return oldDelegate.icon != icon || oldDelegate.color != color;
+  }
+}
+
 class ProfileSelfiesShortcut extends StatelessWidget {
   final int selfiesCount;
   final VoidCallback onTap;
@@ -14177,7 +27874,11 @@ class ProfileSelfiesShortcut extends StatelessWidget {
                 borderRadius: BorderRadius.circular(12),
               ),
               alignment: Alignment.center,
-              child: const Text('📸', style: TextStyle(fontSize: 22)),
+              child: const ProfileLineIcon(
+                icon: ProfileLineIconKind.selfies,
+                color: ssBg,
+                size: 29,
+              ),
             ),
             const SizedBox(width: 14),
             Expanded(
@@ -14216,13 +27917,13 @@ class ProfileSelfiesShortcut extends StatelessWidget {
 }
 
 class ProfileMenuRow extends StatelessWidget {
-  final String iconText;
+  final ProfileLineIconKind icon;
   final String label;
   final VoidCallback onTap;
 
   const ProfileMenuRow({
     super.key,
-    required this.iconText,
+    required this.icon,
     required this.label,
     required this.onTap,
   });
@@ -14245,7 +27946,16 @@ class ProfileMenuRow extends StatelessWidget {
             ),
             child: Row(
               children: [
-                Text(iconText, style: const TextStyle(fontSize: 20)),
+                SizedBox(
+                  width: 36,
+                  child: Center(
+                    child: ProfileLineIcon(
+                      icon: icon,
+                      color: ssOrange,
+                      size: 30,
+                    ),
+                  ),
+                ),
                 const SizedBox(width: 14),
                 Expanded(
                   child: Text(
@@ -14476,7 +28186,7 @@ class SettingsNavigationRow extends StatelessWidget {
   }
 }
 
-class GroupNotificationRow extends StatelessWidget {
+class GroupNotificationRow extends StatefulWidget {
   final String groupId;
   final String groupName;
   final String? groupPhotoUrl;
@@ -14495,28 +28205,54 @@ class GroupNotificationRow extends StatelessWidget {
   });
 
   @override
+  State<GroupNotificationRow> createState() => _GroupNotificationRowState();
+}
+
+class _GroupNotificationRowState extends State<GroupNotificationRow> {
+  late Stream<DocumentSnapshot<Map<String, dynamic>>> groupStream;
+
+  @override
+  void initState() {
+    super.initState();
+    groupStream = FirebaseFirestore.instance
+        .collection('groups')
+        .doc(widget.groupId)
+        .snapshots();
+  }
+
+  @override
+  void didUpdateWidget(covariant GroupNotificationRow oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.groupId != widget.groupId) {
+      groupStream = FirebaseFirestore.instance
+          .collection('groups')
+          .doc(widget.groupId)
+          .snapshots();
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    final normalized = value == 'off' ? 'off' : 'on';
+    final normalized = widget.value == 'off' ? 'off' : 'on';
 
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: FirebaseFirestore.instance.collection('groups').doc(groupId).snapshots(),
+      stream: groupStream,
       builder: (context, snapshot) {
         final groupData = snapshot.data?.data();
-        final resolvedName = (groupData?['name'] ?? groupName).toString();
+        final resolvedName = (groupData?['name'] ?? widget.groupName)
+            .toString();
         final rawResolvedPhotoUrl = groupData?['photoUrl'];
-        final resolvedPhotoUrl = rawResolvedPhotoUrl is String &&
+        final resolvedPhotoUrl =
+            rawResolvedPhotoUrl is String &&
                 rawResolvedPhotoUrl.trim().isNotEmpty
             ? rawResolvedPhotoUrl.trim()
-            : groupPhotoUrl;
+            : widget.groupPhotoUrl;
 
         return Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           child: Row(
             children: [
-              GroupIconSmall(
-                name: resolvedName,
-                photoUrl: resolvedPhotoUrl,
-              ),
+              GroupIconSmall(name: resolvedName, photoUrl: resolvedPhotoUrl),
               const SizedBox(width: 12),
               Expanded(
                 child: Text(
@@ -14550,11 +28286,14 @@ class GroupNotificationRow extends StatelessWidget {
                     ),
                     items: const [
                       DropdownMenuItem(value: 'on', child: Text('Activadas')),
-                      DropdownMenuItem(value: 'off', child: Text('Desactivadas')),
+                      DropdownMenuItem(
+                        value: 'off',
+                        child: Text('Desactivadas'),
+                      ),
                     ],
-                    onChanged: enabled
+                    onChanged: widget.enabled
                         ? (newValue) {
-                            if (newValue != null) onChanged(newValue);
+                            if (newValue != null) widget.onChanged(newValue);
                           }
                         : null,
                   ),
@@ -14572,17 +28311,55 @@ class GroupIconSmall extends StatelessWidget {
   final String name;
   final String? photoUrl;
 
-  const GroupIconSmall({
-    super.key,
-    required this.name,
-    required this.photoUrl,
-  });
+  const GroupIconSmall({super.key, required this.name, required this.photoUrl});
 
   bool get hasPhoto => photoUrl != null && photoUrl!.trim().isNotEmpty;
 
   @override
   Widget build(BuildContext context) {
     final emoji = extractLastEmoji(name);
+
+    if (hasPhoto) {
+      return Container(
+        width: 36,
+        height: 36,
+        decoration: BoxDecoration(borderRadius: BorderRadius.circular(10)),
+        foregroundDecoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: ssOrangeMid, width: 1.2),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: CachedRemoteImage(
+          imageUrl: photoUrl!,
+          cacheVariant: 'avatar',
+          width: 36,
+          height: 36,
+          fit: BoxFit.cover,
+          alignment: Alignment.center,
+          filterQuality: FilterQuality.high,
+          loadingWidget: Center(
+            child: Text(
+              emoji ?? initialsFromName(name),
+              style: const TextStyle(
+                color: ssOrangeDark,
+                fontSize: 16,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+          ),
+          errorWidget: Center(
+            child: Text(
+              emoji ?? initialsFromName(name),
+              style: const TextStyle(
+                color: ssOrangeDark,
+                fontSize: 16,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
 
     return Container(
       width: 36,
@@ -14594,33 +28371,14 @@ class GroupIconSmall extends StatelessWidget {
       ),
       clipBehavior: Clip.antiAlias,
       alignment: Alignment.center,
-      child: hasPhoto
-          ? Image.network(
-              photoUrl!,
-              width: 36,
-              height: 36,
-              fit: BoxFit.cover,
-              alignment: Alignment.center,
-              filterQuality: FilterQuality.high,
-              errorBuilder: (_, _, _) => Center(
-                child: Text(
-                  emoji ?? initialsFromName(name),
-                  style: const TextStyle(
-                    color: ssOrangeDark,
-                    fontSize: 16,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-              ),
-            )
-          : Text(
-              emoji ?? initialsFromName(name),
-              style: const TextStyle(
-                color: ssOrangeDark,
-                fontSize: 16,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
+      child: Text(
+        emoji ?? initialsFromName(name),
+        style: const TextStyle(
+          color: ssOrangeDark,
+          fontSize: 16,
+          fontWeight: FontWeight.w900,
+        ),
+      ),
     );
   }
 }
@@ -14806,7 +28564,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
 
     final camController = CameraController(
       camera,
-      ResolutionPreset.medium,
+      ResolutionPreset.high,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.jpeg,
     );
@@ -14998,34 +28756,37 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                     ),
                     const SizedBox(width: 14),
                     Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Text(
-                            'Sunday Selfie',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 20,
-                              fontWeight: FontWeight.w900,
-                            ),
-                          ),
-                          if (widget.groupName != null) ...[
-                            const SizedBox(height: 2),
-                            Text(
-                              widget.groupName!,
+                      child: Transform.translate(
+                        offset: const Offset(0, -3),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text(
+                              'Sunday Selfie',
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(
-                                color: Colors.white.withValues(alpha: 0.75),
-                                fontSize: 14,
-                                fontWeight: FontWeight.w700,
+                                color: Colors.white,
+                                fontSize: 20,
+                                fontWeight: FontWeight.w900,
                               ),
                             ),
+                            if (widget.groupName != null) ...[
+                              const SizedBox(height: 2),
+                              Text(
+                                widget.groupName!,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: Colors.white.withValues(alpha: 0.75),
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
                           ],
-                        ],
+                        ),
                       ),
                     ),
                     const SizedBox(width: 14),
@@ -15223,6 +28984,8 @@ class AppHeader extends StatelessWidget {
   final VoidCallback? onBack;
   final Widget? right;
   final String? subtitle;
+  final TextStyle? subtitleStyle;
+  final bool subtitleCenteredInBottomGap;
   final bool logoTapToHome;
 
   const AppHeader({
@@ -15230,6 +28993,8 @@ class AppHeader extends StatelessWidget {
     this.onBack,
     this.right,
     this.subtitle,
+    this.subtitleStyle,
+    this.subtitleCenteredInBottomGap = false,
     this.logoTapToHome = true,
   });
 
@@ -15247,8 +29012,30 @@ class AppHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final logo = GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: logoTapToHome ? () => _goToGroups(context) : null,
+      child: const SundayLogo(size: 34),
+    );
+    final subtitleText = subtitle == null
+        ? null
+        : ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: MediaQuery.sizeOf(context).width * 0.62,
+            ),
+            child: Text(
+              subtitle!,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style:
+                  subtitleStyle ??
+                  const TextStyle(color: ssText3, fontSize: 12),
+            ),
+          );
+
     return Padding(
-      padding: const EdgeInsets.fromLTRB(20, 12, 20, 10),
+      padding: const EdgeInsets.fromLTRB(20, ssHeaderTopPadding, 20, 10),
       child: SizedBox(
         width: double.infinity,
         height: subtitle == null ? 58 : 74,
@@ -15258,58 +29045,52 @@ class AppHeader extends StatelessWidget {
             if (onBack != null)
               Positioned(
                 left: -8,
-                top: subtitle == null ? 5 : 13,
-                child: IconButton(
-                  onPressed: onBack,
-                  icon: const Icon(
-                    Icons.chevron_left_rounded,
-                    size: 30,
-                    color: ssText,
-                  ),
-                ),
-              ),
-            Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: logoTapToHome ? () => _goToGroups(context) : null,
-                    child: const SundayLogo(size: 34),
-                  ),
-                  if (subtitle != null) ...[
-                    const SizedBox(height: 2),
-                    ConstrainedBox(
-                      constraints: BoxConstraints(
-                        maxWidth: MediaQuery.sizeOf(context).width * 0.62,
-                      ),
-                      child: Text(
-                        subtitle!,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(color: ssText3, fontSize: 12),
-                      ),
+                top: ssHeaderActionTop,
+                child: SizedBox.square(
+                  dimension: ssHeaderActionSize,
+                  child: IconButton(
+                    onPressed: onBack,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints.tightFor(
+                      width: ssHeaderActionSize,
+                      height: ssHeaderActionSize,
                     ),
-                  ],
-                ],
-              ),
-            ),
-            if (right != null && subtitle == null)
-              Positioned(
-                right: -2,
-                top: 0,
-                bottom: 0,
-                child: Align(
-                  alignment: Alignment.centerRight,
-                  child: right!,
+                    icon: const SundayHeaderBackIcon(),
+                  ),
                 ),
               ),
-            if (right != null && subtitle != null)
+            if (subtitleCenteredInBottomGap && subtitleText != null) ...[
+              Positioned(left: 0, right: 0, top: 2, child: Center(child: logo)),
               Positioned(
-                right: -6,
-                top: 14,
-                child: right!,
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: Center(child: subtitleText),
+              ),
+            ] else
+              Center(
+                child: Transform.translate(
+                  offset: const Offset(0, -3),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      logo,
+                      if (subtitleText != null) ...[
+                        const SizedBox(height: 2),
+                        subtitleText,
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            if (right != null)
+              Positioned(
+                right: subtitle == null ? -2 : -6,
+                top: ssHeaderActionTop,
+                child: SizedBox.square(
+                  dimension: ssHeaderActionSize,
+                  child: Align(alignment: Alignment.centerRight, child: right!),
+                ),
               ),
           ],
         ),
@@ -15508,7 +29289,9 @@ class SundayBanner extends StatelessWidget {
         final dayName = dayNames[now.weekday - 1];
         final isSunday = now.weekday == DateTime.sunday;
         final daysUntilSunday = isSunday ? 0 : DateTime.sunday - now.weekday;
-        final weekLabel = isSunday ? obtenerEtiquetaSemana(obtenerWeekKeyActual()) : '';
+        final weekLabel = isSunday
+            ? obtenerEtiquetaSemana(obtenerWeekKeyActual())
+            : '';
         final leftText = isSunday
             ? '¡Sube tu selfie del domingo!'
             : '¡Toca esperar!';
@@ -15587,7 +29370,7 @@ class SundayBanner extends StatelessWidget {
                   ),
                   Positioned(
                     right: 22,
-                    top: isSunday ? (compact ? 37 : 39) : (compact ? 24 : 26),
+                    top: isSunday ? (compact ? 37 : 39) : (compact ? 22 : 24),
                     width: rightBlockWidth,
                     child: FittedBox(
                       fit: BoxFit.scaleDown,
@@ -15673,30 +29456,48 @@ class SundayCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final borderRadius = BorderRadius.circular(24);
+    final shadow = [
+      BoxShadow(
+        color: Colors.black.withValues(alpha: 0.04),
+        blurRadius: 14,
+        offset: const Offset(0, 4),
+      ),
+    ];
     final card = Container(
       margin: margin,
       padding: padding ?? const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: ssSurface,
-        borderRadius: BorderRadius.circular(24),
+        borderRadius: borderRadius,
         border: Border.all(color: ssBorder),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.04),
-            blurRadius: 14,
-            offset: const Offset(0, 4),
-          ),
-        ],
+        boxShadow: shadow,
       ),
       child: child,
     );
 
     if (onTap == null) return card;
 
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(24),
-      child: card,
+    return Container(
+      margin: margin,
+      decoration: BoxDecoration(borderRadius: borderRadius, boxShadow: shadow),
+      child: Material(
+        color: ssSurface,
+        borderRadius: borderRadius,
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Ink(
+            padding: padding ?? const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: ssSurface,
+              borderRadius: borderRadius,
+              border: Border.all(color: ssBorder),
+            ),
+            child: child,
+          ),
+        ),
+      ),
     );
   }
 }
@@ -15727,40 +29528,56 @@ class GroupIcon extends StatelessWidget {
         : extractLastEmoji(name) ?? fallbackGroupEmoji(name);
     final radius = size * 0.34;
 
+    if (hasPhoto) {
+      return Container(
+        width: size,
+        height: size,
+        decoration: BoxDecoration(borderRadius: BorderRadius.circular(radius)),
+        foregroundDecoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(radius),
+          border: Border.all(color: ssOrangeMid, width: 2),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: CachedRemoteImage(
+          imageUrl: photoUrl!.trim(),
+          cacheVariant: 'avatar',
+          width: size,
+          height: size,
+          fit: BoxFit.cover,
+          alignment: Alignment.center,
+          filterQuality: FilterQuality.high,
+          loadingWidget: _GroupIconFallback(
+            name: name,
+            emoji: resolvedEmoji,
+            color: resolvedColor,
+            size: size,
+          ),
+          errorWidget: _GroupIconFallback(
+            name: name,
+            emoji: resolvedEmoji,
+            color: resolvedColor,
+            size: size,
+          ),
+        ),
+      );
+    }
+
     return Container(
       width: size,
       height: size,
       alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: hasPhoto ? Colors.white : resolvedColor.withValues(alpha: 0.16),
+        color: resolvedColor.withValues(alpha: 0.16),
         borderRadius: BorderRadius.circular(radius),
-        border: Border.all(
-          color: hasPhoto ? ssBorder : resolvedColor.withValues(alpha: 0.28),
-          width: 2,
-        ),
+        border: Border.all(color: ssOrangeMid, width: 2),
       ),
       clipBehavior: Clip.antiAlias,
-      child: hasPhoto
-          ? Image.network(
-              photoUrl!.trim(),
-              width: size,
-              height: size,
-              fit: BoxFit.cover,
-              alignment: Alignment.center,
-              filterQuality: FilterQuality.high,
-              errorBuilder: (_, _, _) => _GroupIconFallback(
-                name: name,
-                emoji: resolvedEmoji,
-                color: resolvedColor,
-                size: size,
-              ),
-            )
-          : _GroupIconFallback(
-              name: name,
-              emoji: resolvedEmoji,
-              color: resolvedColor,
-              size: size,
-            ),
+      child: _GroupIconFallback(
+        name: name,
+        emoji: resolvedEmoji,
+        color: resolvedColor,
+        size: size,
+      ),
     );
   }
 }
@@ -15795,7 +29612,6 @@ class _GroupIconFallback extends StatelessWidget {
     );
   }
 }
-
 
 class MiniProfileAvatar extends StatelessWidget {
   final String name;
@@ -15839,15 +29655,17 @@ class MiniProfileAvatar extends StatelessWidget {
               ? Stack(
                   fit: StackFit.expand,
                   children: [
-                    Image.network(
-                      photoUrl!.trim(),
+                    CachedRemoteImage(
+                      imageUrl: photoUrl!.trim(),
+                      cacheVariant: 'avatar',
                       fit: BoxFit.cover,
                       alignment: Alignment.center,
                       filterQuality: FilterQuality.high,
-                      errorBuilder: (_, _, _) => _MiniAvatarInitials(
+                      loadingWidget: _MiniAvatarInitials(
                         name: name,
                         size: size,
                       ),
+                      errorWidget: _MiniAvatarInitials(name: name, size: size),
                     ),
                     DecoratedBox(
                       decoration: BoxDecoration(
@@ -15900,7 +29718,6 @@ class _MiniAvatarInitials extends StatelessWidget {
   }
 }
 
-
 class GroupMembersAvatarStrip extends StatelessWidget {
   final String groupId;
   final int memberCount;
@@ -15927,7 +29744,8 @@ class GroupMembersAvatarStrip extends StatelessWidget {
         final shown = members.length;
         final remaining = (memberCount - shown).clamp(0, 999);
 
-        if (snapshot.connectionState == ConnectionState.waiting && members.isEmpty) {
+        if (snapshot.connectionState == ConnectionState.waiting &&
+            members.isEmpty) {
           return const SizedBox(height: 30);
         }
 
@@ -15935,7 +29753,9 @@ class GroupMembersAvatarStrip extends StatelessWidget {
           children: [
             ...members.map((member) {
               final data = member.data();
-              final name = formatUserDisplayName(data['effectiveName'] ?? 'Usuario');
+              final name = formatUserDisplayName(
+                data['effectiveName'] ?? 'Usuario',
+              );
               final rawPhotoUrl = data['effectivePhotoUrl'];
               final photoUrl = rawPhotoUrl is String ? rawPhotoUrl : null;
               return Padding(
@@ -15948,11 +29768,7 @@ class GroupMembersAvatarStrip extends StatelessWidget {
               );
             }),
             if (remaining > 0)
-              MiniAvatar(
-                text: '+$remaining',
-                bg: ssSeparator,
-                fg: ssText3,
-              ),
+              MiniAvatar(text: '+$remaining', bg: ssSeparator, fg: ssText3),
           ],
         );
       },
@@ -15981,13 +29797,19 @@ class ResolvedMemberMiniAvatar extends StatelessWidget {
     }
 
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: FirebaseFirestore.instance.collection('users').doc(uid).snapshots(),
+      stream: FirebaseFirestore.instance
+          .collection('users')
+          .doc(uid)
+          .snapshots(),
       builder: (context, snapshot) {
         final userData = snapshot.data?.data();
         final rawUserPhotoUrl = userData?['basePhotoUrl'];
-        final resolvedPhotoUrl = rawUserPhotoUrl is String ? rawUserPhotoUrl : null;
+        final resolvedPhotoUrl = rawUserPhotoUrl is String
+            ? rawUserPhotoUrl
+            : null;
         final rawUserName = userData?['baseName'];
-        final resolvedName = rawUserName is String && rawUserName.trim().isNotEmpty
+        final resolvedName =
+            rawUserName is String && rawUserName.trim().isNotEmpty
             ? rawUserName.trim()
             : name;
 
@@ -16001,70 +29823,40 @@ class ResolvedMemberMiniAvatar extends StatelessWidget {
   }
 }
 
-
 class GroupStreakMedal extends StatelessWidget {
   final String groupId;
-  final String uid;
 
-  const GroupStreakMedal({
-    super.key,
-    required this.groupId,
-    required this.uid,
-  });
+  const GroupStreakMedal({super.key, required this.groupId});
 
-  void _openRanking(BuildContext context, int medalCount) {
+  void _openStats(BuildContext context, GroupStreakStats stats) {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
-      builder: (_) => StreakRankingSheet(
-        groupId: groupId,
-        uid: uid,
-        currentStreak: medalCount,
-      ),
+      builder: (_) => GroupStreakStatsSheet(stats: stats),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<int>(
-      future: calcularRachaPublicacionUsuarioEnGrupo(groupId: groupId, uid: uid),
+    return FutureBuilder<GroupStreakStats>(
+      future: calcularEstadisticasRachaCompletaGrupoFirestore(groupId: groupId),
       builder: (context, snapshot) {
-        final medalCount = snapshot.data ?? 0;
+        final stats = snapshot.data ?? GroupStreakStats.zero;
+        final medalCount = stats.current;
 
         if (medalCount <= 0) {
           return const SizedBox.shrink();
         }
 
         return GestureDetector(
-          onTap: () => _openRanking(context, medalCount),
-          child: Container(
-            width: 34,
-            height: 34,
-            padding: const EdgeInsets.all(1.2),
-            decoration: BoxDecoration(
-              color: ssBg,
-              shape: BoxShape.circle,
-              border: Border.all(color: ssOrangeMid, width: 1.4),
-            ),
-            child: Container(
-              alignment: Alignment.center,
-              decoration: const BoxDecoration(
-                color: ssOrange,
-                shape: BoxShape.circle,
-              ),
-              child: Text(
-                '$medalCount',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: medalCount > 99 ? 11 : 16,
-                  fontWeight: FontWeight.w900,
-                  height: 1,
-                  fontFeatures: const [FontFeature.tabularFigures()],
-                ),
-              ),
-            ),
+          onTap: () => _openStats(context, stats),
+          child: Semantics(
+            button: true,
+            label: medalCount == 1
+                ? 'El grupo lleva 1 semana completa seguida'
+                : 'El grupo lleva $medalCount semanas completas seguidas',
+            child: SundayStreakMedalIcon(count: medalCount),
           ),
         );
       },
@@ -16072,165 +29864,271 @@ class GroupStreakMedal extends StatelessWidget {
   }
 }
 
-class StreakRankingSheet extends StatelessWidget {
-  final String groupId;
-  final String uid;
-  final int currentStreak;
+class SundayStreakMedalIcon extends StatelessWidget {
+  final int count;
 
-  const StreakRankingSheet({
-    super.key,
-    required this.groupId,
-    required this.uid,
-    required this.currentStreak,
-  });
+  const SundayStreakMedalIcon({super.key, required this.count});
 
   @override
   Widget build(BuildContext context) {
+    final label = '$count';
+
+    Widget ribbon({required bool left}) {
+      return Transform.rotate(
+        angle: left ? -0.18 : 0.18,
+        child: Container(
+          width: 7,
+          height: 24,
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: left
+                  ? const [ssOrangeDark, ssOrange]
+                  : const [Color(0xFFFFD9A5), ssOrangeMid],
+            ),
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: ssBg, width: 0.9),
+          ),
+        ),
+      );
+    }
+
+    return SizedBox(
+      width: 34,
+      height: 40,
+      child: Stack(
+        alignment: Alignment.topCenter,
+        clipBehavior: Clip.none,
+        children: [
+          Positioned(
+            top: 0,
+            child: SizedBox(
+              width: 28,
+              height: 27,
+              child: Stack(
+                alignment: Alignment.topCenter,
+                clipBehavior: Clip.none,
+                children: [
+                  Positioned(left: 6, top: 0, child: ribbon(left: true)),
+                  Positioned(right: 6, top: 0, child: ribbon(left: false)),
+                  Positioned(
+                    top: 3,
+                    child: Container(
+                      width: 4,
+                      height: 20,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.48),
+                        borderRadius: BorderRadius.circular(999),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Positioned(
+            top: 13,
+            child: Container(
+              width: 27,
+              height: 27,
+              padding: const EdgeInsets.all(2),
+              decoration: BoxDecoration(
+                color: ssBg,
+                shape: BoxShape.circle,
+                border: Border.all(color: ssOrangeMid, width: 1.3),
+                boxShadow: [
+                  BoxShadow(
+                    color: ssOrangeDark.withValues(alpha: 0.16),
+                    blurRadius: 8,
+                    offset: const Offset(0, 3),
+                  ),
+                ],
+              ),
+              child: DecoratedBox(
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [Color(0xFFFFC978), ssOrange, ssOrangeDark],
+                  ),
+                ),
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    Positioned(
+                      top: 5,
+                      left: 7,
+                      child: Container(
+                        width: 8,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.36),
+                          borderRadius: BorderRadius.circular(999),
+                        ),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 3.5),
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: Text(
+                          label,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w900,
+                            height: 1,
+                            fontFeatures: [FontFeature.tabularFigures()],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class GroupStreakStatsSheet extends StatelessWidget {
+  final GroupStreakStats stats;
+
+  const GroupStreakStatsSheet({super.key, required this.stats});
+
+  @override
+  Widget build(BuildContext context) {
+    final currentText = stats.current == 1
+        ? '1 semana seguida'
+        : '${stats.current} semanas seguidas';
+    final recordText = stats.record == 1
+        ? '1 semana'
+        : '${stats.record} semanas';
+
     return SafeArea(
       top: false,
       child: Container(
         constraints: BoxConstraints(
-          maxHeight: MediaQuery.sizeOf(context).height * 0.78,
+          maxHeight: MediaQuery.sizeOf(context).height * 0.72,
         ),
         padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
         decoration: const BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
         ),
-        child: FutureBuilder<List<StreakRankingEntry>>(
-          future: calcularRankingRachasGrupo(groupId: groupId, currentUid: uid),
-          builder: (context, snapshot) {
-            final ranking = snapshot.data ?? [];
-            final myPosition = ranking.indexWhere((entry) => entry.uid == uid) + 1;
-            final leader = ranking.isNotEmpty ? ranking.first : null;
-            final inFront = leader?.uid == uid;
-
-            return Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Container(
-                  width: 38,
-                  height: 4,
-                  margin: const EdgeInsets.only(bottom: 18),
-                  decoration: BoxDecoration(
-                    color: ssBorder,
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                ),
-                Container(
-                  width: 54,
-                  height: 54,
-                  alignment: Alignment.center,
-                  decoration: const BoxDecoration(
-                    color: ssOrange,
-                    shape: BoxShape.circle,
-                  ),
-                  child: Text(
-                    '$currentStreak',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 24,
-                      fontWeight: FontWeight.w900,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                Text(
-                  currentStreak == 1
-                      ? 'Llevas 1 semana seguida publicando.'
-                      : 'Llevas $currentStreak semanas seguidas publicando.',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: ssTitle,
-                    fontSize: 19,
-                    fontWeight: FontWeight.w900,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Text(
-                  inFront
-                      ? 'Vas en cabeza en tu grupo.'
-                      : myPosition > 0
-                          ? 'Estás en la posición $myPosition del ranking.'
-                          : 'Sigue publicando para entrar en el ranking.',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: ssText2,
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    height: 1.35,
-                  ),
-                ),
-                const SizedBox(height: 18),
-                if (snapshot.connectionState == ConnectionState.waiting)
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 24),
-                    child: CircularProgressIndicator(color: ssOrange),
-                  )
-                else
-                  Flexible(
-                    child: ListView.separated(
-                      shrinkWrap: true,
-                      itemCount: ranking.length,
-                      separatorBuilder: (_, _) =>
-                          const Divider(height: 1, color: ssSeparator),
-                      itemBuilder: (context, index) {
-                        final entry = ranking[index];
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 10),
-                          child: Row(
-                            children: [
-                              SizedBox(
-                                width: 26,
-                                child: Text(
-                                  '${index + 1}',
-                                  style: const TextStyle(
-                                    color: ssText3,
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w900,
-                                  ),
-                                ),
-                              ),
-                              MiniProfileAvatar(
-                                name: entry.name,
-                                photoUrl: entry.photoUrl,
-                                size: 36,
-                                borderColor: ssBg,
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  entry.isCurrentUser
-                                      ? '${entry.name} · tú'
-                                      : entry.name,
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    color: ssTitle,
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w800,
-                                  ),
-                                ),
-                              ),
-                              Text(
-                                '${entry.streak}',
-                                style: const TextStyle(
-                                  color: ssOrangeDark,
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w900,
-                                  fontFeatures: [FontFeature.tabularFigures()],
-                                ),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                    ),
-                  ),
-              ],
-            );
-          },
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 38,
+              height: 4,
+              margin: const EdgeInsets.only(bottom: 18),
+              decoration: BoxDecoration(
+                color: ssBorder,
+                borderRadius: BorderRadius.circular(999),
+              ),
+            ),
+            SundayStreakMedalIcon(count: stats.current),
+            const SizedBox(height: 18),
+            Text(
+              'Racha del grupo',
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: ssTitle,
+                fontSize: 20,
+                fontWeight: FontWeight.w900,
+              ),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'Cuenta las semanas seguidas en las que todos los miembros han subido su Sunday Selfie.',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: ssText2,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                height: 1.35,
+              ),
+            ),
+            const SizedBox(height: 18),
+            GroupStreakStatRow(
+              icon: Icons.local_fire_department_rounded,
+              label: 'Actual',
+              value: currentText,
+            ),
+            const SizedBox(height: 10),
+            GroupStreakStatRow(
+              icon: Icons.workspace_premium_rounded,
+              label: 'Record',
+              value: recordText,
+            ),
+          ],
         ),
+      ),
+    );
+  }
+}
+
+class GroupStreakStatRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String value;
+
+  const GroupStreakStatRow({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: ssBg,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: ssBorder),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 34,
+            height: 34,
+            alignment: Alignment.center,
+            decoration: const BoxDecoration(
+              color: ssOrangeLight,
+              shape: BoxShape.circle,
+            ),
+            child: Icon(icon, color: ssOrangeDark, size: 19),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: ssText2,
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          Text(
+            value,
+            style: const TextStyle(
+              color: ssTitle,
+              fontSize: 15,
+              fontWeight: FontWeight.w900,
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -16355,55 +30253,61 @@ class SundayActionCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(18),
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: ssBg,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: ssBorder, width: 1.4),
-        ),
-        child: Row(
-          children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: ssOrangeLight,
-                borderRadius: BorderRadius.circular(12),
+    final borderRadius = BorderRadius.circular(18);
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: borderRadius,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Ink(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: ssBg,
+            borderRadius: borderRadius,
+            border: Border.all(color: ssBorder, width: 1.4),
+          ),
+          child: Row(
+            children: [
+              Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: ssOrangeLight,
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(icon, color: ssOrange, size: 22),
               ),
-              child: Icon(icon, color: ssOrange, size: 22),
-            ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w600,
-                      color: ssTitle,
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: ssTitle,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    subtitle,
-                    style: const TextStyle(
-                      fontSize: 12.5,
-                      height: 1.35,
-                      color: ssText2,
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        fontSize: 12.5,
+                        height: 1.35,
+                        color: ssText2,
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
-            ),
-            const SizedBox(width: 8),
-            const Icon(Icons.chevron_right_rounded, color: ssText3, size: 24),
-          ],
+              const SizedBox(width: 8),
+              const Icon(Icons.chevron_right_rounded, color: ssText3, size: 24),
+            ],
+          ),
         ),
       ),
     );
@@ -16459,28 +30363,1189 @@ class SmallPillButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(999),
-      child: Container(
-        height: 25,
-        padding: const EdgeInsets.symmetric(horizontal: 15),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: ssOrange,
-          borderRadius: BorderRadius.circular(999),
-        ),
-        child: Text(
-          text,
-          maxLines: 1,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 13,
-            fontWeight: FontWeight.w800,
-            height: 1,
+    final borderRadius = BorderRadius.circular(999);
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: borderRadius,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Ink(
+          height: 25,
+          padding: const EdgeInsets.symmetric(horizontal: 15),
+          decoration: BoxDecoration(
+            color: ssOrange,
+            borderRadius: borderRadius,
+          ),
+          child: Center(
+            child: Text(
+              text,
+              maxLines: 1,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w800,
+                height: 1,
+              ),
+            ),
           ),
         ),
       ),
+    );
+  }
+}
+
+class WeekCalendarEntry {
+  final String weekKey;
+  final int isoYear;
+  final int isoWeek;
+  final int postedCount;
+  final int memberCount;
+  final DateTime sunday;
+
+  const WeekCalendarEntry({
+    required this.weekKey,
+    required this.isoYear,
+    required this.isoWeek,
+    required this.postedCount,
+    required this.memberCount,
+    required this.sunday,
+  });
+
+  int get totalCount => memberCount <= 0 ? postedCount : memberCount;
+
+  bool get isComplete => totalCount > 0 && postedCount >= totalCount;
+
+  String get progressLabel => '$postedCount/$totalCount';
+
+  String get monthLabel => monthName(sunday.month);
+}
+
+List<WeekCalendarEntry> construirEntradasCalendarioSemanas({
+  required Iterable<String> weekKeys,
+  required List<QueryDocumentSnapshot<Map<String, dynamic>>> weekDocs,
+  required int memberCount,
+}) {
+  final weekDocsById = {for (final doc in weekDocs) doc.id: doc};
+  final entries = <WeekCalendarEntry>[];
+
+  for (final weekKey in weekKeys) {
+    final parts = weekKey.split('-W');
+    if (parts.length != 2) continue;
+
+    final isoYear = int.tryParse(parts[0]);
+    final isoWeek = int.tryParse(parts[1]);
+    final sunday = domingoDesdeWeekKey(weekKey);
+
+    if (isoYear == null || isoWeek == null || sunday == null) continue;
+
+    final weekData = weekDocsById[weekKey]?.data();
+    final rawPostCount = weekData?['postCount'] ?? 0;
+    final postCount = rawPostCount is int
+        ? rawPostCount
+        : int.tryParse('$rawPostCount') ?? 0;
+
+    entries.add(
+      WeekCalendarEntry(
+        weekKey: weekKey,
+        isoYear: isoYear,
+        isoWeek: isoWeek,
+        postedCount: postCount,
+        memberCount: memberCount,
+        sunday: sunday,
+      ),
+    );
+  }
+
+  return entries;
+}
+
+Future<String?> showWeekCalendarSheet({
+  required BuildContext context,
+  required List<WeekCalendarEntry> entries,
+  required String selectedWeekKey,
+}) {
+  if (entries.isEmpty) return Future.value();
+
+  return showModalBottomSheet<String>(
+    context: context,
+    isScrollControlled: true,
+    isDismissible: true,
+    enableDrag: true,
+    backgroundColor: Colors.transparent,
+    builder: (_) =>
+        WeekCalendarSheet(entries: entries, selectedWeekKey: selectedWeekKey),
+  );
+}
+
+Future<List<String>?> showDownloadWeeksSheet({
+  required BuildContext context,
+  required List<WeekCalendarEntry> entries,
+}) {
+  if (entries.isEmpty) {
+    showSundaySnack(context, 'No hay semanas para descargar');
+    return Future.value();
+  }
+
+  return showModalBottomSheet<List<String>>(
+    context: context,
+    isScrollControlled: true,
+    isDismissible: true,
+    enableDrag: true,
+    backgroundColor: Colors.transparent,
+    builder: (_) => DownloadWeeksSheet(entries: entries),
+  );
+}
+
+class DownloadWeeksSheet extends StatefulWidget {
+  final List<WeekCalendarEntry> entries;
+
+  const DownloadWeeksSheet({super.key, required this.entries});
+
+  @override
+  State<DownloadWeeksSheet> createState() => _DownloadWeeksSheetState();
+}
+
+class _DownloadWeeksSheetState extends State<DownloadWeeksSheet> {
+  late int selectedYear;
+  late Set<String> selectedWeekKeys;
+
+  @override
+  void initState() {
+    super.initState();
+    selectedYear = widget.entries.first.isoYear;
+    selectedWeekKeys = {};
+  }
+
+  Map<int, List<WeekCalendarEntry>> get entriesByYear {
+    final grouped = <int, List<WeekCalendarEntry>>{};
+    for (final entry in widget.entries) {
+      grouped.putIfAbsent(entry.isoYear, () => []).add(entry);
+    }
+    return grouped;
+  }
+
+  void _toggleWeek(WeekCalendarEntry entry) {
+    if (entry.postedCount <= 0) return;
+    setState(() {
+      if (!selectedWeekKeys.remove(entry.weekKey)) {
+        selectedWeekKeys.add(entry.weekKey);
+      }
+    });
+  }
+
+  int _availableWeekCount(Iterable<WeekCalendarEntry> entries) {
+    return entries.where((entry) => entry.postedCount > 0).length;
+  }
+
+  int _selectedWeekCount(Iterable<WeekCalendarEntry> entries) {
+    return entries
+        .where((entry) => selectedWeekKeys.contains(entry.weekKey))
+        .length;
+  }
+
+  int get _selectedPhotoCount {
+    var count = 0;
+    for (final entry in widget.entries) {
+      if (selectedWeekKeys.contains(entry.weekKey)) {
+        count += entry.postedCount;
+      }
+    }
+    return count;
+  }
+
+  String _yearSubtitle({
+    required List<WeekCalendarEntry> yearEntries,
+    required bool selected,
+  }) {
+    final selectedCount = _selectedWeekCount(yearEntries);
+    if (selected && selectedCount > 0) {
+      return selectedCount == 1
+          ? '1 seleccionada'
+          : '$selectedCount seleccionadas';
+    }
+
+    final availableCount = _availableWeekCount(yearEntries);
+    return availableCount == 1 ? '1 semana' : '$availableCount semanas';
+  }
+
+  void _selectVisibleYear(List<WeekCalendarEntry> yearEntries) {
+    setState(() {
+      for (final entry in yearEntries) {
+        if (entry.postedCount > 0) selectedWeekKeys.add(entry.weekKey);
+      }
+    });
+  }
+
+  void _downloadSelectedWeeks() {
+    Navigator.pop(context, ordenarWeekKeysDescendentes(selectedWeekKeys));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final groupedEntries = entriesByYear;
+    final years = groupedEntries.keys.toList()..sort((a, b) => b.compareTo(a));
+    final activeYear = years.contains(selectedYear)
+        ? selectedYear
+        : years.first;
+    final yearEntries = groupedEntries[activeYear] ?? const [];
+    final selectedCount = selectedWeekKeys.length;
+    final selectedPhotoCount = _selectedPhotoCount;
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final maxSheetHeight = math.min(screenHeight * 0.91, 780.0);
+    final minSheetHeight = math.min(maxSheetHeight, screenHeight * 0.72);
+
+    return MediaQuery.withClampedTextScaling(
+      maxScaleFactor: 1.12,
+      child: SafeArea(
+        top: false,
+        child: Align(
+          alignment: Alignment.bottomCenter,
+          child: Container(
+            constraints: BoxConstraints(
+              minHeight: minSheetHeight,
+              maxHeight: maxSheetHeight,
+            ),
+            decoration: const BoxDecoration(
+              color: ssBg,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(36)),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Center(
+                  child: Container(
+                    width: 48,
+                    height: 6,
+                    margin: const EdgeInsets.only(top: 12, bottom: 22),
+                    decoration: BoxDecoration(
+                      color: ssBorder,
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(28, 0, 18, 0),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'Descargar selfies',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: ssTitle,
+                                fontSize: 30,
+                                fontWeight: FontWeight.w900,
+                                height: 1.05,
+                              ),
+                            ),
+                            SizedBox(height: 8),
+                            Text(
+                              'Elige el año y las semanas a guardar',
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: ssText2,
+                                fontSize: 18,
+                                fontWeight: FontWeight.w600,
+                                height: 1.12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Material(
+                        color: ssSeparator,
+                        shape: const CircleBorder(),
+                        clipBehavior: Clip.antiAlias,
+                        child: InkWell(
+                          onTap: () => Navigator.pop(context),
+                          child: const SizedBox(
+                            width: 54,
+                            height: 54,
+                            child: Icon(
+                              Icons.close_rounded,
+                              color: ssText2,
+                              size: 31,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 28),
+                SizedBox(
+                  height: 88,
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final visibleCards = math.min(years.length, 3);
+                      final fittedWidth = visibleCards == 0
+                          ? 112.0
+                          : (constraints.maxWidth -
+                                    56 -
+                                    ((visibleCards - 1) * 12)) /
+                                visibleCards;
+                      final cardWidth = math.max(104.0, fittedWidth);
+
+                      return ListView.separated(
+                        scrollDirection: Axis.horizontal,
+                        padding: const EdgeInsets.symmetric(horizontal: 28),
+                        itemCount: years.length,
+                        separatorBuilder: (_, _) => const SizedBox(width: 12),
+                        itemBuilder: (context, index) {
+                          final year = years[index];
+                          final selected = year == activeYear;
+                          final yearEntries = groupedEntries[year] ?? const [];
+
+                          return DownloadYearCard(
+                            width: cardWidth,
+                            year: year,
+                            subtitle: _yearSubtitle(
+                              yearEntries: yearEntries,
+                              selected: selected,
+                            ),
+                            selected: selected,
+                            onTap: () => setState(() => selectedYear = year),
+                          );
+                        },
+                      );
+                    },
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(28, 30, 28, 14),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '$activeYear · SEMANAS',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: ssText3,
+                            fontSize: 17,
+                            fontWeight: FontWeight.w900,
+                            height: 1,
+                            letterSpacing: 0,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Flexible(
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: _availableWeekCount(yearEntries) == 0
+                              ? null
+                              : () => _selectVisibleYear(yearEntries),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 8),
+                            child: FittedBox(
+                              fit: BoxFit.scaleDown,
+                              alignment: Alignment.centerRight,
+                              child: Text(
+                                'Seleccionar todas',
+                                maxLines: 1,
+                                style: TextStyle(
+                                  color: _availableWeekCount(yearEntries) == 0
+                                      ? ssText3
+                                      : ssOrangeDark,
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.w900,
+                                  height: 1,
+                                  letterSpacing: 0,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Flexible(
+                  child: GridView.builder(
+                    shrinkWrap: true,
+                    padding: const EdgeInsets.fromLTRB(28, 0, 28, 22),
+                    gridDelegate:
+                        const SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: 3,
+                          mainAxisSpacing: 12,
+                          crossAxisSpacing: 12,
+                          childAspectRatio: 0.92,
+                        ),
+                    itemCount: yearEntries.length,
+                    itemBuilder: (context, index) {
+                      final entry = yearEntries[index];
+                      return DownloadWeekTile(
+                        entry: entry,
+                        selected: selectedWeekKeys.contains(entry.weekKey),
+                        onTap: () => _toggleWeek(entry),
+                      );
+                    },
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.fromLTRB(28, 16, 28, 18),
+                  decoration: const BoxDecoration(
+                    color: ssBg,
+                    border: Border(top: BorderSide(color: ssSeparator)),
+                  ),
+                  child: DownloadWeeksBottomButton(
+                    selectedWeekCount: selectedCount,
+                    selectedPhotoCount: selectedPhotoCount,
+                    onPressed: selectedCount == 0
+                        ? null
+                        : _downloadSelectedWeeks,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class DownloadYearCard extends StatelessWidget {
+  final double width;
+  final int year;
+  final String subtitle;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const DownloadYearCard({
+    super.key,
+    required this.width,
+    required this.year,
+    required this.subtitle,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final fg = selected ? Colors.white : ssTitle;
+    final muted = selected ? Colors.white : ssText3;
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(22),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Ink(
+          width: width,
+          decoration: BoxDecoration(
+            color: selected ? ssOrange : Colors.white,
+            borderRadius: BorderRadius.circular(22),
+            border: Border.all(
+              color: selected ? ssOrange : ssBorder,
+              width: 1.5,
+            ),
+            boxShadow: selected
+                ? [
+                    BoxShadow(
+                      color: ssOrange.withValues(alpha: 0.18),
+                      blurRadius: 24,
+                      offset: const Offset(0, 12),
+                    ),
+                  ]
+                : null,
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    '$year',
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: fg,
+                      fontSize: 28,
+                      fontWeight: FontWeight.w900,
+                      height: 0.95,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  const SizedBox(height: 9),
+                  Text(
+                    subtitle,
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: muted,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w900,
+                      height: 1,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class DownloadWeeksBottomButton extends StatelessWidget {
+  final int selectedWeekCount;
+  final int selectedPhotoCount;
+  final VoidCallback? onPressed;
+
+  const DownloadWeeksBottomButton({
+    super.key,
+    required this.selectedWeekCount,
+    required this.selectedPhotoCount,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onPressed != null;
+    final weekLabel = selectedWeekCount == 1 ? 'semana' : 'semanas';
+    final photoLabel = selectedPhotoCount == 1 ? 'foto' : 'fotos';
+    final text = enabled
+        ? 'Descargar $selectedWeekCount $weekLabel · $selectedPhotoCount $photoLabel'
+        : 'Selecciona semanas';
+
+    return Material(
+      color: enabled ? ssOrange : ssSeparator,
+      borderRadius: BorderRadius.circular(18),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onPressed,
+        child: SizedBox(
+          height: 64,
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 18),
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.download_rounded,
+                      color: enabled ? Colors.white : ssText3,
+                      size: 29,
+                    ),
+                    const SizedBox(width: 12),
+                    Text(
+                      text,
+                      maxLines: 1,
+                      style: TextStyle(
+                        color: enabled ? Colors.white : ssText3,
+                        fontSize: 19,
+                        fontWeight: FontWeight.w900,
+                        height: 1,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class DownloadWeekTile extends StatelessWidget {
+  final WeekCalendarEntry entry;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const DownloadWeekTile({
+    super.key,
+    required this.entry,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = entry.postedCount > 0;
+    final bg = selected ? ssOrangeLight : Colors.white;
+    final borderColor = selected ? ssOrange : ssBorder;
+    final accentColor = selected ? ssOrangeDark : ssTitle;
+    final secondaryColor = selected ? ssOrangeDark : ssText3;
+
+    return Opacity(
+      opacity: enabled ? 1 : 0.42,
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(22),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: enabled ? onTap : null,
+          child: Ink(
+            decoration: BoxDecoration(
+              color: bg,
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(
+                color: borderColor,
+                width: selected ? 2.5 : 1.4,
+              ),
+            ),
+            child: Stack(
+              children: [
+                Positioned(
+                  top: 12,
+                  right: 12,
+                  child: _DownloadWeekSelectionDot(selected: selected),
+                ),
+                Center(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(8, 14, 8, 10),
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'SEM',
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: secondaryColor,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w900,
+                              height: 1,
+                              letterSpacing: 0,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            '${entry.isoWeek}',
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: accentColor,
+                              fontSize: 38,
+                              fontWeight: FontWeight.w900,
+                              height: 0.9,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            entry.progressLabel,
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: secondaryColor,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w900,
+                              height: 1,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures(),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 5),
+                          Text(
+                            entry.monthLabel,
+                            maxLines: 1,
+                            style: TextStyle(
+                              color: secondaryColor,
+                              fontSize: 13.5,
+                              fontWeight: FontWeight.w600,
+                              height: 1,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DownloadWeekSelectionDot extends StatelessWidget {
+  final bool selected;
+
+  const _DownloadWeekSelectionDot({required this.selected});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 28,
+      height: 28,
+      decoration: BoxDecoration(
+        color: selected ? ssOrange : Colors.white,
+        shape: BoxShape.circle,
+        border: selected ? null : Border.all(color: ssBorder, width: 1.6),
+      ),
+      child: selected
+          ? const Icon(Icons.check_rounded, color: Colors.white, size: 20)
+          : null,
+    );
+  }
+}
+
+class WeekCalendarButton extends StatelessWidget {
+  final VoidCallback? onTap;
+
+  const WeekCalendarButton({super.key, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final borderRadius = BorderRadius.circular(999);
+
+    return Tooltip(
+      message: 'Ir a una semana',
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: borderRadius,
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Ink(
+            width: 34,
+            height: 25,
+            decoration: BoxDecoration(
+              color: onTap == null ? ssSeparator : ssOrangeLight,
+              borderRadius: borderRadius,
+              border: Border.all(
+                color: onTap == null ? ssBorder : ssOrangeMid,
+                width: 1.2,
+              ),
+            ),
+            child: Icon(
+              Icons.calendar_month_outlined,
+              color: onTap == null ? ssText3 : ssOrangeDark,
+              size: 17,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class WeekCalendarSheet extends StatefulWidget {
+  final List<WeekCalendarEntry> entries;
+  final String selectedWeekKey;
+
+  const WeekCalendarSheet({
+    super.key,
+    required this.entries,
+    required this.selectedWeekKey,
+  });
+
+  @override
+  State<WeekCalendarSheet> createState() => _WeekCalendarSheetState();
+}
+
+class _WeekCalendarSheetState extends State<WeekCalendarSheet> {
+  late int selectedYear;
+
+  @override
+  void initState() {
+    super.initState();
+
+    final selectedEntry = widget.entries
+        .where((entry) => entry.weekKey == widget.selectedWeekKey)
+        .firstOrNull;
+
+    selectedYear = selectedEntry?.isoYear ?? widget.entries.first.isoYear;
+  }
+
+  Map<int, List<WeekCalendarEntry>> get entriesByYear {
+    final grouped = <int, List<WeekCalendarEntry>>{};
+
+    for (final entry in widget.entries) {
+      grouped.putIfAbsent(entry.isoYear, () => []).add(entry);
+    }
+
+    return grouped;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    SundayClockScope.watch(context);
+    final groupedEntries = entriesByYear;
+    final years = groupedEntries.keys.toList()..sort((a, b) => b.compareTo(a));
+    final activeYear = years.contains(selectedYear)
+        ? selectedYear
+        : years.first;
+    final yearEntries = groupedEntries[activeYear] ?? const [];
+    final screenHeight = MediaQuery.sizeOf(context).height;
+    final maxSheetHeight = math.min(screenHeight * 0.86, 680.0);
+    final minSheetHeight = math.min(screenHeight * 0.34, 320.0);
+
+    return MediaQuery.withClampedTextScaling(
+      maxScaleFactor: 1.12,
+      child: SafeArea(
+        top: false,
+        child: Align(
+          alignment: Alignment.bottomCenter,
+          child: Container(
+            constraints: BoxConstraints(
+              minHeight: minSheetHeight,
+              maxHeight: maxSheetHeight,
+            ),
+            decoration: const BoxDecoration(
+              color: ssBg,
+              borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 38,
+                  height: 4,
+                  margin: const EdgeInsets.only(top: 10, bottom: 12),
+                  decoration: BoxDecoration(
+                    color: ssBorder,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                ),
+                SizedBox(
+                  height: 62,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 18),
+                    itemCount: years.length,
+                    separatorBuilder: (_, _) => const SizedBox(width: 9),
+                    itemBuilder: (context, index) {
+                      final year = years[index];
+                      final selected = year == activeYear;
+                      final count = groupedEntries[year]?.length ?? 0;
+
+                      return WeekCalendarYearCard(
+                        year: year,
+                        weekCount: count,
+                        selected: selected,
+                        onTap: () => setState(() => selectedYear = year),
+                      );
+                    },
+                  ),
+                ),
+                Flexible(
+                  fit: FlexFit.loose,
+                  child: CustomScrollView(
+                    shrinkWrap: true,
+                    slivers: [
+                      SliverPadding(
+                        padding: const EdgeInsets.fromLTRB(18, 14, 18, 10),
+                        sliver: SliverToBoxAdapter(
+                          child: Text(
+                            '$activeYear · SEMANAS',
+                            style: const TextStyle(
+                              color: ssText3,
+                              fontSize: 14,
+                              fontWeight: FontWeight.w900,
+                              height: 1,
+                            ),
+                          ),
+                        ),
+                      ),
+                      SliverPadding(
+                        padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+                        sliver: SliverGrid(
+                          gridDelegate:
+                              const SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: 4,
+                                mainAxisSpacing: 9,
+                                crossAxisSpacing: 9,
+                                childAspectRatio: 0.84,
+                              ),
+                          delegate: SliverChildBuilderDelegate((
+                            context,
+                            index,
+                          ) {
+                            final entry = yearEntries[index];
+
+                            return WeekCalendarWeekTile(
+                              entry: entry,
+                              selected: entry.weekKey == widget.selectedWeekKey,
+                              onTap: () =>
+                                  Navigator.pop(context, entry.weekKey),
+                            );
+                          }, childCount: yearEntries.length),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const WeekCalendarLegend(),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class WeekCalendarYearCard extends StatelessWidget {
+  final int year;
+  final int weekCount;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const WeekCalendarYearCard({
+    super.key,
+    required this.year,
+    required this.weekCount,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final fg = selected ? Colors.white : ssTitle;
+    final muted = selected ? Colors.white : ssText3;
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(16),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Ink(
+          width: 96,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: selected ? ssOrange : Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: selected ? ssOrange : ssBorder,
+              width: 1.4,
+            ),
+          ),
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  '$year',
+                  maxLines: 1,
+                  style: TextStyle(
+                    color: fg,
+                    fontSize: 21,
+                    fontWeight: FontWeight.w900,
+                    height: 1,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  weekCount == 1 ? '1 semana' : '$weekCount semanas',
+                  maxLines: 1,
+                  style: TextStyle(
+                    color: muted,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w900,
+                    height: 1,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class WeekCalendarWeekTile extends StatelessWidget {
+  final WeekCalendarEntry entry;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const WeekCalendarWeekTile({
+    super.key,
+    required this.entry,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final complete = entry.isComplete;
+    final bg = complete ? ssOrangeLight : Colors.white;
+    final borderColor = selected ? ssOrange : ssBorder;
+    final borderWidth = selected ? 2.0 : 1.4;
+    const labelColor = ssText3;
+    const mainColor = ssTitle;
+    const secondaryColor = ssText3;
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(14),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Ink(
+          decoration: BoxDecoration(
+            color: bg,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: borderColor, width: borderWidth),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 6),
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    'SEM',
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: labelColor,
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w900,
+                      height: 1,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    '${entry.isoWeek}',
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: mainColor,
+                      fontSize: 26,
+                      fontWeight: FontWeight.w900,
+                      height: 0.95,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    entry.progressLabel,
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: secondaryColor,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w900,
+                      height: 1,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    entry.monthLabel,
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: secondaryColor,
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w500,
+                      height: 1,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class WeekCalendarLegend extends StatelessWidget {
+  const WeekCalendarLegend({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),
+      decoration: const BoxDecoration(
+        color: ssBg,
+        border: Border(top: BorderSide(color: ssSeparator, width: 1.2)),
+      ),
+      child: const Wrap(
+        alignment: WrapAlignment.center,
+        spacing: 16,
+        runSpacing: 8,
+        children: [
+          WeekCalendarLegendItem(
+            color: ssOrangeLight,
+            borderColor: ssBorder,
+            label: 'Completa',
+          ),
+          WeekCalendarLegendItem(
+            color: Colors.white,
+            borderColor: ssBorder,
+            label: 'Incompleta',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class WeekCalendarLegendItem extends StatelessWidget {
+  final Color color;
+  final Color? borderColor;
+  final String label;
+
+  const WeekCalendarLegendItem({
+    super.key,
+    required this.color,
+    required this.label,
+    this.borderColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          width: 13,
+          height: 13,
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+            border: borderColor == null
+                ? null
+                : Border.all(color: borderColor!, width: 1.4),
+          ),
+        ),
+        const SizedBox(width: 6),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 92),
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: ssText2,
+              fontSize: 12.5,
+              fontWeight: FontWeight.w700,
+              height: 1,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -16489,38 +31554,79 @@ class WeekChip extends StatelessWidget {
   final String text;
   final bool selected;
   final VoidCallback onTap;
+  final double horizontalPadding;
 
   const WeekChip({
     super.key,
     required this.text,
     required this.selected,
     required this.onTap,
+    this.horizontalPadding = 13,
   });
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(999),
-      child: Container(
-        height: 25,
-        padding: const EdgeInsets.symmetric(horizontal: 15),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: selected ? ssOrange : Colors.white,
-          borderRadius: BorderRadius.circular(999),
-          border: selected ? null : Border.all(color: ssBorder, width: 1.2),
-        ),
-        child: Text(
-          text,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: TextStyle(
-            color: selected ? Colors.white : ssText2,
-            fontSize: 13,
-            fontWeight: FontWeight.w800,
-            height: 1,
+    final borderRadius = BorderRadius.circular(999);
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: borderRadius,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Ink(
+          height: 25,
+          padding: EdgeInsets.symmetric(horizontal: horizontalPadding),
+          decoration: BoxDecoration(
+            color: selected ? ssOrangeChip : Colors.white,
+            borderRadius: borderRadius,
+            border: selected ? null : Border.all(color: ssBorder, width: 1.2),
           ),
+          child: Center(
+            child: Text(
+              text,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                color: selected ? Colors.white : ssText2,
+                fontSize: 13,
+                fontWeight: FontWeight.w800,
+                height: 1,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class WeekYearSeparatorChip extends StatelessWidget {
+  final String year;
+
+  const WeekYearSeparatorChip({super.key, required this.year});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 25,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: ssSeparator,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: ssBorder, width: 1.1),
+      ),
+      child: Text(
+        year,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+          color: ssText3,
+          fontSize: 12,
+          fontWeight: FontWeight.w900,
+          height: 1,
+          fontFeatures: [FontFeature.tabularFigures()],
         ),
       ),
     );
@@ -16540,7 +31646,7 @@ class EmptyGroupsCard extends StatelessWidget {
       child: const EmptyStateContent(
         icon: Icons.groups_outlined,
         title: 'Todavía no tienes grupos',
-        subtitle: 'Crea uno o únete con un enlace de invitación',
+        subtitle: 'Crea uno o únete con un código de invitación',
       ),
     );
   }
@@ -16553,40 +31659,48 @@ class InviteHintCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(16),
-      child: Container(
-        constraints: const BoxConstraints(minHeight: 80),
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          color: ssOrangeLight,
-          border: Border.all(
-            color: ssOrangeMid,
-            width: 1.5,
-            style: BorderStyle.solid,
-          ),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: const Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Text(
-              '¿Tienes un grupo en mente?',
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                color: ssOrangeDark,
-                fontSize: 15,
-                fontWeight: FontWeight.w600,
+    final borderRadius = BorderRadius.circular(16);
+
+    return Material(
+      color: Colors.transparent,
+      borderRadius: borderRadius,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minHeight: 80),
+          child: Ink(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(
+              color: ssOrangeLight,
+              border: Border.all(
+                color: ssOrangeMid,
+                width: 1.5,
+                style: BorderStyle.solid,
               ),
+              borderRadius: borderRadius,
             ),
-            SizedBox(height: 4),
-            Text(
-              'Crea uno o únete con un enlace de invitación',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: ssText2, fontSize: 13),
+            child: const Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  '¿Tienes un grupo en mente?',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: ssOrangeDark,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                SizedBox(height: 4),
+                Text(
+                  'Crea uno o únete con un código de invitación',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: ssText2, fontSize: 13),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );
@@ -16658,7 +31772,9 @@ class WeekCalendarGraphic extends StatelessWidget {
                 style: TextStyle(
                   color: isSunday || isPastOrToday ? ssOrange : ssText3,
                   fontSize: 10,
-                  fontWeight: isSunday || isToday ? FontWeight.w800 : FontWeight.w500,
+                  fontWeight: isSunday || isToday
+                      ? FontWeight.w800
+                      : FontWeight.w500,
                 ),
               ),
               const SizedBox(height: 4),
@@ -16673,7 +31789,9 @@ class WeekCalendarGraphic extends StatelessWidget {
                       ? ssOrangeLight
                       : ssSeparator,
                   borderRadius: BorderRadius.circular(8),
-                  border: isSunday ? Border.all(color: ssOrangeMid, width: 1.1) : null,
+                  border: isSunday
+                      ? Border.all(color: ssOrangeMid, width: 1.1)
+                      : null,
                 ),
                 child: isSunday
                     ? const SundaySelfieLogoMark(size: 18)
@@ -16686,7 +31804,6 @@ class WeekCalendarGraphic extends StatelessWidget {
     );
   }
 }
-
 
 String weekBadgeText(String weekKey) {
   final parts = weekKey.split('-W');
@@ -16707,13 +31824,20 @@ String? fallbackGroupEmoji(String name) {
   return null;
 }
 
-
 String formatUserDisplayName(dynamic value) {
   final raw = value?.toString().trim() ?? '';
   final clean = raw.isEmpty ? 'Usuario' : raw;
   final first = clean.characters.first.toUpperCase();
   final rest = clean.characters.skip(1).join();
   return '$first$rest';
+}
+
+String formatMemberCount(int count) {
+  return count == 1 ? '1 miembro' : '$count miembros';
+}
+
+String formatActiveWeeksLabel(int count) {
+  return count == 1 ? '1 semana activo' : '$count semanas activo';
 }
 
 String formatGroupDisplayName(String name) {
@@ -16759,13 +31883,164 @@ String? extractLastEmoji(String value) {
   return null;
 }
 
+OverlayEntry? _activeSundaySnackEntry;
+Timer? _activeSundaySnackTimer;
+
 void showSundaySnack(BuildContext context, String message) {
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(
-      content: Text(message),
-      backgroundColor: ssText,
-      behavior: SnackBarBehavior.floating,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+  final overlay = Overlay.maybeOf(context, rootOverlay: true);
+  if (overlay == null) return;
+
+  _dismissActiveSundaySnack();
+
+  final entry = OverlayEntry(
+    builder: (context) => _SundaySnackNotice(
+      message: _cleanSundaySnackMessage(message),
+      isError: _isSundaySnackError(message),
     ),
   );
+
+  _activeSundaySnackEntry = entry;
+  overlay.insert(entry);
+  _activeSundaySnackTimer = Timer(
+    const Duration(seconds: 3),
+    _dismissActiveSundaySnack,
+  );
+}
+
+void _dismissActiveSundaySnack() {
+  _activeSundaySnackTimer?.cancel();
+  _activeSundaySnackTimer = null;
+
+  final entry = _activeSundaySnackEntry;
+  _activeSundaySnackEntry = null;
+  entry?.remove();
+}
+
+String _cleanSundaySnackMessage(String message) {
+  var clean = message.trim();
+  final prefixes = [
+    RegExp(r'^Error:\s*Exception:\s*', caseSensitive: false),
+    RegExp(r'^Exception:\s*', caseSensitive: false),
+    RegExp(r'^Error:\s*', caseSensitive: false),
+  ];
+
+  for (final prefix in prefixes) {
+    clean = clean.replaceFirst(prefix, '');
+  }
+
+  clean = clean.trim();
+  return clean.isEmpty ? message : clean;
+}
+
+bool _isSundaySnackError(String message) {
+  final lower = message.trim().toLowerCase();
+  return lower.startsWith('error:') ||
+      lower.startsWith('exception:') ||
+      lower.contains('no se pudo') ||
+      lower.contains('fall');
+}
+
+IconData _sundaySnackIconForMessage(String message, bool isError) {
+  if (isError) return Icons.error_outline_rounded;
+
+  final lower = message.toLowerCase();
+  if (lower.contains('cargando') ||
+      lower.contains('guardando') ||
+      lower.contains('actualizando')) {
+    return Icons.hourglass_top_rounded;
+  }
+
+  if (lower.contains('enviado') ||
+      lower.contains('actualizado') ||
+      lower.contains('copiado') ||
+      lower.contains('completado') ||
+      lower.contains('publicado')) {
+    return Icons.check_rounded;
+  }
+
+  return Icons.info_outline_rounded;
+}
+
+class _SundaySnackNotice extends StatelessWidget {
+  final String message;
+  final bool isError;
+
+  const _SundaySnackNotice({required this.message, required this.isError});
+
+  @override
+  Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final maxWidth = math.min(media.size.width - 48, 380.0);
+    final accent = isError ? const Color(0xFFD96558) : ssOrange;
+    final icon = _sundaySnackIconForMessage(message, isError);
+
+    return IgnorePointer(
+      child: SafeArea(
+        child: Center(
+          child: TweenAnimationBuilder<double>(
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOutCubic,
+            tween: Tween<double>(begin: 0, end: 1),
+            builder: (context, value, child) {
+              return Opacity(
+                opacity: value,
+                child: Transform.scale(
+                  scale: 0.96 + (0.04 * value),
+                  child: child,
+                ),
+              );
+            },
+            child: Material(
+              color: Colors.transparent,
+              child: Container(
+                width: maxWidth,
+                margin: const EdgeInsets.symmetric(horizontal: 24),
+                padding: const EdgeInsets.fromLTRB(22, 22, 22, 20),
+                decoration: BoxDecoration(
+                  color: ssSurface,
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(
+                    color: isError ? const Color(0xFFFFD7C2) : ssOrangeMid,
+                    width: 1.4,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.14),
+                      blurRadius: 30,
+                      offset: const Offset(0, 14),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 54,
+                      height: 54,
+                      decoration: BoxDecoration(
+                        color: accent.withValues(alpha: 0.12),
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(icon, color: accent, size: 30),
+                    ),
+                    const SizedBox(height: 14),
+                    Text(
+                      message,
+                      textAlign: TextAlign.center,
+                      style: const TextStyle(
+                        color: ssText,
+                        fontSize: 16,
+                        height: 1.35,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }

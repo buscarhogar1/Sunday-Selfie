@@ -11,6 +11,7 @@ import {
   getDoc,
   serverTimestamp,
   setDoc,
+  updateDoc,
 } from "firebase/firestore";
 import {
   deleteObject,
@@ -185,16 +186,86 @@ test("direct clients cannot perform server-only Firestore writes", async () => {
   await assertFails(deleteDoc(doc(db, "users", memberUid)));
 });
 
+test("members can change only their own name inside a group", async () => {
+  const memberDb = firestoreFor(memberUid);
+  const outsiderDb = firestoreFor(outsiderUid);
+  const ownMemberRef = doc(
+    memberDb,
+    "groups",
+    groupId,
+    "members",
+    memberUid
+  );
+  const otherMemberRef = doc(
+    memberDb,
+    "groups",
+    groupId,
+    "members",
+    authorUid
+  );
+  const outsiderMemberRef = doc(
+    outsiderDb,
+    "groups",
+    groupId,
+    "members",
+    memberUid
+  );
+
+  await assertSucceeds(updateDoc(ownMemberRef, {
+    effectiveName: "Alias del grupo",
+    groupNameOverride: "Alias del grupo",
+    profileSyncedAt: serverTimestamp(),
+  }));
+  await assertFails(updateDoc(otherMemberRef, {
+    effectiveName: "Nombre ajeno",
+    groupNameOverride: "Nombre ajeno",
+    profileSyncedAt: serverTimestamp(),
+  }));
+  await assertFails(updateDoc(outsiderMemberRef, {
+    effectiveName: "Intruso",
+    groupNameOverride: "Intruso",
+    profileSyncedAt: serverTimestamp(),
+  }));
+  await assertFails(updateDoc(ownMemberRef, {
+    role: "admin",
+    profileSyncedAt: serverTimestamp(),
+  }));
+  await assertFails(updateDoc(ownMemberRef, {
+    effectiveName: "",
+    groupNameOverride: "",
+    profileSyncedAt: serverTimestamp(),
+  }));
+});
+
 test("security reports stay private even for their reporter", async () => {
   const reportRef = doc(firestoreFor(memberUid), "reports", "private-report");
 
   await assertFails(getDoc(reportRef));
 });
 
-test("a valid invitation allows a join request", async () => {
+test("direct clients cannot create private suggestions", async () => {
+  const memberDb = firestoreFor(memberUid);
+  const validSuggestion = {
+    uid: memberUid,
+    authorName: "Miembro",
+    authorEmail: "member@example.com",
+    text: "Me gustaría poder ordenar los grupos.",
+    status: "new",
+    source: "profile",
+    createdAt: serverTimestamp(),
+  };
+
+  await assertFails(setDoc(
+    doc(memberDb, "suggestions", "member-suggestion"),
+    validSuggestion
+  ));
+  await assertFails(getDoc(doc(memberDb, "suggestions", "member-suggestion")));
+});
+
+test("direct clients cannot create join requests", async () => {
   const db = firestoreFor(outsiderUid);
 
-  await assertSucceeds(setDoc(
+  await assertFails(setDoc(
     doc(db, "groups", groupId, "joinRequests", outsiderUid),
     {
       uid: outsiderUid,
@@ -257,10 +328,13 @@ test("direct clients cannot replace or delete a stored selfie", async () => {
 });
 
 test("users can upload only their own profile photo", async () => {
-  const ownProfile = ref(storageFor(memberUid), `users/${memberUid}/profile/own.jpg`);
-  const otherProfile = ref(storageFor(outsiderUid), `users/${memberUid}/profile/other.jpg`);
+  const ownProfile = ref(storageFor(memberUid), `users/${memberUid}/profile/base_123.jpg`);
+  const otherProfile = ref(storageFor(outsiderUid), `users/${memberUid}/profile/base_456.jpg`);
   const bytes = new Uint8Array([7, 8, 9]);
-  const metadata = {contentType: "image/jpeg"};
+  const metadata = {
+    contentType: "image/jpeg",
+    customMetadata: {uid: memberUid, kind: "profilePhoto"},
+  };
 
   await assertSucceeds(uploadBytes(ownProfile, bytes, metadata));
   await assertFails(uploadBytes(otherProfile, bytes, metadata));
@@ -268,8 +342,8 @@ test("users can upload only their own profile photo", async () => {
 
 test("only admins can upload a group photo", async () => {
   const bytes = new Uint8Array([10, 11, 12]);
-  const adminPhoto = ref(storageFor(adminUid), `groups/${groupId}/profile/admin.jpg`);
-  const memberPhoto = ref(storageFor(memberUid), `groups/${groupId}/profile/member.jpg`);
+  const adminPhoto = ref(storageFor(adminUid), `groups/${groupId}/profile/group_123.jpg`);
+  const memberPhoto = ref(storageFor(memberUid), `groups/${groupId}/profile/group_456.jpg`);
 
   await assertSucceeds(uploadBytes(adminPhoto, bytes, {
     contentType: "image/jpeg",

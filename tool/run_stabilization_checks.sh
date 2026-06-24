@@ -9,14 +9,20 @@ node --check functions/index.js
 node --test functions/callable_contracts.test.js
 node --test tool/security_contracts.test.js
 git diff --check -- \
+  .gitignore \
+  SECURITY.md \
   firebase.json \
   firestore.rules \
   storage.rules \
+  android \
+  ios \
   functions/index.js \
   lib/main.dart \
+  pubspec.yaml \
   test/widget_test.dart \
   tool \
   firebase_test \
+  public \
   package.json \
   README.md
 

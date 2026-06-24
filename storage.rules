@@ -32,31 +32,87 @@ service firebase.storage {
         || request.time.dayOfWeek() == 7;
     }
 
+    function isLateMondayUploadWindowOpen() {
+      return request.time.dayOfWeek() == 1
+        || (
+          request.time.dayOfWeek() == 7
+          && request.time.time() >= duration.time(22, 0, 0, 0)
+        );
+    }
+
+    function isLateMondayUpload() {
+      return "lateUpload" in request.resource.metadata
+        && "rewardedAdWatched" in request.resource.metadata
+        && request.resource.metadata.lateUpload == "true"
+        && request.resource.metadata.rewardedAdWatched == "true";
+    }
+
+    function isJpegUpload() {
+      return request.resource.contentType == "image/jpeg";
+    }
+
+    function isUserProfilePhotoFileName(fileName) {
+      return fileName.matches("base_[0-9]+\\.jpg");
+    }
+
+    function isGroupProfilePhotoFileName(fileName) {
+      return fileName.matches("group_[0-9]+\\.jpg");
+    }
+
     function isValidSelfieUpload(groupId, weekKey, fileName) {
       return isMember(groupId)
-        && isSundayUploadWindowOpen()
+        && (
+          isSundayUploadWindowOpen()
+          || (
+            isLateMondayUploadWindowOpen()
+            && isLateMondayUpload()
+          )
+        )
         && request.resource != null
         && fileName == request.auth.uid + ".jpg"
         && request.resource.size < 10 * 1024 * 1024
-        && request.resource.contentType.matches("image/.*")
+        && isJpegUpload()
         && request.resource.metadata.groupId == groupId
         && request.resource.metadata.weekKey == weekKey
         && request.resource.metadata.uid == request.auth.uid;
     }
 
-    function isValidProfilePhotoUpload(userId) {
+    function isValidSelfieThumbnailUpload(groupId, weekKey, fileName) {
+      return isMember(groupId)
+        && (
+          isSundayUploadWindowOpen()
+          || (
+            isLateMondayUploadWindowOpen()
+            && isLateMondayUpload()
+          )
+        )
+        && request.resource != null
+        && fileName == request.auth.uid + ".jpg"
+        && request.resource.size < 2 * 1024 * 1024
+        && isJpegUpload()
+        && request.resource.metadata.groupId == groupId
+        && request.resource.metadata.weekKey == weekKey
+        && request.resource.metadata.uid == request.auth.uid
+        && request.resource.metadata.kind == "selfieThumb";
+    }
+
+    function isValidProfilePhotoUpload(userId, fileName) {
       return isSignedIn()
         && request.auth.uid == userId
         && request.resource != null
+        && isUserProfilePhotoFileName(fileName)
         && request.resource.size < 8 * 1024 * 1024
-        && request.resource.contentType.matches("image/.*");
+        && isJpegUpload()
+        && request.resource.metadata.uid == userId
+        && request.resource.metadata.kind == "profilePhoto";
     }
 
-    function isValidGroupPhotoUpload(groupId) {
+    function isValidGroupPhotoUpload(groupId, fileName) {
       return isAdmin(groupId)
         && request.resource != null
+        && isGroupProfilePhotoFileName(fileName)
         && request.resource.size < 8 * 1024 * 1024
-        && request.resource.contentType.matches("image/.*")
+        && isJpegUpload()
         && request.resource.metadata.groupId == groupId
         && request.resource.metadata.uid == request.auth.uid
         && request.resource.metadata.kind == "groupPhoto";
@@ -70,10 +126,18 @@ service firebase.storage {
       allow update, delete: if false;
     }
 
+    match /groups/{groupId}/weeks/{weekKey}/thumbs/{fileName} {
+      allow read: if isMember(groupId);
+
+      allow create: if isValidSelfieThumbnailUpload(groupId, weekKey, fileName);
+
+      allow update, delete: if false;
+    }
+
     match /groups/{groupId}/profile/{fileName} {
       allow read: if isMember(groupId);
 
-      allow create, update: if isValidGroupPhotoUpload(groupId);
+      allow create, update: if isValidGroupPhotoUpload(groupId, fileName);
 
       allow delete: if isAdmin(groupId);
     }
@@ -81,9 +145,9 @@ service firebase.storage {
     match /users/{userId}/profile/{fileName} {
       allow read: if isSignedIn();
 
-      allow create: if isValidProfilePhotoUpload(userId);
+      allow create: if isValidProfilePhotoUpload(userId, fileName);
 
-      allow update: if isValidProfilePhotoUpload(userId);
+      allow update: if isValidProfilePhotoUpload(userId, fileName);
 
       allow delete: if isSignedIn()
         && request.auth.uid == userId;

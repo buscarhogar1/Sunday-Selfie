@@ -88,11 +88,20 @@
 	<key>NSCameraUsageDescription</key>
 	<string>La app necesita acceso a la cámara para publicar selfies.</string>
 
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>La app necesita guardar las selfies descargadas en Fotos.</string>
+
 	<key>NSUserNotificationsUsageDescription</key>
 	<string>Sunday Selfie quiere enviarte recordatorios para subir tu selfie semanal y avisarte de actividad en tus grupos.</string>
 
 	<key>FirebaseMessagingAutoInitEnabled</key>
 	<true/>
+
+	<key>GADApplicationIdentifier</key>
+	<string>ca-app-pub-3940256099942544~1458002511</string>
+
+	<key>FlutterDeepLinkingEnabled</key>
+	<false/>
 
 </dict>
 </plist>

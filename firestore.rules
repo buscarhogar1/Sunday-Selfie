@@ -66,6 +66,9 @@ service cloud.firestore {
           "authorName",
           "authorPhotoUrl",
           "text",
+          "type",
+          "gifUrl",
+          "gifLabel",
           "weekKey",
           "createdAt"
         ])
@@ -79,9 +82,39 @@ service cloud.firestore {
           || request.resource.data.authorPhotoUrl is string
         )
         && request.resource.data.text is string
-        && request.resource.data.text.size() > 0
         && request.resource.data.text.size() <= 500
+        && (
+          request.resource.data.gifUrl == null
+          || isValidTenorGifUrl(request.resource.data.gifUrl)
+        )
+        && (
+          request.resource.data.gifLabel == null
+          || (
+            request.resource.data.gifLabel is string
+            && request.resource.data.gifLabel.size() <= 80
+          )
+        )
+        && (
+          request.resource.data.type == null
+          || request.resource.data.type == "text"
+          || request.resource.data.type == "gif"
+          || request.resource.data.type == "mixed"
+        )
+        && (
+          request.resource.data.text.size() > 0
+          || (
+            request.resource.data.gifUrl is string
+            && request.resource.data.gifUrl.size() > 0
+          )
+        )
         && request.resource.data.createdAt == request.time;
+    }
+
+    function isValidTenorGifUrl(value) {
+      return value is string
+        && value.size() > 0
+        && value.size() <= 2000
+        && value.matches("^https://media\\.tenor\\.com/[^\\s]+$");
     }
 
     function validGroupActivityUpdate(groupId) {
@@ -153,68 +186,29 @@ service cloud.firestore {
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           "effectiveName",
           "effectivePhotoUrl",
+          "groupNameOverride",
           "profileSyncedAt"
         ])
         && (
           request.resource.data.effectiveName == null
-          || request.resource.data.effectiveName is string
+          || (
+            request.resource.data.effectiveName is string
+            && request.resource.data.effectiveName.size() <= 80
+          )
         )
         && (
           request.resource.data.effectivePhotoUrl == null
           || request.resource.data.effectivePhotoUrl is string
         )
-        && request.resource.data.profileSyncedAt == request.time;
-    }
-
-    function validActiveInviteCodeForGroup(groupId, inviteCode) {
-      return inviteCode is string
-        && inviteCode.matches("[A-Z2-9]{10}")
-        && exists(/databases/$(database)/documents/inviteCodes/$(inviteCode))
-        && get(/databases/$(database)/documents/inviteCodes/$(inviteCode)).data.active == true
-        && get(/databases/$(database)/documents/inviteCodes/$(inviteCode)).data.groupId == groupId;
-    }
-
-    function validLegacyInviteCodeForGroup(groupId, inviteCode) {
-      return inviteCode is string
-        && inviteCode == "TEMP-" + groupId
-        && get(/databases/$(database)/documents/groups/$(groupId)).data.inviteCode == inviteCode;
-    }
-
-    function validInviteCodeForJoinRequest(groupId) {
-      let inviteCode = request.resource.data.inviteCodeUsed;
-      return validActiveInviteCodeForGroup(groupId, inviteCode)
-        || validLegacyInviteCodeForGroup(groupId, inviteCode);
-    }
-
-    function validJoinRequestCreate(groupId, requestUid) {
-      return isSignedIn()
-        && requestUid == uid()
-        && exists(/databases/$(database)/documents/groups/$(groupId))
-        && get(/databases/$(database)/documents/groups/$(groupId)).data.deleted != true
-        && !isMember(groupId, uid())
-        && !isBlockedFromGroup(groupId, uid())
-        && get(/databases/$(database)/documents/groups/$(groupId)).data.memberCount < 30
-        && request.resource.data.keys().hasOnly([
-          "uid",
-          "baseName",
-          "basePhotoUrl",
-          "status",
-          "inviteCodeUsed",
-          "requestedAt",
-          "updatedAt"
-        ])
-        && request.resource.data.uid == uid()
-        && request.resource.data.baseName is string
-        && request.resource.data.baseName.size() > 0
-        && request.resource.data.baseName.size() <= 80
         && (
-          request.resource.data.basePhotoUrl == null
-          || request.resource.data.basePhotoUrl is string
+          request.resource.data.groupNameOverride == null
+          || (
+            request.resource.data.groupNameOverride is string
+            && request.resource.data.groupNameOverride.size() > 0
+            && request.resource.data.groupNameOverride.size() <= 80
+          )
         )
-        && request.resource.data.status == "pending"
-        && request.resource.data.requestedAt == request.time
-        && request.resource.data.updatedAt == request.time
-        && validInviteCodeForJoinRequest(groupId);
+        && request.resource.data.profileSyncedAt == request.time;
     }
 
     match /users/{userId} {
@@ -255,6 +249,11 @@ service cloud.firestore {
 
     match /reports/{reportId} {
       allow read, create, update, delete: if false;
+    }
+
+    match /suggestions/{suggestionId} {
+      allow read, update, delete: if false;
+      allow create: if false;
     }
 
     match /inviteCodes/{inviteCode} {
@@ -306,7 +305,7 @@ service cloud.firestore {
 
       match /joinRequests/{requestUid} {
 
-        allow create: if validJoinRequestCreate(groupId, requestUid);
+        allow create: if false;
 
         allow read: if isSignedIn()
           && (
