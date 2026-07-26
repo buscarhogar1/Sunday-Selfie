@@ -1,19 +1,37 @@
 #!/usr/bin/env ruby
-# Makes the Runner target inherit the CocoaPods build settings explicitly.
-# Xcode Cloud can otherwise compile GeneratedPluginRegistrant.m without the
-# Pods framework/module search paths.
-
-require "xcodeproj"
+# Makes the Flutter xcconfig files inherit the CocoaPods build settings
+# explicitly. Xcode Cloud can otherwise compile GeneratedPluginRegistrant.m
+# without the Pods framework/module search paths.
 
 repo_root = ENV["REPO_ROOT"] || File.expand_path("../..", __dir__)
 ios_dir = File.join(repo_root, "ios")
-project_path = File.join(ios_dir, "Runner.xcodeproj")
 pods_support_dir = File.join(
   ios_dir,
   "Pods",
   "Target Support Files",
   "Pods-Runner"
 )
+
+BEGIN_MARKER = "// BEGIN XCODE CLOUD PODS SETTINGS"
+END_MARKER = "// END XCODE CLOUD PODS SETTINGS"
+
+SETTINGS_TO_COPY = %w[
+  ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES
+  CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER
+  FRAMEWORK_SEARCH_PATHS
+  GCC_PREPROCESSOR_DEFINITIONS
+  HEADER_SEARCH_PATHS
+  LIBRARY_SEARCH_PATHS
+  OTHER_LDFLAGS
+  OTHER_MODULE_VERIFIER_FLAGS
+  OTHER_SWIFT_FLAGS
+  PODS_BUILD_DIR
+  PODS_CONFIGURATION_BUILD_DIR
+  PODS_PODFILE_DIR_PATH
+  PODS_ROOT
+  PODS_XCFRAMEWORKS_BUILD_DIR
+  USE_RECURSIVE_SCRIPT_INPUTS_IN_SCRIPT_PHASES
+].freeze
 
 def parse_xcconfig(path)
   settings = {}
@@ -31,53 +49,57 @@ def parse_xcconfig(path)
   settings
 end
 
-project = Xcodeproj::Project.open(project_path)
-runner = project.targets.find { |target| target.name == "Runner" }
-abort "Runner target not found in #{project_path}" unless runner
+def without_generated_block(content)
+  skipping = false
+  output = []
 
-settings_to_copy = %w[
-  ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES
-  CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER
-  FRAMEWORK_SEARCH_PATHS
-  GCC_PREPROCESSOR_DEFINITIONS
-  HEADER_SEARCH_PATHS
-  LIBRARY_SEARCH_PATHS
-  OTHER_LDFLAGS
-  OTHER_MODULE_VERIFIER_FLAGS
-  OTHER_SWIFT_FLAGS
-  PODS_BUILD_DIR
-  PODS_CONFIGURATION_BUILD_DIR
-  PODS_PODFILE_DIR_PATH
-  PODS_ROOT
-  PODS_XCFRAMEWORKS_BUILD_DIR
-  USE_RECURSIVE_SCRIPT_INPUTS_IN_SCRIPT_PHASES
-]
+  content.lines.each do |line|
+    stripped = line.strip
 
-runner.build_configurations.each do |configuration|
-  pods_config = configuration.name.downcase
-  xcconfig_path = File.join(
-    pods_support_dir,
-    "Pods-Runner.#{pods_config}.xcconfig"
-  )
+    if stripped == BEGIN_MARKER
+      skipping = true
+      next
+    end
 
-  unless File.exist?(xcconfig_path)
-    warn "Skipping #{configuration.name}: #{xcconfig_path} does not exist"
-    next
+    if stripped == END_MARKER
+      skipping = false
+      next
+    end
+
+    output << line unless skipping
   end
 
-  pods_settings = parse_xcconfig(xcconfig_path)
+  "#{output.join.rstrip}\n"
+end
 
-  settings_to_copy.each do |key|
+def patch_flutter_xcconfig(ios_dir, pods_support_dir, flutter_config, pods_config)
+  flutter_path = File.join(ios_dir, "Flutter", "#{flutter_config}.xcconfig")
+  pods_path = File.join(pods_support_dir, "Pods-Runner.#{pods_config}.xcconfig")
+
+  abort "Missing #{flutter_path}" unless File.exist?(flutter_path)
+  abort "Missing #{pods_path}" unless File.exist?(pods_path)
+
+  pods_settings = parse_xcconfig(pods_path)
+  generated_settings = []
+  SETTINGS_TO_COPY.each do |key|
     value = pods_settings[key]
-    configuration.build_settings[key] = value if value && !value.empty?
+    generated_settings << "#{key} = #{value}" if value && !value.empty?
   end
 
-  configuration.build_settings["CLANG_ENABLE_MODULES"] = "YES"
+  patched = without_generated_block(File.read(flutter_path))
+  patched << "\n"
+  patched << BEGIN_MARKER << "\n"
+  patched << generated_settings.join("\n") << "\n"
+  patched << "CLANG_ENABLE_MODULES = YES\n"
+  patched << END_MARKER << "\n"
+
+  if ENV["DRY_RUN"] == "1"
+    puts "Dry run: would patch #{flutter_path} from #{pods_path}"
+  else
+    File.write(flutter_path, patched)
+    puts "Patched #{flutter_path} with Pods settings from #{pods_path}"
+  end
 end
 
-if ENV["DRY_RUN"] == "1"
-  puts "Dry run: Runner Pods settings are readable."
-else
-  project.save
-  puts "Runner target now has explicit Pods build settings."
-end
+patch_flutter_xcconfig(ios_dir, pods_support_dir, "Debug", "debug")
+patch_flutter_xcconfig(ios_dir, pods_support_dir, "Release", "release")
