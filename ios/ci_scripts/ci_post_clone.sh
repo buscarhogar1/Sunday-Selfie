@@ -9,6 +9,10 @@ export LC_ALL=en_US.UTF-8
 REPO_ROOT="${CI_PRIMARY_REPOSITORY_PATH:-$(cd "$(dirname "$0")/../.." && pwd)}"
 cd "$REPO_ROOT"
 
+echo "Cleaning generated Flutter and CocoaPods files..."
+rm -f .flutter-plugins-dependencies
+rm -rf .dart_tool ios/.symlinks ios/Pods ios/Podfile.lock
+
 if [ ! -d "$HOME/flutter" ]; then
   echo "Installing Flutter stable..."
   git clone https://github.com/flutter/flutter.git --depth 1 -b stable "$HOME/flutter"

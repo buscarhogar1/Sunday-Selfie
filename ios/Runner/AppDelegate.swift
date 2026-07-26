@@ -9,6 +9,11 @@ import UIKit
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var mediaSaverChannel: FlutterMethodChannel?
   private var volumeButtonsChannel: FlutterMethodChannel?
+  private var deepLinksChannel: FlutterMethodChannel?
+  private var deepLinksEventChannel: FlutterEventChannel?
+  private let deepLinksStreamHandler = SundayDeepLinksStreamHandler()
+  private var initialDeepLink: String?
+  private var latestDeepLink: String?
   private var volumeButtonCaptureEnabled = false
   private var captureEventInteraction: UIInteraction?
   private weak var captureEventView: UIView?
@@ -24,14 +29,39 @@ import UIKit
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    if let url = Self.deepLinkURL(from: launchOptions) {
+      recordDeepLink(url)
+    }
+
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    let messenger = engineBridge.applicationRegistrar.messenger()
+
+    deepLinksChannel = FlutterMethodChannel(
+      name: "sunday_selfie/deep_links",
+      binaryMessenger: messenger
+    )
+    deepLinksChannel?.setMethodCallHandler { [weak self] call, result in
+      guard call.method == "getInitialLink" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+
+      result(self?.initialDeepLink ?? self?.latestDeepLink)
+    }
+
+    deepLinksEventChannel = FlutterEventChannel(
+      name: "sunday_selfie/deep_links/events",
+      binaryMessenger: messenger
+    )
+    deepLinksEventChannel?.setStreamHandler(deepLinksStreamHandler)
+
     mediaSaverChannel = FlutterMethodChannel(
       name: "sunday_selfie/media_saver",
-      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+      binaryMessenger: messenger
     )
     mediaSaverChannel?.setMethodCallHandler { [weak self] call, result in
       guard call.method == "saveImagesToGallery" else {
@@ -44,7 +74,7 @@ import UIKit
 
     volumeButtonsChannel = FlutterMethodChannel(
       name: "sunday_selfie/volume_buttons",
-      binaryMessenger: engineBridge.applicationRegistrar.messenger()
+      binaryMessenger: messenger
     )
     volumeButtonsChannel?.setMethodCallHandler { [weak self] call, result in
       guard call.method == "setCaptureEnabled" else {
@@ -57,6 +87,79 @@ import UIKit
       self?.setVolumeButtonCaptureEnabled(enabled)
       result(nil)
     }
+  }
+
+  override func application(
+    _ application: UIApplication,
+    open url: URL,
+    options: [UIApplication.OpenURLOptionsKey: Any] = [:]
+  ) -> Bool {
+    let handledDeepLink = recordDeepLink(url)
+    return super.application(application, open: url, options: options) || handledDeepLink
+  }
+
+  override func application(
+    _ application: UIApplication,
+    continue userActivity: NSUserActivity,
+    restorationHandler: @escaping ([UIUserActivityRestoring]?) -> Void
+  ) -> Bool {
+    let handledDeepLink: Bool
+    if let url = userActivity.webpageURL {
+      handledDeepLink = recordDeepLink(url)
+    } else {
+      handledDeepLink = false
+    }
+
+    return super.application(
+      application,
+      continue: userActivity,
+      restorationHandler: restorationHandler
+    ) || handledDeepLink
+  }
+
+  @discardableResult
+  func recordDeepLink(_ url: URL) -> Bool {
+    guard Self.isSundaySelfieDeepLink(url) else { return false }
+
+    let value = url.absoluteString
+    if initialDeepLink == nil {
+      initialDeepLink = value
+    }
+    latestDeepLink = value
+    deepLinksStreamHandler.send(value)
+    return true
+  }
+
+  private static func deepLinkURL(
+    from launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  ) -> URL? {
+    guard let launchOptions = launchOptions else { return nil }
+
+    if let url = launchOptions[.url] as? URL {
+      return url
+    }
+
+    if let activities = launchOptions[.userActivityDictionary] as? [AnyHashable: Any] {
+      for value in activities.values {
+        if let activity = value as? NSUserActivity, let url = activity.webpageURL {
+          return url
+        }
+      }
+    }
+
+    return nil
+  }
+
+  private static func isSundaySelfieDeepLink(_ url: URL) -> Bool {
+    guard url.scheme?.lowercased() == "https" else { return false }
+
+    let host = url.host?.lowercased()
+    guard host == "sundayselfie.app" || host == "www.sundayselfie.app" else {
+      return false
+    }
+
+    let firstPathComponent = url.pathComponents.dropFirst().first?.lowercased()
+    return ["j", "join", "invite"].contains(firstPathComponent ?? "")
   }
 
   private var flutterRootView: UIView? {
@@ -317,5 +420,26 @@ import UIKit
         }
       }
     }
+  }
+}
+
+private final class SundayDeepLinksStreamHandler: NSObject, FlutterStreamHandler {
+  private var eventSink: FlutterEventSink?
+
+  func onListen(
+    withArguments arguments: Any?,
+    eventSink events: @escaping FlutterEventSink
+  ) -> FlutterError? {
+    eventSink = events
+    return nil
+  }
+
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    eventSink = nil
+    return nil
+  }
+
+  func send(_ value: String) {
+    eventSink?(value)
   }
 }

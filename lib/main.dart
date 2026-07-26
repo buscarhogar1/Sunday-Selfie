@@ -4,7 +4,6 @@ import 'dart:math' as math;
 import 'dart:ui';
 import 'dart:convert';
 
-import 'package:app_links/app_links.dart';
 import 'package:camera/camera.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_app_check/firebase_app_check.dart';
@@ -41,6 +40,12 @@ const MethodChannel mediaSaverChannel = MethodChannel(
 const MethodChannel volumeButtonsChannel = MethodChannel(
   'sunday_selfie/volume_buttons',
 );
+const MethodChannel deepLinksMethodChannel = MethodChannel(
+  'sunday_selfie/deep_links',
+);
+const EventChannel deepLinksEventChannel = EventChannel(
+  'sunday_selfie/deep_links/events',
+);
 const int kMontageCaptureMaxPixels = 12000000;
 const double kMontageCaptureMaxPixelRatio = 3;
 const double kMontageCaptureMinPixelRatio = 0.65;
@@ -48,6 +53,34 @@ const double kMontageCaptureMinPixelRatio = 0.65;
 void logDebug(String message) {
   if (kDebugMode) {
     debugPrint(message);
+  }
+}
+
+class SundayDeepLinks {
+  Stream<Uri> get uriLinkStream {
+    if (!Platform.isIOS) return const Stream<Uri>.empty();
+
+    return deepLinksEventChannel
+        .receiveBroadcastStream()
+        .where((event) => event is String && event.trim().isNotEmpty)
+        .map((event) => Uri.parse((event as String).trim()));
+  }
+
+  Future<Uri?> getInitialLink() async {
+    if (!Platform.isIOS) return null;
+
+    try {
+      final value = await deepLinksMethodChannel.invokeMethod<String>(
+        'getInitialLink',
+      );
+      if (value == null || value.trim().isEmpty) return null;
+      return Uri.tryParse(value.trim());
+    } on MissingPluginException {
+      return null;
+    } catch (error) {
+      logDebug('No se pudo leer el enlace nativo inicial: $error');
+      return null;
+    }
   }
 }
 
@@ -2785,7 +2818,7 @@ const Map<String, Map<String, String>> kSundayExtraTranslations = {
     'Chat de domingo finalizado': 'Sunday chat finished',
     'CHAT · {weekLabel}': 'CHAT · {weekLabel}',
     'Minimizar chat': 'Minimize chat',
-    'Buscar en Tenor': 'Search Tenor',
+    'Buscar en GIPHY': 'Search GIPHY',
     'Buscar GIFs': 'Search GIFs',
     'Todos': 'All',
     'Favoritos': 'Favorites',
@@ -3068,7 +3101,7 @@ const Map<String, Map<String, String>> kSundayExtraTranslations = {
     'Chat de domingo finalizado': 'Chat du dimanche terminé',
     'CHAT · {weekLabel}': 'CHAT · {weekLabel}',
     'Minimizar chat': 'Réduire le chat',
-    'Buscar en Tenor': 'Rechercher sur Tenor',
+    'Buscar en GIPHY': 'Rechercher sur GIPHY',
     'Buscar GIFs': 'Rechercher des GIF',
     'Todos': 'Tous',
     'Favoritos': 'Favoris',
@@ -10158,20 +10191,24 @@ Future<void> publicarSelfieReal({
   }
 
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable(
-      'registrarSelfie',
+    await llamarCallableAutenticadoConReintento(
+      name: 'registrarSelfie',
+      data: {
+        'groupId': groupId,
+        if (targetWeekKey != currentWeekKey) 'weekKey': targetWeekKey,
+        if (isLateMondayUpload || isRewardedReplacement)
+          'rewardedAdWatched': true,
+        if (isRewardedReplacement) 'replaceExisting': true,
+        'replacementUploadId': ?replacementUploadId,
+      },
     );
-
-    await callable.call<void>({
-      'groupId': groupId,
-      if (targetWeekKey != currentWeekKey) 'weekKey': targetWeekKey,
-      if (isLateMondayUpload || isRewardedReplacement)
-        'rewardedAdWatched': true,
-      if (isRewardedReplacement) 'replaceExisting': true,
-      'replacementUploadId': ?replacementUploadId,
-    });
   } on FirebaseFunctionsException catch (error) {
-    throw Exception(error.message ?? 'No se pudo registrar la selfie');
+    throw Exception(
+      mensajeErrorFirebaseFunction(
+        error,
+        fallback: 'No se pudo registrar la selfie',
+      ),
+    );
   }
 }
 
@@ -11751,7 +11788,7 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> {
-  final AppLinks _appLinks = AppLinks();
+  final SundayDeepLinks _deepLinks = SundayDeepLinks();
   late final SundayClock _sundayClock;
   late Future<void> appStartupFuture;
   StreamSubscription<Uri>? _linkSubscription;
@@ -11784,7 +11821,7 @@ class _MyAppState extends State<MyApp> {
     }
 
     _postStartupServicesStarted = true;
-    _linkSubscription = _appLinks.uriLinkStream.listen(
+    _linkSubscription = _deepLinks.uriLinkStream.listen(
       _handleIncomingLink,
       onError: (error) {
         logDebug('No se pudo leer el enlace de invitación: $error');
@@ -11822,7 +11859,7 @@ class _MyAppState extends State<MyApp> {
 
   Future<void> _handleInitialLink() async {
     try {
-      final uri = await _appLinks.getInitialLink();
+      final uri = await _deepLinks.getInitialLink();
       if (uri == null) return;
       await _handleIncomingLink(uri);
     } catch (error) {
@@ -21717,13 +21754,13 @@ class SundayChatGif {
 class SundayGifSearchResult {
   final List<SundayChatGif> gifs;
   final String next;
-  final bool fromTenor;
+  final bool fromGiphy;
   final String? errorMessage;
 
   const SundayGifSearchResult({
     required this.gifs,
     required this.next,
-    required this.fromTenor,
+    required this.fromGiphy,
     this.errorMessage,
   });
 }
@@ -21760,15 +21797,15 @@ class SundayGifRepository {
       return SundayGifSearchResult(
         gifs: gifs,
         next: (data['next'] ?? '').toString(),
-        fromTenor: true,
+        fromGiphy: (data['source'] ?? '').toString() == 'giphy',
       );
     } catch (error) {
-      logDebug('No se pudo cargar GIFs de Tenor: $error');
+      logDebug('No se pudo cargar GIFs de GIPHY: $error');
 
       return SundayGifSearchResult(
         gifs: const [],
         next: '',
-        fromTenor: false,
+        fromGiphy: false,
         errorMessage: _searchErrorMessage(
           error,
           paginating: cleanPos.isNotEmpty,
@@ -21781,7 +21818,7 @@ class SundayGifRepository {
     if (value is! Map) return null;
 
     final url = (value['url'] ?? '').toString().trim();
-    if (!_isTenorMediaUrl(url)) return null;
+    if (!_isTrustedGifMediaUrl(url)) return null;
 
     final label = (value['label'] ?? 'GIF').toString().trim();
     final rawKeywords = value['keywords'];
@@ -21799,12 +21836,14 @@ class SundayGifRepository {
     );
   }
 
-  static bool _isTenorMediaUrl(String url) {
+  static bool _isTrustedGifMediaUrl(String url) {
     final uri = Uri.tryParse(url);
-    return uri != null &&
-        uri.scheme == 'https' &&
-        uri.host == 'media.tenor.com' &&
-        uri.path.isNotEmpty;
+    if (uri == null || uri.scheme != 'https' || uri.path.isEmpty) {
+      return false;
+    }
+
+    return uri.host == 'media.tenor.com' ||
+        RegExp(r'^media\d*\.giphy\.com$').hasMatch(uri.host);
   }
 
   static String _searchErrorMessage(Object error, {required bool paginating}) {
@@ -21847,7 +21886,7 @@ class _SundayGifPickerSheetState extends State<SundayGifPickerSheet> {
   String? errorMessage;
   bool loading = true;
   bool loadingMore = false;
-  bool showingTenorResults = false;
+  bool showingGiphyResults = false;
   int requestGeneration = 0;
 
   @override
@@ -21922,12 +21961,12 @@ class _SundayGifPickerSheetState extends State<SundayGifPickerSheet> {
     setState(() {
       if (reset) {
         gifs = result.gifs;
-        showingTenorResults = result.fromTenor;
+        showingGiphyResults = result.fromGiphy;
         errorMessage = result.errorMessage;
       } else {
         final seenUrls = gifs.map((gif) => gif.url).toSet();
         gifs = [...gifs, ...result.gifs.where((gif) => seenUrls.add(gif.url))];
-        showingTenorResults = showingTenorResults || result.fromTenor;
+        showingGiphyResults = showingGiphyResults || result.fromGiphy;
         errorMessage = result.errorMessage;
       }
 
@@ -22011,8 +22050,8 @@ class _SundayGifPickerSheetState extends State<SundayGifPickerSheet> {
                         color: ssText3,
                         size: 20,
                       ),
-                      hintText: showingTenorResults
-                          ? context.tr('Buscar en Tenor')
+                      hintText: showingGiphyResults
+                          ? context.tr('Buscar en GIPHY')
                           : context.tr('Buscar GIFs'),
                       hintStyle: const TextStyle(
                         color: ssText3,
@@ -22126,13 +22165,13 @@ class _SundayGifPickerSheetState extends State<SundayGifPickerSheet> {
                         },
                       ),
               ),
-              if (showingTenorResults)
+              if (showingGiphyResults)
                 const Padding(
                   padding: EdgeInsets.fromLTRB(18, 0, 18, 12),
                   child: Align(
                     alignment: Alignment.centerRight,
                     child: Text(
-                      'Powered by Tenor',
+                      'Powered by GIPHY',
                       style: TextStyle(
                         color: ssText3,
                         fontSize: 10,
