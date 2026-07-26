@@ -9,3 +9,6 @@ if [ ! -f "$REPO_ROOT/ios/Flutter/Generated.xcconfig" ] || [ ! -d "$REPO_ROOT/io
 else
   echo "Flutter and Pods files are ready."
 fi
+
+echo "Patching Runner target with explicit Pods build settings..."
+REPO_ROOT="$REPO_ROOT" ruby "$REPO_ROOT/ios/ci_scripts/patch_runner_pods_settings.rb"
