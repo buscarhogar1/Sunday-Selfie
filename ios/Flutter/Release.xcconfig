@@ -1,2 +1,4 @@
 #include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"
 #include "Generated.xcconfig"
+SWIFT_ENABLE_EXPLICIT_MODULES=NO
+_EXPERIMENTAL_SWIFT_EXPLICIT_MODULES=NO

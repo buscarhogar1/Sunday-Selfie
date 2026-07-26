@@ -46,6 +46,8 @@ post_install do |installer|
       flags = flags.is_a?(Array) ? flags : [flags]
       flags += ['-enable-experimental-feature', 'AccessLevelOnImport']
       config.build_settings['OTHER_SWIFT_FLAGS'] = flags
+      config.build_settings['SWIFT_ENABLE_EXPLICIT_MODULES'] = 'NO'
+      config.build_settings['_EXPERIMENTAL_SWIFT_EXPLICIT_MODULES'] = 'NO'
     end
   end
 end

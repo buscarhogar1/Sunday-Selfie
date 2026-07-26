@@ -18,7 +18,9 @@ export PATH="$HOME/flutter/bin:$PATH"
 
 flutter --version
 flutter precache --ios
+flutter clean
 flutter pub get
+flutter build ios --release --no-codesign --config-only
 
 echo "Installing iOS pods..."
 cd "$REPO_ROOT/ios"
