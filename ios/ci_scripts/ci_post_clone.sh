@@ -3,6 +3,9 @@ set -e
 
 echo "Preparing Flutter project for Xcode Cloud..."
 
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
 REPO_ROOT="${CI_PRIMARY_REPOSITORY_PATH:-$(cd "$(dirname "$0")/../.." && pwd)}"
 cd "$REPO_ROOT"
 
