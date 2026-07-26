@@ -18,6 +18,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:google_sign_in/google_sign_in.dart';
@@ -37,11 +38,27 @@ const MethodChannel foregroundNotificationChannel = MethodChannel(
 const MethodChannel mediaSaverChannel = MethodChannel(
   'sunday_selfie/media_saver',
 );
+const MethodChannel volumeButtonsChannel = MethodChannel(
+  'sunday_selfie/volume_buttons',
+);
+const int kMontageCaptureMaxPixels = 12000000;
+const double kMontageCaptureMaxPixelRatio = 3;
+const double kMontageCaptureMinPixelRatio = 0.65;
 
 void logDebug(String message) {
   if (kDebugMode) {
     debugPrint(message);
   }
+}
+
+double calcularPixelRatioCapturaMontaje(Size size) {
+  final area = size.width * size.height;
+  if (area <= 0 || !area.isFinite) return 1;
+
+  final cappedRatio = math.sqrt(kMontageCaptureMaxPixels / area);
+  return cappedRatio
+      .clamp(kMontageCaptureMinPixelRatio, kMontageCaptureMaxPixelRatio)
+      .toDouble();
 }
 
 class LocalPhotoCache {
@@ -885,26 +902,2326 @@ class SundayClockScope extends InheritedNotifier<SundayClock> {
   }
 }
 
-Future<void> main() async {
+const String kDefaultSundayLanguageCode = 'es';
+
+class SundayLanguageOption {
+  final String code;
+  final String nativeName;
+
+  const SundayLanguageOption({required this.code, required this.nativeName});
+}
+
+const List<SundayLanguageOption> kSundayLanguageOptions = [
+  SundayLanguageOption(code: 'es', nativeName: 'Español'),
+  SundayLanguageOption(code: 'en', nativeName: 'English'),
+  SundayLanguageOption(code: 'fr', nativeName: 'Français'),
+  SundayLanguageOption(code: 'de', nativeName: 'Deutsch'),
+  SundayLanguageOption(code: 'it', nativeName: 'Italiano'),
+  SundayLanguageOption(code: 'pt', nativeName: 'Português'),
+  SundayLanguageOption(code: 'nl', nativeName: 'Nederlands'),
+  SundayLanguageOption(code: 'pl', nativeName: 'Polski'),
+  SundayLanguageOption(code: 'ro', nativeName: 'Română'),
+];
+
+const Set<String> kSundaySupportedLanguageCodes = {
+  'es',
+  'en',
+  'fr',
+  'de',
+  'it',
+  'pt',
+  'nl',
+  'pl',
+  'ro',
+};
+
+const List<Locale> kSundaySupportedLocales = [
+  Locale('es'),
+  Locale('en'),
+  Locale('fr'),
+  Locale('de'),
+  Locale('it'),
+  Locale('pt'),
+  Locale('nl'),
+  Locale('pl'),
+  Locale('ro'),
+];
+
+class SundayLanguageController extends ChangeNotifier {
+  String _languageCode = _deviceLanguageCode();
+
+  String get languageCode => _languageCode;
+  Locale get locale => Locale(_languageCode);
+
+  static String normalize(String? code) {
+    final normalized = code?.trim().toLowerCase().split(RegExp('[-_]')).first;
+    if (normalized == null || normalized.isEmpty) {
+      return kDefaultSundayLanguageCode;
+    }
+    return kSundaySupportedLanguageCodes.contains(normalized)
+        ? normalized
+        : kDefaultSundayLanguageCode;
+  }
+
+  static String _deviceLanguageCode() {
+    final deviceCode = PlatformDispatcher.instance.locale.languageCode;
+    return normalize(deviceCode);
+  }
+
+  void setLanguageCode(String code) {
+    final nextCode = normalize(code);
+    if (_languageCode == nextCode) return;
+
+    _languageCode = nextCode;
+    notifyListeners();
+  }
+
+  void syncFromUserData(Map<String, dynamic>? userData) {
+    final rawLanguageCode = userData?['languageCode'];
+    if (rawLanguageCode is! String || rawLanguageCode.trim().isEmpty) return;
+    setLanguageCode(rawLanguageCode);
+  }
+}
+
+final SundayLanguageController sundayLanguageController =
+    SundayLanguageController();
+
+class SundayLanguageScope extends InheritedNotifier<SundayLanguageController> {
+  const SundayLanguageScope({
+    super.key,
+    required SundayLanguageController controller,
+    required super.child,
+  }) : super(notifier: controller);
+
+  static String languageCodeOf(BuildContext context) {
+    final scope = context
+        .dependOnInheritedWidgetOfExactType<SundayLanguageScope>();
+    return scope?.notifier?.languageCode ?? kDefaultSundayLanguageCode;
+  }
+}
+
+extension SundayTranslationContext on BuildContext {
+  String tr(String source) {
+    return sundayTranslate(
+      source,
+      languageCode: SundayLanguageScope.languageCodeOf(this),
+    );
+  }
+}
+
+String sundayTranslate(String source, {String? languageCode}) {
+  final code = SundayLanguageController.normalize(
+    languageCode ?? sundayLanguageController.languageCode,
+  );
+  if (code == kDefaultSundayLanguageCode) return source;
+
+  return kSundayTranslations[code]?[source] ??
+      kSundayExtraTranslations[code]?[source] ??
+      kSundayExtraTranslations['en']?[source] ??
+      source;
+}
+
+String sundayLanguageNativeName(String languageCode) {
+  final code = SundayLanguageController.normalize(languageCode);
+  return kSundayLanguageOptions
+      .firstWhere(
+        (language) => language.code == code,
+        orElse: () => kSundayLanguageOptions.first,
+      )
+      .nativeName;
+}
+
+String localizedMonthName(BuildContext context, int month) {
+  if (month < 1 || month > 12) return '';
+  final code = SundayLanguageController.normalize(
+    SundayLanguageScope.languageCodeOf(context),
+  );
+  final monthNames =
+      kSundayLocalizedMonthNames[code] ??
+      kSundayLocalizedMonthNames[kDefaultSundayLanguageCode]!;
+  return monthNames[month - 1];
+}
+
+String localizedMemberSince(BuildContext context, DateTime? createdAt) {
+  if (createdAt == null) return context.tr('Miembro desde ahora');
+
+  final month = localizedMonthName(context, createdAt.month);
+  final year = createdAt.year;
+  switch (SundayLanguageController.normalize(
+    SundayLanguageScope.languageCodeOf(context),
+  )) {
+    case 'en':
+      return 'Member since $month $year';
+    case 'fr':
+      return 'Membre depuis $month $year';
+    case 'de':
+      return 'Mitglied seit $month $year';
+    case 'it':
+      return 'Membro da $month $year';
+    case 'pt':
+      return 'Membro desde $month de $year';
+    case 'nl':
+      return 'Lid sinds $month $year';
+    case 'pl':
+      return 'Członek od $month $year';
+    case 'ro':
+      return 'Membru din $month $year';
+    case 'es':
+    default:
+      return 'Miembro desde $month $year';
+  }
+}
+
+String localizedPublishedSelfies(BuildContext context, int count) {
+  if (count == 1) return context.tr('1 selfie publicado');
+  final translated = context.tr('{count} selfies publicados');
+  return translated.replaceAll('{count}', '$count');
+}
+
+String localizedInviteShareText(BuildContext context, String inviteLink) {
+  return context
+      .tr('Únete a mi grupo de Sunday Selfie: {inviteLink}')
+      .replaceAll('{inviteLink}', inviteLink);
+}
+
+String localizedInviteShareSubject(BuildContext context, String groupName) {
+  return context
+      .tr('Invitación a {groupName}')
+      .replaceAll('{groupName}', groupName);
+}
+
+String localizedJoinGroupTitle(BuildContext context, String groupName) {
+  return context
+      .tr('Únete a "{groupName}"')
+      .replaceAll('{groupName}', groupName);
+}
+
+String localizedSharedVia(BuildContext context, String channelName) {
+  return context
+      .tr('Compartido por {channelName}')
+      .replaceAll('{channelName}', context.tr(channelName));
+}
+
+String localizedWeekLabel(BuildContext context, String weekKey) {
+  final parts = weekKey.split('-W');
+  if (parts.length != 2) return weekKey;
+  return context
+      .tr('Semana {weekNumber} / {year}')
+      .replaceAll('{weekNumber}', parts[1])
+      .replaceAll('{year}', parts[0]);
+}
+
+String localizedShortWeekLabel(BuildContext context, String weekKey) {
+  final parts = weekKey.split('-W');
+  if (parts.length != 2) return weekKey;
+  return context.tr('Semana {weekNumber}').replaceAll('{weekNumber}', parts[1]);
+}
+
+String localizedCompactWeekLabel(
+  BuildContext context,
+  int weekNumber,
+  int year,
+) {
+  return context
+      .tr('Sem {weekNumber} · {year}')
+      .replaceAll('{weekNumber}', '$weekNumber')
+      .replaceAll('{year}', '$year');
+}
+
+String localizedActiveWeekCount(BuildContext context, int count) {
+  if (count == 1) return context.tr('1 semana');
+  return context.tr('{count} semanas').replaceAll('{count}', '$count');
+}
+
+String localizedMissingSundaySelfieStatusLabel(
+  BuildContext context,
+  String weekKey, {
+  DateTime? now,
+}) {
+  return context.tr(missingSundaySelfieStatusLabel(weekKey, now: now));
+}
+
+String localizedDownloadWeeksButtonText(
+  BuildContext context, {
+  required int selectedWeekCount,
+  required int selectedPhotoCount,
+  required bool enabled,
+}) {
+  if (!enabled) return context.tr('Selecciona semanas');
+
+  final weekLabel = selectedWeekCount == 1
+      ? context.tr('semana')
+      : context.tr('semanas');
+  final photoLabel = selectedPhotoCount == 1
+      ? context.tr('foto')
+      : context.tr('fotos');
+  return context
+      .tr('Descargar {weekCount} {weekLabel} · {photoCount} {photoLabel}')
+      .replaceAll('{weekCount}', '$selectedWeekCount')
+      .replaceAll('{weekLabel}', weekLabel)
+      .replaceAll('{photoCount}', '$selectedPhotoCount')
+      .replaceAll('{photoLabel}', photoLabel);
+}
+
+String localizedCountdownSubtitle(
+  BuildContext context,
+  SundayWindowState window,
+) {
+  switch (window.phase) {
+    case SundayWindowPhase.waiting:
+      return context
+          .tr('La subida se abrirá el domingo a las {time}')
+          .replaceAll('{time}', formatWindowTime(window.openAt));
+    case SundayWindowPhase.open:
+      return context
+          .tr('Puedes publicar hasta las {time}')
+          .replaceAll('{time}', formatWindowTime(window.closeAt));
+    case SundayWindowPhase.closed:
+      return context
+          .tr('La subida volverá a abrirse el próximo domingo a las {time}')
+          .replaceAll('{time}', formatWindowTime(window.openAt));
+  }
+}
+
+const Map<String, List<String>> kSundayLocalizedMonthNames = {
+  'es': [
+    'enero',
+    'febrero',
+    'marzo',
+    'abril',
+    'mayo',
+    'junio',
+    'julio',
+    'agosto',
+    'septiembre',
+    'octubre',
+    'noviembre',
+    'diciembre',
+  ],
+  'en': [
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
+  ],
+  'fr': [
+    'janvier',
+    'février',
+    'mars',
+    'avril',
+    'mai',
+    'juin',
+    'juillet',
+    'août',
+    'septembre',
+    'octobre',
+    'novembre',
+    'décembre',
+  ],
+  'de': [
+    'Januar',
+    'Februar',
+    'März',
+    'April',
+    'Mai',
+    'Juni',
+    'Juli',
+    'August',
+    'September',
+    'Oktober',
+    'November',
+    'Dezember',
+  ],
+  'it': [
+    'gennaio',
+    'febbraio',
+    'marzo',
+    'aprile',
+    'maggio',
+    'giugno',
+    'luglio',
+    'agosto',
+    'settembre',
+    'ottobre',
+    'novembre',
+    'dicembre',
+  ],
+  'pt': [
+    'janeiro',
+    'fevereiro',
+    'março',
+    'abril',
+    'maio',
+    'junho',
+    'julho',
+    'agosto',
+    'setembro',
+    'outubro',
+    'novembro',
+    'dezembro',
+  ],
+  'nl': [
+    'januari',
+    'februari',
+    'maart',
+    'april',
+    'mei',
+    'juni',
+    'juli',
+    'augustus',
+    'september',
+    'oktober',
+    'november',
+    'december',
+  ],
+  'pl': [
+    'stycznia',
+    'lutego',
+    'marca',
+    'kwietnia',
+    'maja',
+    'czerwca',
+    'lipca',
+    'sierpnia',
+    'września',
+    'października',
+    'listopada',
+    'grudnia',
+  ],
+  'ro': [
+    'ianuarie',
+    'februarie',
+    'martie',
+    'aprilie',
+    'mai',
+    'iunie',
+    'iulie',
+    'august',
+    'septembrie',
+    'octombrie',
+    'noiembrie',
+    'decembrie',
+  ],
+};
+
+const Map<String, List<String>> kSundayLocalizedWeekdayNames = {
+  'es': [
+    'lunes',
+    'martes',
+    'miércoles',
+    'jueves',
+    'viernes',
+    'sábado',
+    'domingo',
+  ],
+  'en': [
+    'Monday',
+    'Tuesday',
+    'Wednesday',
+    'Thursday',
+    'Friday',
+    'Saturday',
+    'Sunday',
+  ],
+  'fr': [
+    'lundi',
+    'mardi',
+    'mercredi',
+    'jeudi',
+    'vendredi',
+    'samedi',
+    'dimanche',
+  ],
+  'de': [
+    'Montag',
+    'Dienstag',
+    'Mittwoch',
+    'Donnerstag',
+    'Freitag',
+    'Samstag',
+    'Sonntag',
+  ],
+  'it': [
+    'lunedì',
+    'martedì',
+    'mercoledì',
+    'giovedì',
+    'venerdì',
+    'sabato',
+    'domenica',
+  ],
+  'pt': [
+    'segunda-feira',
+    'terça-feira',
+    'quarta-feira',
+    'quinta-feira',
+    'sexta-feira',
+    'sábado',
+    'domingo',
+  ],
+  'nl': [
+    'maandag',
+    'dinsdag',
+    'woensdag',
+    'donderdag',
+    'vrijdag',
+    'zaterdag',
+    'zondag',
+  ],
+  'pl': [
+    'poniedziałek',
+    'wtorek',
+    'środa',
+    'czwartek',
+    'piątek',
+    'sobota',
+    'niedziela',
+  ],
+  'ro': ['luni', 'marți', 'miercuri', 'joi', 'vineri', 'sâmbătă', 'duminică'],
+};
+
+String localizedSelfieDateLabel(BuildContext context, DateTime date) {
+  final code = SundayLanguageController.normalize(
+    SundayLanguageScope.languageCodeOf(context),
+  );
+  final weekdayNames =
+      kSundayLocalizedWeekdayNames[code] ??
+      kSundayLocalizedWeekdayNames[kDefaultSundayLanguageCode]!;
+  final weekday = weekdayNames[date.weekday - 1];
+  final month = localizedMonthName(context, date.month);
+
+  switch (code) {
+    case 'en':
+      return '$weekday, $month ${date.day}';
+    case 'fr':
+      return '$weekday ${date.day} $month';
+    case 'de':
+      return '$weekday, ${date.day}. $month';
+    case 'it':
+    case 'pl':
+    case 'ro':
+      return '$weekday, ${date.day} $month';
+    case 'nl':
+      return '$weekday ${date.day} $month';
+    case 'pt':
+    case 'es':
+    default:
+      return '$weekday, ${date.day} de $month';
+  }
+}
+
+const Map<String, Map<String, String>> kSundayTranslations = {
+  'en': {
+    'No se pudo iniciar Sunday Selfie': 'Could not start Sunday Selfie',
+    'No se pudo preparar tu perfil': 'Could not prepare your profile',
+    'Reintentar': 'Try again',
+    'Elige una foto': 'Choose a photo',
+    '¿De dónde quieres añadirla?': 'Where do you want to add it from?',
+    'Galería': 'Gallery',
+    'Elige una foto guardada': 'Choose a saved photo',
+    'Haz una foto ahora': 'Take a photo now',
+    'Error guardando idioma: ': 'Error saving language: ',
+    'Error guardando notificaciones: ': 'Error saving notifications: ',
+    'Error enviando sugerencia: ': 'Error sending suggestion: ',
+    'Error borrando la cuenta: ': 'Error deleting account: ',
+    'No se pudo borrar la caché local: ': 'Could not clear local cache: ',
+    'No se pudo abrir la galería: ': 'Could not open gallery: ',
+    'Error guardando perfil: ': 'Error saving profile: ',
+    'Error: ': 'Error: ',
+    'Usuario': 'User',
+    'Grupo': 'Group',
+    'Grupos': 'Groups',
+    'Mis selfies': 'My selfies',
+    'Cámara': 'Camera',
+    'Montaje': 'Montage',
+    'Perfil': 'Profile',
+    'Miembro desde ahora': 'Member from now',
+    'Notificaciones': 'Notifications',
+    'Editar perfil': 'Edit profile',
+    'Sugerencias': 'Suggestions',
+    'Ajustes': 'Settings',
+    'Idioma': 'Language',
+    'Mis Sunday Selfies': 'My Sunday Selfies',
+    '1 selfie publicado': '1 selfie posted',
+    '{count} selfies publicados': '{count} selfies posted',
+    'Semanas activo': 'Active weeks',
+    'Selfies': 'Selfies',
+    'Perfil Sunday Selfie': 'Sunday Selfie profile',
+    'Puedes cambiarlo en cualquier momento': 'You can change it anytime',
+    'Tu nombre': 'Your name',
+    'Siguiente': 'Next',
+    'Foto de perfil': 'Profile photo',
+    'La foto de perfil se puede cambiar cada domingo':
+        'The profile photo can be changed every Sunday',
+    'Añadir foto de perfil': 'Add profile photo',
+    'Elige una imagen de galería o hazla ahora':
+        'Choose a gallery image or take one now',
+    'Cambiar foto de perfil': 'Change profile photo',
+    'Elige otra imagen o haz una nueva':
+        'Choose another image or take a new one',
+    'Guardando...': 'Saving...',
+    '¡Empezar!': 'Start!',
+    'Atrás': 'Back',
+    'Hoy puedes cambiar tu foto de perfil':
+        'Today you can change your profile photo',
+    'NOMBRE': 'NAME',
+    'Este es tu nombre en Sunday Selfie': 'This is your name on Sunday Selfie',
+    'Guardado': 'Saved',
+    'Guardar cambios': 'Save changes',
+    'Perfil actualizado': 'Profile updated',
+    'El nombre no puede estar vacío': 'Name cannot be empty',
+    'Escribe tu nombre para continuar': 'Enter your name to continue',
+    'IDIOMA': 'LANGUAGE',
+    'Idioma de la app': 'App language',
+    'Elige el idioma de Sunday Selfie': 'Choose the Sunday Selfie language',
+    'Idioma actualizado': 'Language updated',
+    'ALMACENAMIENTO': 'STORAGE',
+    'LEGAL': 'LEGAL',
+    'CUENTA': 'ACCOUNT',
+    'Borrar caché local': 'Clear local cache',
+    'Libera espacio descargado localmente': 'Free up locally downloaded space',
+    'Borrando caché...': 'Clearing cache...',
+    '✅ Caché borrada': 'Cache cleared',
+    'Las fotos originales permanecen en la nube':
+        'Original photos remain in the cloud',
+    'Política de privacidad': 'Privacy policy',
+    'Términos de uso': 'Terms of use',
+    'Borrar cuenta': 'Delete account',
+    'Borrando cuenta...': 'Deleting account...',
+    'Elimina definitivamente tu perfil y contenido personal':
+        'Permanently deletes your profile and personal content',
+    'Cerrar sesión': 'Sign out',
+    'Sale de Sunday Selfie en este dispositivo':
+        'Signs out of Sunday Selfie on this device',
+    '¿Borrar el contenido descargado?': 'Clear downloaded content?',
+    'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.':
+        'This does not affect cloud content. You can download it again whenever you want.',
+    'Borrar caché': 'Clear cache',
+    'Cancelar': 'Cancel',
+    'La caché local ya estaba vacía': 'The local cache was already empty',
+    'Caché local borrada': 'Local cache cleared',
+    'Borrar cuenta definitivamente': 'Permanently delete account',
+    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.':
+        'Your profile, selfies, reactions, messages and access to Sunday Selfie will be deleted. This action cannot be undone.',
+    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.':
+        'If you are the only group admin, another member will become admin. Safety reports may be kept for review.',
+    'Escribe BORRAR para confirmar:': 'Type BORRAR to confirm:',
+    'Borrar definitivamente': 'Delete permanently',
+    '¿Quieres salir de Sunday Selfie en este dispositivo?':
+        'Do you want to sign out of Sunday Selfie on this device?',
+    'Salir': 'Sign out',
+    'Notificaciones activadas': 'Notifications enabled',
+    'Activa o desactiva todas las notificaciones':
+        'Turn all notifications on or off',
+    'TIPOS DE NOTIFICACIÓN': 'NOTIFICATION TYPES',
+    'Recordatorio del domingo': 'Sunday reminder',
+    'Aviso el domingo para subir tu selfie':
+        'Reminder on Sunday to upload your selfie',
+    'Nuevos selfies': 'New selfies',
+    'Cuando alguien publica una selfie en tus grupos':
+        'When someone posts a selfie in your groups',
+    'Recordatorios de amigos': 'Friend reminders',
+    'Cuando un amigo te envía un zumbido para recordarte subir tu selfie':
+        'When a friend nudges you to upload your selfie',
+    'Nuevas reacciones': 'New reactions',
+    'Cuando alguien reacciona a tu selfie':
+        'When someone reacts to your selfie',
+    'Miembros y solicitudes': 'Members and requests',
+    'Cuando alguien solicita entrar, se une o te aceptan':
+        'When someone asks to join, joins, or accepts you',
+    'Resumen semanal': 'Weekly summary',
+    'Cada lunes con las fotos de la semana':
+        'Every Monday with the week photos',
+    'Mensajes del chat': 'Chat messages',
+    'Cuando alguien escribe o envía un GIF en un chat de grupo':
+        'When someone writes or sends a GIF in a group chat',
+    'POR GRUPO': 'BY GROUP',
+    'Sin grupos todavía': 'No groups yet',
+    'Cuando tengas grupos, podrás ajustar las notificaciones de cada uno.':
+        'When you have groups, you can adjust notifications for each one.',
+    'DISPOSITIVO': 'DEVICE',
+    'Sonido': 'Sound',
+    'Permite que las notificaciones suenen si el sistema lo permite':
+        'Allow notifications to make sound if the system permits it',
+    'Vibración': 'Vibration',
+    'Permite vibración en avisos compatibles':
+        'Allow vibration for compatible alerts',
+    'Activadas': 'On',
+    'Desactivadas': 'Off',
+    'Cuéntanos qué mejorarías': 'Tell us what you would improve',
+    'Enviar sugerencia': 'Send suggestion',
+    'Enviando...': 'Sending...',
+    'Sugerencia enviada': 'Suggestion sent',
+    'Sugerencia enviada. ¡Gracias!': 'Suggestion sent. Thank you!',
+    'Escribe un poco más para enviar la sugerencia':
+        'Write a little more to send the suggestion',
+    'La sugerencia no puede superar 1000 caracteres':
+        'The suggestion cannot exceed 1000 characters',
+  },
+  'fr': {
+    'No se pudo iniciar Sunday Selfie': 'Impossible de démarrer Sunday Selfie',
+    'No se pudo preparar tu perfil': 'Impossible de préparer votre profil',
+    'Reintentar': 'Réessayer',
+    'Elige una foto': 'Choisissez une photo',
+    '¿De dónde quieres añadirla?': 'Depuis où voulez-vous l’ajouter ?',
+    'Galería': 'Galerie',
+    'Elige una foto guardada': 'Choisir une photo enregistrée',
+    'Haz una foto ahora': 'Prendre une photo maintenant',
+    'Error guardando idioma: ':
+        'Erreur lors de l’enregistrement de la langue : ',
+    'Error guardando notificaciones: ':
+        'Erreur lors de l’enregistrement des notifications : ',
+    'Error enviando sugerencia: ': 'Erreur lors de l’envoi de la suggestion : ',
+    'Error borrando la cuenta: ': 'Erreur lors de la suppression du compte : ',
+    'No se pudo borrar la caché local: ':
+        'Impossible de vider le cache local : ',
+    'No se pudo abrir la galería: ': 'Impossible d’ouvrir la galerie : ',
+    'Error guardando perfil: ': 'Erreur lors de l’enregistrement du profil : ',
+    'Error: ': 'Erreur : ',
+    'Usuario': 'Utilisateur',
+    'Grupo': 'Groupe',
+    'Grupos': 'Groupes',
+    'Mis selfies': 'Mes selfies',
+    'Cámara': 'Caméra',
+    'Montaje': 'Montage',
+    'Perfil': 'Profil',
+    'Miembro desde ahora': 'Membre dès maintenant',
+    'Notificaciones': 'Notifications',
+    'Editar perfil': 'Modifier le profil',
+    'Sugerencias': 'Suggestions',
+    'Ajustes': 'Réglages',
+    'Idioma': 'Langue',
+    'Mis Sunday Selfies': 'Mes Sunday Selfies',
+    '1 selfie publicado': '1 selfie publié',
+    '{count} selfies publicados': '{count} selfies publiés',
+    'Semanas activo': 'Semaines actives',
+    'Selfies': 'Selfies',
+    'Perfil Sunday Selfie': 'Profil Sunday Selfie',
+    'Puedes cambiarlo en cualquier momento':
+        'Vous pouvez le modifier à tout moment',
+    'Tu nombre': 'Votre nom',
+    'Siguiente': 'Suivant',
+    'Foto de perfil': 'Photo de profil',
+    'La foto de perfil se puede cambiar cada domingo':
+        'La photo de profil peut être changée chaque dimanche',
+    'Añadir foto de perfil': 'Ajouter une photo de profil',
+    'Elige una imagen de galería o hazla ahora':
+        'Choisissez une image de la galerie ou prenez-en une maintenant',
+    'Cambiar foto de perfil': 'Changer la photo de profil',
+    'Elige otra imagen o haz una nueva':
+        'Choisissez une autre image ou prenez-en une nouvelle',
+    'Guardando...': 'Enregistrement...',
+    '¡Empezar!': 'Commencer',
+    'Atrás': 'Retour',
+    'Hoy puedes cambiar tu foto de perfil':
+        'Aujourd’hui, vous pouvez changer votre photo de profil',
+    'NOMBRE': 'NOM',
+    'Este es tu nombre en Sunday Selfie': 'Voici votre nom sur Sunday Selfie',
+    'Guardado': 'Enregistré',
+    'Guardar cambios': 'Enregistrer',
+    'Perfil actualizado': 'Profil mis à jour',
+    'El nombre no puede estar vacío': 'Le nom ne peut pas être vide',
+    'Escribe tu nombre para continuar': 'Saisissez votre nom pour continuer',
+    'IDIOMA': 'LANGUE',
+    'Idioma de la app': 'Langue de l’application',
+    'Elige el idioma de Sunday Selfie': 'Choisissez la langue de Sunday Selfie',
+    'Idioma actualizado': 'Langue mise à jour',
+    'ALMACENAMIENTO': 'STOCKAGE',
+    'LEGAL': 'LÉGAL',
+    'CUENTA': 'COMPTE',
+    'Borrar caché local': 'Vider le cache local',
+    'Libera espacio descargado localmente':
+        'Libère l’espace téléchargé localement',
+    'Borrando caché...': 'Vidage du cache...',
+    '✅ Caché borrada': 'Cache vidé',
+    'Las fotos originales permanecen en la nube':
+        'Les photos originales restent dans le cloud',
+    'Política de privacidad': 'Politique de confidentialité',
+    'Términos de uso': 'Conditions d’utilisation',
+    'Borrar cuenta': 'Supprimer le compte',
+    'Borrando cuenta...': 'Suppression du compte...',
+    'Elimina definitivamente tu perfil y contenido personal':
+        'Supprime définitivement votre profil et votre contenu personnel',
+    'Cerrar sesión': 'Se déconnecter',
+    'Sale de Sunday Selfie en este dispositivo':
+        'Déconnecte Sunday Selfie sur cet appareil',
+    '¿Borrar el contenido descargado?': 'Supprimer le contenu téléchargé ?',
+    'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.':
+        'Cela ne touche pas le contenu dans le cloud. Vous pourrez le télécharger à nouveau quand vous voulez.',
+    'Borrar caché': 'Vider le cache',
+    'Cancelar': 'Annuler',
+    'La caché local ya estaba vacía': 'Le cache local était déjà vide',
+    'Caché local borrada': 'Cache local vidé',
+    'Borrar cuenta definitivamente': 'Supprimer définitivement le compte',
+    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.':
+        'Votre profil, vos selfies, réactions, messages et accès à Sunday Selfie seront supprimés. Cette action est irréversible.',
+    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.':
+        'Si vous êtes la seule personne administratrice d’un groupe, un autre membre le deviendra. Les signalements de sécurité peuvent être conservés pour examen.',
+    'Escribe BORRAR para confirmar:': 'Tapez BORRAR pour confirmer :',
+    'Borrar definitivamente': 'Supprimer définitivement',
+    '¿Quieres salir de Sunday Selfie en este dispositivo?':
+        'Voulez-vous quitter Sunday Selfie sur cet appareil ?',
+    'Salir': 'Quitter',
+    'Notificaciones activadas': 'Notifications activées',
+    'Activa o desactiva todas las notificaciones':
+        'Active ou désactive toutes les notifications',
+    'TIPOS DE NOTIFICACIÓN': 'TYPES DE NOTIFICATION',
+    'Recordatorio del domingo': 'Rappel du dimanche',
+    'Aviso el domingo para subir tu selfie':
+        'Rappel le dimanche pour publier votre selfie',
+    'Nuevos selfies': 'Nouveaux selfies',
+    'Cuando alguien publica una selfie en tus grupos':
+        'Quand quelqu’un publie un selfie dans vos groupes',
+    'Recordatorios de amigos': 'Rappels des amis',
+    'Cuando un amigo te envía un zumbido para recordarte subir tu selfie':
+        'Quand un ami vous envoie un rappel pour publier votre selfie',
+    'Nuevas reacciones': 'Nouvelles réactions',
+    'Cuando alguien reacciona a tu selfie':
+        'Quand quelqu’un réagit à votre selfie',
+    'Miembros y solicitudes': 'Membres et demandes',
+    'Cuando alguien solicita entrar, se une o te aceptan':
+        'Quand quelqu’un demande à entrer, rejoint ou vous accepte',
+    'Resumen semanal': 'Résumé hebdomadaire',
+    'Cada lunes con las fotos de la semana':
+        'Chaque lundi avec les photos de la semaine',
+    'Mensajes del chat': 'Messages du chat',
+    'Cuando alguien escribe o envía un GIF en un chat de grupo':
+        'Quand quelqu’un écrit ou envoie un GIF dans un chat de groupe',
+    'POR GRUPO': 'PAR GROUPE',
+    'Sin grupos todavía': 'Aucun groupe pour le moment',
+    'Cuando tengas grupos, podrás ajustar las notificaciones de cada uno.':
+        'Quand vous aurez des groupes, vous pourrez régler les notifications de chacun.',
+    'DISPOSITIVO': 'APPAREIL',
+    'Sonido': 'Son',
+    'Permite que las notificaciones suenen si el sistema lo permite':
+        'Permet aux notifications de sonner si le système l’autorise',
+    'Vibración': 'Vibration',
+    'Permite vibración en avisos compatibles':
+        'Permet la vibration pour les alertes compatibles',
+    'Activadas': 'Activées',
+    'Desactivadas': 'Désactivées',
+    'Cuéntanos qué mejorarías': 'Dites-nous ce que vous amélioreriez',
+    'Enviar sugerencia': 'Envoyer la suggestion',
+    'Enviando...': 'Envoi...',
+    'Sugerencia enviada': 'Suggestion envoyée',
+    'Sugerencia enviada. ¡Gracias!': 'Suggestion envoyée. Merci !',
+    'Escribe un poco más para enviar la sugerencia':
+        'Écrivez un peu plus pour envoyer la suggestion',
+    'La sugerencia no puede superar 1000 caracteres':
+        'La suggestion ne peut pas dépasser 1000 caractères',
+  },
+  'de': {
+    'No se pudo iniciar Sunday Selfie':
+        'Sunday Selfie konnte nicht gestartet werden',
+    'No se pudo preparar tu perfil':
+        'Dein Profil konnte nicht vorbereitet werden',
+    'Reintentar': 'Erneut versuchen',
+    'Elige una foto': 'Foto auswählen',
+    '¿De dónde quieres añadirla?': 'Von wo möchtest du es hinzufügen?',
+    'Galería': 'Galerie',
+    'Elige una foto guardada': 'Gespeichertes Foto auswählen',
+    'Haz una foto ahora': 'Jetzt ein Foto machen',
+    'Error guardando idioma: ': 'Fehler beim Speichern der Sprache: ',
+    'Error guardando notificaciones: ':
+        'Fehler beim Speichern der Benachrichtigungen: ',
+    'Error enviando sugerencia: ': 'Fehler beim Senden des Vorschlags: ',
+    'Error borrando la cuenta: ': 'Fehler beim Löschen des Kontos: ',
+    'No se pudo borrar la caché local: ':
+        'Lokaler Cache konnte nicht gelöscht werden: ',
+    'No se pudo abrir la galería: ': 'Galerie konnte nicht geöffnet werden: ',
+    'Error guardando perfil: ': 'Fehler beim Speichern des Profils: ',
+    'Error: ': 'Fehler: ',
+    'Usuario': 'Benutzer',
+    'Grupo': 'Gruppe',
+    'Grupos': 'Gruppen',
+    'Mis selfies': 'Meine Selfies',
+    'Cámara': 'Kamera',
+    'Montaje': 'Montage',
+    'Perfil': 'Profil',
+    'Miembro desde ahora': 'Mitglied ab jetzt',
+    'Notificaciones': 'Benachrichtigungen',
+    'Editar perfil': 'Profil bearbeiten',
+    'Sugerencias': 'Vorschläge',
+    'Ajustes': 'Einstellungen',
+    'Idioma': 'Sprache',
+    'Mis Sunday Selfies': 'Meine Sunday Selfies',
+    '1 selfie publicado': '1 Selfie veröffentlicht',
+    '{count} selfies publicados': '{count} Selfies veröffentlicht',
+    'Semanas activo': 'Aktive Wochen',
+    'Selfies': 'Selfies',
+    'Perfil Sunday Selfie': 'Sunday Selfie Profil',
+    'Puedes cambiarlo en cualquier momento': 'Du kannst es jederzeit ändern',
+    'Tu nombre': 'Dein Name',
+    'Siguiente': 'Weiter',
+    'Foto de perfil': 'Profilfoto',
+    'La foto de perfil se puede cambiar cada domingo':
+        'Das Profilfoto kann jeden Sonntag geändert werden',
+    'Añadir foto de perfil': 'Profilfoto hinzufügen',
+    'Elige una imagen de galería o hazla ahora':
+        'Wähle ein Bild aus der Galerie oder mache jetzt eins',
+    'Cambiar foto de perfil': 'Profilfoto ändern',
+    'Elige otra imagen o haz una nueva':
+        'Wähle ein anderes Bild oder mache ein neues',
+    'Guardando...': 'Speichern...',
+    '¡Empezar!': 'Starten',
+    'Atrás': 'Zurück',
+    'Hoy puedes cambiar tu foto de perfil':
+        'Heute kannst du dein Profilfoto ändern',
+    'NOMBRE': 'NAME',
+    'Este es tu nombre en Sunday Selfie': 'Das ist dein Name in Sunday Selfie',
+    'Guardado': 'Gespeichert',
+    'Guardar cambios': 'Änderungen speichern',
+    'Perfil actualizado': 'Profil aktualisiert',
+    'El nombre no puede estar vacío': 'Der Name darf nicht leer sein',
+    'Escribe tu nombre para continuar': 'Gib deinen Namen ein, um fortzufahren',
+    'IDIOMA': 'SPRACHE',
+    'Idioma de la app': 'App-Sprache',
+    'Elige el idioma de Sunday Selfie': 'Wähle die Sprache von Sunday Selfie',
+    'Idioma actualizado': 'Sprache aktualisiert',
+    'ALMACENAMIENTO': 'SPEICHER',
+    'LEGAL': 'RECHTLICHES',
+    'CUENTA': 'KONTO',
+    'Borrar caché local': 'Lokalen Cache löschen',
+    'Libera espacio descargado localmente':
+        'Gibt lokal heruntergeladenen Speicher frei',
+    'Borrando caché...': 'Cache wird gelöscht...',
+    '✅ Caché borrada': 'Cache gelöscht',
+    'Las fotos originales permanecen en la nube':
+        'Originalfotos bleiben in der Cloud',
+    'Política de privacidad': 'Datenschutzrichtlinie',
+    'Términos de uso': 'Nutzungsbedingungen',
+    'Borrar cuenta': 'Konto löschen',
+    'Borrando cuenta...': 'Konto wird gelöscht...',
+    'Elimina definitivamente tu perfil y contenido personal':
+        'Löscht dein Profil und persönliche Inhalte dauerhaft',
+    'Cerrar sesión': 'Abmelden',
+    'Sale de Sunday Selfie en este dispositivo':
+        'Meldet Sunday Selfie auf diesem Gerät ab',
+    '¿Borrar el contenido descargado?': 'Heruntergeladene Inhalte löschen?',
+    'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.':
+        'Cloud-Inhalte sind nicht betroffen. Du kannst sie jederzeit erneut herunterladen.',
+    'Borrar caché': 'Cache löschen',
+    'Cancelar': 'Abbrechen',
+    'La caché local ya estaba vacía': 'Der lokale Cache war bereits leer',
+    'Caché local borrada': 'Lokaler Cache gelöscht',
+    'Borrar cuenta definitivamente': 'Konto dauerhaft löschen',
+    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.':
+        'Dein Profil, deine Selfies, Reaktionen, Nachrichten und dein Zugang zu Sunday Selfie werden gelöscht. Diese Aktion kann nicht rückgängig gemacht werden.',
+    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.':
+        'Wenn du die einzige Gruppenadmin-Person bist, wird ein anderes Mitglied Admin. Sicherheitsmeldungen können zur Prüfung aufbewahrt werden.',
+    'Escribe BORRAR para confirmar:': 'Gib BORRAR zur Bestätigung ein:',
+    'Borrar definitivamente': 'Dauerhaft löschen',
+    '¿Quieres salir de Sunday Selfie en este dispositivo?':
+        'Möchtest du Sunday Selfie auf diesem Gerät verlassen?',
+    'Salir': 'Abmelden',
+    'Notificaciones activadas': 'Benachrichtigungen aktiviert',
+    'Activa o desactiva todas las notificaciones':
+        'Alle Benachrichtigungen ein- oder ausschalten',
+    'TIPOS DE NOTIFICACIÓN': 'BENACHRICHTIGUNGSTYPEN',
+    'Recordatorio del domingo': 'Sonntagserinnerung',
+    'Aviso el domingo para subir tu selfie':
+        'Erinnerung am Sonntag, dein Selfie hochzuladen',
+    'Nuevos selfies': 'Neue Selfies',
+    'Cuando alguien publica una selfie en tus grupos':
+        'Wenn jemand ein Selfie in deinen Gruppen postet',
+    'Recordatorios de amigos': 'Erinnerungen von Freunden',
+    'Cuando un amigo te envía un zumbido para recordarte subir tu selfie':
+        'Wenn ein Freund dich daran erinnert, dein Selfie hochzuladen',
+    'Nuevas reacciones': 'Neue Reaktionen',
+    'Cuando alguien reacciona a tu selfie':
+        'Wenn jemand auf dein Selfie reagiert',
+    'Miembros y solicitudes': 'Mitglieder und Anfragen',
+    'Cuando alguien solicita entrar, se une o te aceptan':
+        'Wenn jemand beitreten möchte, beitritt oder dich akzeptiert',
+    'Resumen semanal': 'Wochenübersicht',
+    'Cada lunes con las fotos de la semana': 'Jeden Montag mit den Wochenfotos',
+    'Mensajes del chat': 'Chatnachrichten',
+    'Cuando alguien escribe o envía un GIF en un chat de grupo':
+        'Wenn jemand in einem Gruppenchat schreibt oder ein GIF sendet',
+    'POR GRUPO': 'PRO GRUPPE',
+    'Sin grupos todavía': 'Noch keine Gruppen',
+    'Cuando tengas grupos, podrás ajustar las notificaciones de cada uno.':
+        'Wenn du Gruppen hast, kannst du die Benachrichtigungen für jede anpassen.',
+    'DISPOSITIVO': 'GERÄT',
+    'Sonido': 'Ton',
+    'Permite que las notificaciones suenen si el sistema lo permite':
+        'Benachrichtigungen dürfen klingeln, wenn das System es erlaubt',
+    'Vibración': 'Vibration',
+    'Permite vibración en avisos compatibles':
+        'Vibration für kompatible Hinweise erlauben',
+    'Activadas': 'Ein',
+    'Desactivadas': 'Aus',
+    'Cuéntanos qué mejorarías': 'Sag uns, was du verbessern würdest',
+    'Enviar sugerencia': 'Vorschlag senden',
+    'Enviando...': 'Senden...',
+    'Sugerencia enviada': 'Vorschlag gesendet',
+    'Sugerencia enviada. ¡Gracias!': 'Vorschlag gesendet. Danke!',
+    'Escribe un poco más para enviar la sugerencia':
+        'Schreib etwas mehr, um den Vorschlag zu senden',
+    'La sugerencia no puede superar 1000 caracteres':
+        'Der Vorschlag darf 1000 Zeichen nicht überschreiten',
+  },
+  'it': {
+    'No se pudo iniciar Sunday Selfie': 'Impossibile avviare Sunday Selfie',
+    'No se pudo preparar tu perfil': 'Impossibile preparare il tuo profilo',
+    'Reintentar': 'Riprova',
+    'Elige una foto': 'Scegli una foto',
+    '¿De dónde quieres añadirla?': 'Da dove vuoi aggiungerla?',
+    'Galería': 'Galleria',
+    'Elige una foto guardada': 'Scegli una foto salvata',
+    'Haz una foto ahora': 'Scatta una foto ora',
+    'Error guardando idioma: ': 'Errore nel salvataggio della lingua: ',
+    'Error guardando notificaciones: ':
+        'Errore nel salvataggio delle notifiche: ',
+    'Error enviando sugerencia: ': 'Errore nell’invio del suggerimento: ',
+    'Error borrando la cuenta: ': 'Errore nell’eliminazione dell’account: ',
+    'No se pudo borrar la caché local: ':
+        'Impossibile svuotare la cache locale: ',
+    'No se pudo abrir la galería: ': 'Impossibile aprire la galleria: ',
+    'Error guardando perfil: ': 'Errore nel salvataggio del profilo: ',
+    'Error: ': 'Errore: ',
+    'Usuario': 'Utente',
+    'Grupo': 'Gruppo',
+    'Grupos': 'Gruppi',
+    'Mis selfies': 'I miei selfie',
+    'Cámara': 'Fotocamera',
+    'Montaje': 'Montaggio',
+    'Perfil': 'Profilo',
+    'Miembro desde ahora': 'Membro da ora',
+    'Notificaciones': 'Notifiche',
+    'Editar perfil': 'Modifica profilo',
+    'Sugerencias': 'Suggerimenti',
+    'Ajustes': 'Impostazioni',
+    'Idioma': 'Lingua',
+    'Mis Sunday Selfies': 'I miei Sunday Selfies',
+    '1 selfie publicado': '1 selfie pubblicato',
+    '{count} selfies publicados': '{count} selfie pubblicati',
+    'Semanas activo': 'Settimane attive',
+    'Selfies': 'Selfie',
+    'Perfil Sunday Selfie': 'Profilo Sunday Selfie',
+    'Puedes cambiarlo en cualquier momento':
+        'Puoi cambiarlo in qualsiasi momento',
+    'Tu nombre': 'Il tuo nome',
+    'Siguiente': 'Avanti',
+    'Foto de perfil': 'Foto profilo',
+    'La foto de perfil se puede cambiar cada domingo':
+        'La foto profilo può essere cambiata ogni domenica',
+    'Añadir foto de perfil': 'Aggiungi foto profilo',
+    'Elige una imagen de galería o hazla ahora':
+        'Scegli una foto dalla galleria o scattala ora',
+    'Cambiar foto de perfil': 'Cambia foto profilo',
+    'Elige otra imagen o haz una nueva':
+        'Scegli un’altra immagine o scattane una nuova',
+    'Guardando...': 'Salvataggio...',
+    '¡Empezar!': 'Inizia',
+    'Atrás': 'Indietro',
+    'Hoy puedes cambiar tu foto de perfil':
+        'Oggi puoi cambiare la tua foto profilo',
+    'NOMBRE': 'NOME',
+    'Este es tu nombre en Sunday Selfie':
+        'Questo è il tuo nome su Sunday Selfie',
+    'Guardado': 'Salvato',
+    'Guardar cambios': 'Salva modifiche',
+    'Perfil actualizado': 'Profilo aggiornato',
+    'El nombre no puede estar vacío': 'Il nome non può essere vuoto',
+    'Escribe tu nombre para continuar': 'Inserisci il tuo nome per continuare',
+    'IDIOMA': 'LINGUA',
+    'Idioma de la app': 'Lingua dell’app',
+    'Elige el idioma de Sunday Selfie': 'Scegli la lingua di Sunday Selfie',
+    'Idioma actualizado': 'Lingua aggiornata',
+    'ALMACENAMIENTO': 'ARCHIVIAZIONE',
+    'LEGAL': 'LEGALE',
+    'CUENTA': 'ACCOUNT',
+    'Borrar caché local': 'Svuota cache locale',
+    'Libera espacio descargado localmente':
+        'Libera spazio scaricato localmente',
+    'Borrando caché...': 'Svuotamento cache...',
+    '✅ Caché borrada': 'Cache svuotata',
+    'Las fotos originales permanecen en la nube':
+        'Le foto originali restano nel cloud',
+    'Política de privacidad': 'Informativa sulla privacy',
+    'Términos de uso': 'Termini di utilizzo',
+    'Borrar cuenta': 'Elimina account',
+    'Borrando cuenta...': 'Eliminazione account...',
+    'Elimina definitivamente tu perfil y contenido personal':
+        'Elimina definitivamente profilo e contenuti personali',
+    'Cerrar sesión': 'Esci',
+    'Sale de Sunday Selfie en este dispositivo':
+        'Esce da Sunday Selfie su questo dispositivo',
+    '¿Borrar el contenido descargado?': 'Eliminare i contenuti scaricati?',
+    'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.':
+        'Non influisce sui contenuti nel cloud. Potrai scaricarli di nuovo quando vuoi.',
+    'Borrar caché': 'Svuota cache',
+    'Cancelar': 'Annulla',
+    'La caché local ya estaba vacía': 'La cache locale era già vuota',
+    'Caché local borrada': 'Cache locale svuotata',
+    'Borrar cuenta definitivamente': 'Elimina account definitivamente',
+    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.':
+        'Profilo, selfie, reazioni, messaggi e accesso a Sunday Selfie verranno eliminati. Questa azione non può essere annullata.',
+    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.':
+        'Se sei l’unica persona amministratrice di un gruppo, un altro membro lo diventerà. Le segnalazioni di sicurezza possono essere conservate per revisione.',
+    'Escribe BORRAR para confirmar:': 'Scrivi BORRAR per confermare:',
+    'Borrar definitivamente': 'Elimina definitivamente',
+    '¿Quieres salir de Sunday Selfie en este dispositivo?':
+        'Vuoi uscire da Sunday Selfie su questo dispositivo?',
+    'Salir': 'Esci',
+    'Notificaciones activadas': 'Notifiche attive',
+    'Activa o desactiva todas las notificaciones':
+        'Attiva o disattiva tutte le notifiche',
+    'TIPOS DE NOTIFICACIÓN': 'TIPI DI NOTIFICA',
+    'Recordatorio del domingo': 'Promemoria della domenica',
+    'Aviso el domingo para subir tu selfie':
+        'Avviso la domenica per caricare il tuo selfie',
+    'Nuevos selfies': 'Nuovi selfie',
+    'Cuando alguien publica una selfie en tus grupos':
+        'Quando qualcuno pubblica un selfie nei tuoi gruppi',
+    'Recordatorios de amigos': 'Promemoria degli amici',
+    'Cuando un amigo te envía un zumbido para recordarte subir tu selfie':
+        'Quando un amico ti manda un promemoria per caricare il selfie',
+    'Nuevas reacciones': 'Nuove reazioni',
+    'Cuando alguien reacciona a tu selfie':
+        'Quando qualcuno reagisce al tuo selfie',
+    'Miembros y solicitudes': 'Membri e richieste',
+    'Cuando alguien solicita entrar, se une o te aceptan':
+        'Quando qualcuno chiede di entrare, si unisce o ti accetta',
+    'Resumen semanal': 'Riepilogo settimanale',
+    'Cada lunes con las fotos de la semana':
+        'Ogni lunedì con le foto della settimana',
+    'Mensajes del chat': 'Messaggi della chat',
+    'Cuando alguien escribe o envía un GIF en un chat de grupo':
+        'Quando qualcuno scrive o invia una GIF in una chat di gruppo',
+    'POR GRUPO': 'PER GRUPPO',
+    'Sin grupos todavía': 'Ancora nessun gruppo',
+    'Cuando tengas grupos, podrás ajustar las notificaciones de cada uno.':
+        'Quando avrai gruppi, potrai regolare le notifiche di ognuno.',
+    'DISPOSITIVO': 'DISPOSITIVO',
+    'Sonido': 'Suono',
+    'Permite que las notificaciones suenen si el sistema lo permite':
+        'Permette alle notifiche di suonare se il sistema lo consente',
+    'Vibración': 'Vibrazione',
+    'Permite vibración en avisos compatibles':
+        'Permette la vibrazione per avvisi compatibili',
+    'Activadas': 'Attive',
+    'Desactivadas': 'Disattive',
+    'Cuéntanos qué mejorarías': 'Dicci cosa miglioreresti',
+    'Enviar sugerencia': 'Invia suggerimento',
+    'Enviando...': 'Invio...',
+    'Sugerencia enviada': 'Suggerimento inviato',
+    'Sugerencia enviada. ¡Gracias!': 'Suggerimento inviato. Grazie!',
+    'Escribe un poco más para enviar la sugerencia':
+        'Scrivi un po’ di più per inviare il suggerimento',
+    'La sugerencia no puede superar 1000 caracteres':
+        'Il suggerimento non può superare 1000 caratteri',
+  },
+  'pt': {
+    'No se pudo iniciar Sunday Selfie':
+        'Não foi possível iniciar o Sunday Selfie',
+    'No se pudo preparar tu perfil': 'Não foi possível preparar o teu perfil',
+    'Reintentar': 'Tentar novamente',
+    'Elige una foto': 'Escolhe uma foto',
+    '¿De dónde quieres añadirla?': 'De onde queres adicioná-la?',
+    'Galería': 'Galeria',
+    'Elige una foto guardada': 'Escolhe uma foto guardada',
+    'Haz una foto ahora': 'Tira uma foto agora',
+    'Error guardando idioma: ': 'Erro ao guardar idioma: ',
+    'Error guardando notificaciones: ': 'Erro ao guardar notificações: ',
+    'Error enviando sugerencia: ': 'Erro ao enviar sugestão: ',
+    'Error borrando la cuenta: ': 'Erro ao eliminar conta: ',
+    'No se pudo borrar la caché local: ':
+        'Não foi possível limpar a cache local: ',
+    'No se pudo abrir la galería: ': 'Não foi possível abrir a galeria: ',
+    'Error guardando perfil: ': 'Erro ao guardar perfil: ',
+    'Error: ': 'Erro: ',
+    'Usuario': 'Utilizador',
+    'Grupo': 'Grupo',
+    'Grupos': 'Grupos',
+    'Mis selfies': 'As minhas selfies',
+    'Cámara': 'Câmara',
+    'Montaje': 'Montagem',
+    'Perfil': 'Perfil',
+    'Miembro desde ahora': 'Membro a partir de agora',
+    'Notificaciones': 'Notificações',
+    'Editar perfil': 'Editar perfil',
+    'Sugerencias': 'Sugestões',
+    'Ajustes': 'Definições',
+    'Idioma': 'Idioma',
+    'Mis Sunday Selfies': 'As minhas Sunday Selfies',
+    '1 selfie publicado': '1 selfie publicada',
+    '{count} selfies publicados': '{count} selfies publicadas',
+    'Semanas activo': 'Semanas ativas',
+    'Selfies': 'Selfies',
+    'Perfil Sunday Selfie': 'Perfil Sunday Selfie',
+    'Puedes cambiarlo en cualquier momento':
+        'Podes alterá-lo a qualquer momento',
+    'Tu nombre': 'O teu nome',
+    'Siguiente': 'Seguinte',
+    'Foto de perfil': 'Foto de perfil',
+    'La foto de perfil se puede cambiar cada domingo':
+        'A foto de perfil pode ser alterada todos os domingos',
+    'Añadir foto de perfil': 'Adicionar foto de perfil',
+    'Elige una imagen de galería o hazla ahora':
+        'Escolhe uma imagem da galeria ou tira uma agora',
+    'Cambiar foto de perfil': 'Alterar foto de perfil',
+    'Elige otra imagen o haz una nueva':
+        'Escolhe outra imagem ou tira uma nova',
+    'Guardando...': 'A guardar...',
+    '¡Empezar!': 'Começar',
+    'Atrás': 'Voltar',
+    'Hoy puedes cambiar tu foto de perfil':
+        'Hoje podes alterar a tua foto de perfil',
+    'NOMBRE': 'NOME',
+    'Este es tu nombre en Sunday Selfie': 'Este é o teu nome no Sunday Selfie',
+    'Guardado': 'Guardado',
+    'Guardar cambios': 'Guardar alterações',
+    'Perfil actualizado': 'Perfil atualizado',
+    'El nombre no puede estar vacío': 'O nome não pode estar vazio',
+    'Escribe tu nombre para continuar': 'Escreve o teu nome para continuar',
+    'IDIOMA': 'IDIOMA',
+    'Idioma de la app': 'Idioma da app',
+    'Elige el idioma de Sunday Selfie': 'Escolhe o idioma do Sunday Selfie',
+    'Idioma actualizado': 'Idioma atualizado',
+    'ALMACENAMIENTO': 'ARMAZENAMENTO',
+    'LEGAL': 'LEGAL',
+    'CUENTA': 'CONTA',
+    'Borrar caché local': 'Limpar cache local',
+    'Libera espacio descargado localmente':
+        'Liberta espaço descarregado localmente',
+    'Borrando caché...': 'A limpar cache...',
+    '✅ Caché borrada': 'Cache limpa',
+    'Las fotos originales permanecen en la nube':
+        'As fotos originais permanecem na nuvem',
+    'Política de privacidad': 'Política de privacidade',
+    'Términos de uso': 'Termos de utilização',
+    'Borrar cuenta': 'Eliminar conta',
+    'Borrando cuenta...': 'A eliminar conta...',
+    'Elimina definitivamente tu perfil y contenido personal':
+        'Elimina definitivamente o teu perfil e conteúdo pessoal',
+    'Cerrar sesión': 'Terminar sessão',
+    'Sale de Sunday Selfie en este dispositivo':
+        'Termina a sessão do Sunday Selfie neste dispositivo',
+    '¿Borrar el contenido descargado?': 'Eliminar o conteúdo descarregado?',
+    'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.':
+        'Não afeta o conteúdo na nuvem. Poderás descarregá-lo novamente quando quiseres.',
+    'Borrar caché': 'Limpar cache',
+    'Cancelar': 'Cancelar',
+    'La caché local ya estaba vacía': 'A cache local já estava vazia',
+    'Caché local borrada': 'Cache local limpa',
+    'Borrar cuenta definitivamente': 'Eliminar conta definitivamente',
+    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.':
+        'O teu perfil, selfies, reações, mensagens e acesso ao Sunday Selfie serão eliminados. Esta ação não pode ser anulada.',
+    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.':
+        'Se fores a única pessoa administradora de um grupo, outro membro passará a administrá-lo. Os relatórios de segurança podem ser guardados para revisão.',
+    'Escribe BORRAR para confirmar:': 'Escreve BORRAR para confirmar:',
+    'Borrar definitivamente': 'Eliminar definitivamente',
+    '¿Quieres salir de Sunday Selfie en este dispositivo?':
+        'Queres sair do Sunday Selfie neste dispositivo?',
+    'Salir': 'Sair',
+    'Notificaciones activadas': 'Notificações ativadas',
+    'Activa o desactiva todas las notificaciones':
+        'Ativa ou desativa todas as notificações',
+    'TIPOS DE NOTIFICACIÓN': 'TIPOS DE NOTIFICAÇÃO',
+    'Recordatorio del domingo': 'Lembrete de domingo',
+    'Aviso el domingo para subir tu selfie':
+        'Aviso no domingo para carregares a tua selfie',
+    'Nuevos selfies': 'Novas selfies',
+    'Cuando alguien publica una selfie en tus grupos':
+        'Quando alguém publica uma selfie nos teus grupos',
+    'Recordatorios de amigos': 'Lembretes de amigos',
+    'Cuando un amigo te envía un zumbido para recordarte subir tu selfie':
+        'Quando um amigo te envia um lembrete para carregares a selfie',
+    'Nuevas reacciones': 'Novas reações',
+    'Cuando alguien reacciona a tu selfie': 'Quando alguém reage à tua selfie',
+    'Miembros y solicitudes': 'Membros e pedidos',
+    'Cuando alguien solicita entrar, se une o te aceptan':
+        'Quando alguém pede para entrar, se junta ou te aceita',
+    'Resumen semanal': 'Resumo semanal',
+    'Cada lunes con las fotos de la semana':
+        'Todas as segundas com as fotos da semana',
+    'Mensajes del chat': 'Mensagens do chat',
+    'Cuando alguien escribe o envía un GIF en un chat de grupo':
+        'Quando alguém escreve ou envia um GIF num chat de grupo',
+    'POR GRUPO': 'POR GRUPO',
+    'Sin grupos todavía': 'Ainda sem grupos',
+    'Cuando tengas grupos, podrás ajustar las notificaciones de cada uno.':
+        'Quando tiveres grupos, poderás ajustar as notificações de cada um.',
+    'DISPOSITIVO': 'DISPOSITIVO',
+    'Sonido': 'Som',
+    'Permite que las notificaciones suenen si el sistema lo permite':
+        'Permite som nas notificações se o sistema permitir',
+    'Vibración': 'Vibração',
+    'Permite vibración en avisos compatibles':
+        'Permite vibração em avisos compatíveis',
+    'Activadas': 'Ativadas',
+    'Desactivadas': 'Desativadas',
+    'Cuéntanos qué mejorarías': 'Diz-nos o que melhorarias',
+    'Enviar sugerencia': 'Enviar sugestão',
+    'Enviando...': 'A enviar...',
+    'Sugerencia enviada': 'Sugestão enviada',
+    'Sugerencia enviada. ¡Gracias!': 'Sugestão enviada. Obrigado!',
+    'Escribe un poco más para enviar la sugerencia':
+        'Escreve um pouco mais para enviar a sugestão',
+    'La sugerencia no puede superar 1000 caracteres':
+        'A sugestão não pode exceder 1000 caracteres',
+  },
+  'nl': {
+    'No se pudo iniciar Sunday Selfie': 'Sunday Selfie kon niet worden gestart',
+    'No se pudo preparar tu perfil': 'Je profiel kon niet worden voorbereid',
+    'Reintentar': 'Opnieuw proberen',
+    'Elige una foto': 'Kies een foto',
+    '¿De dónde quieres añadirla?': 'Waar wil je die vandaan toevoegen?',
+    'Galería': 'Galerij',
+    'Elige una foto guardada': 'Kies een opgeslagen foto',
+    'Haz una foto ahora': 'Maak nu een foto',
+    'Error guardando idioma: ': 'Fout bij opslaan van taal: ',
+    'Error guardando notificaciones: ': 'Fout bij opslaan van meldingen: ',
+    'Error enviando sugerencia: ': 'Fout bij verzenden van suggestie: ',
+    'Error borrando la cuenta: ': 'Fout bij verwijderen van account: ',
+    'No se pudo borrar la caché local: ':
+        'Lokale cache kon niet worden gewist: ',
+    'No se pudo abrir la galería: ': 'Galerij kon niet worden geopend: ',
+    'Error guardando perfil: ': 'Fout bij opslaan van profiel: ',
+    'Error: ': 'Fout: ',
+    'Usuario': 'Gebruiker',
+    'Grupo': 'Groep',
+    'Grupos': 'Groepen',
+    'Mis selfies': 'Mijn selfies',
+    'Cámara': 'Camera',
+    'Montaje': 'Montage',
+    'Perfil': 'Profiel',
+    'Miembro desde ahora': 'Lid vanaf nu',
+    'Notificaciones': 'Meldingen',
+    'Editar perfil': 'Profiel bewerken',
+    'Sugerencias': 'Suggesties',
+    'Ajustes': 'Instellingen',
+    'Idioma': 'Taal',
+    'Mis Sunday Selfies': 'Mijn Sunday Selfies',
+    '1 selfie publicado': '1 selfie geplaatst',
+    '{count} selfies publicados': '{count} selfies geplaatst',
+    'Semanas activo': 'Actieve weken',
+    'Selfies': 'Selfies',
+    'Perfil Sunday Selfie': 'Sunday Selfie-profiel',
+    'Puedes cambiarlo en cualquier momento':
+        'Je kunt dit op elk moment wijzigen',
+    'Tu nombre': 'Je naam',
+    'Siguiente': 'Volgende',
+    'Foto de perfil': 'Profielfoto',
+    'La foto de perfil se puede cambiar cada domingo':
+        'De profielfoto kan elke zondag worden gewijzigd',
+    'Añadir foto de perfil': 'Profielfoto toevoegen',
+    'Elige una imagen de galería o hazla ahora':
+        'Kies een foto uit je galerij of maak er nu een',
+    'Cambiar foto de perfil': 'Profielfoto wijzigen',
+    'Elige otra imagen o haz una nueva':
+        'Kies een andere foto of maak een nieuwe',
+    'Guardando...': 'Opslaan...',
+    '¡Empezar!': 'Starten',
+    'Atrás': 'Terug',
+    'Hoy puedes cambiar tu foto de perfil':
+        'Vandaag kun je je profielfoto wijzigen',
+    'NOMBRE': 'NAAM',
+    'Este es tu nombre en Sunday Selfie': 'Dit is je naam op Sunday Selfie',
+    'Guardado': 'Opgeslagen',
+    'Guardar cambios': 'Wijzigingen opslaan',
+    'Perfil actualizado': 'Profiel bijgewerkt',
+    'El nombre no puede estar vacío': 'De naam mag niet leeg zijn',
+    'Escribe tu nombre para continuar': 'Voer je naam in om door te gaan',
+    'IDIOMA': 'TAAL',
+    'Idioma de la app': 'App-taal',
+    'Elige el idioma de Sunday Selfie': 'Kies de taal van Sunday Selfie',
+    'Idioma actualizado': 'Taal bijgewerkt',
+    'ALMACENAMIENTO': 'OPSLAG',
+    'LEGAL': 'JURIDISCH',
+    'CUENTA': 'ACCOUNT',
+    'Borrar caché local': 'Lokale cache wissen',
+    'Libera espacio descargado localmente':
+        'Maakt lokaal gedownloade ruimte vrij',
+    'Borrando caché...': 'Cache wissen...',
+    '✅ Caché borrada': 'Cache gewist',
+    'Las fotos originales permanecen en la nube':
+        'Originele foto’s blijven in de cloud',
+    'Política de privacidad': 'Privacybeleid',
+    'Términos de uso': 'Gebruiksvoorwaarden',
+    'Borrar cuenta': 'Account verwijderen',
+    'Borrando cuenta...': 'Account verwijderen...',
+    'Elimina definitivamente tu perfil y contenido personal':
+        'Verwijdert je profiel en persoonlijke content permanent',
+    'Cerrar sesión': 'Uitloggen',
+    'Sale de Sunday Selfie en este dispositivo':
+        'Logt uit bij Sunday Selfie op dit apparaat',
+    '¿Borrar el contenido descargado?': 'Gedownloade content wissen?',
+    'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.':
+        'Dit heeft geen invloed op cloudcontent. Je kunt die opnieuw downloaden wanneer je wilt.',
+    'Borrar caché': 'Cache wissen',
+    'Cancelar': 'Annuleren',
+    'La caché local ya estaba vacía': 'De lokale cache was al leeg',
+    'Caché local borrada': 'Lokale cache gewist',
+    'Borrar cuenta definitivamente': 'Account permanent verwijderen',
+    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.':
+        'Je profiel, selfies, reacties, berichten en toegang tot Sunday Selfie worden verwijderd. Deze actie kan niet ongedaan worden gemaakt.',
+    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.':
+        'Als je de enige groepsbeheerder bent, wordt een ander lid beheerder. Veiligheidsmeldingen kunnen worden bewaard voor beoordeling.',
+    'Escribe BORRAR para confirmar:': 'Typ BORRAR om te bevestigen:',
+    'Borrar definitivamente': 'Permanent verwijderen',
+    '¿Quieres salir de Sunday Selfie en este dispositivo?':
+        'Wil je uitloggen bij Sunday Selfie op dit apparaat?',
+    'Salir': 'Uitloggen',
+    'Notificaciones activadas': 'Meldingen ingeschakeld',
+    'Activa o desactiva todas las notificaciones':
+        'Schakel alle meldingen in of uit',
+    'TIPOS DE NOTIFICACIÓN': 'MELDINGSTYPEN',
+    'Recordatorio del domingo': 'Zondagherinnering',
+    'Aviso el domingo para subir tu selfie':
+        'Herinnering op zondag om je selfie te uploaden',
+    'Nuevos selfies': 'Nieuwe selfies',
+    'Cuando alguien publica una selfie en tus grupos':
+        'Wanneer iemand een selfie in je groepen plaatst',
+    'Recordatorios de amigos': 'Herinneringen van vrienden',
+    'Cuando un amigo te envía un zumbido para recordarte subir tu selfie':
+        'Wanneer een vriend je herinnert om je selfie te uploaden',
+    'Nuevas reacciones': 'Nieuwe reacties',
+    'Cuando alguien reacciona a tu selfie':
+        'Wanneer iemand op je selfie reageert',
+    'Miembros y solicitudes': 'Leden en verzoeken',
+    'Cuando alguien solicita entrar, se une o te aceptan':
+        'Wanneer iemand vraagt om deel te nemen, deelneemt of jou accepteert',
+    'Resumen semanal': 'Wekelijkse samenvatting',
+    'Cada lunes con las fotos de la semana':
+        'Elke maandag met de foto’s van de week',
+    'Mensajes del chat': 'Chatberichten',
+    'Cuando alguien escribe o envía un GIF en un chat de grupo':
+        'Wanneer iemand schrijft of een GIF stuurt in een groepschat',
+    'POR GRUPO': 'PER GROEP',
+    'Sin grupos todavía': 'Nog geen groepen',
+    'Cuando tengas grupos, podrás ajustar las notificaciones de cada uno.':
+        'Wanneer je groepen hebt, kun je meldingen per groep aanpassen.',
+    'DISPOSITIVO': 'APPARAAT',
+    'Sonido': 'Geluid',
+    'Permite que las notificaciones suenen si el sistema lo permite':
+        'Laat meldingen geluid maken als het systeem dit toestaat',
+    'Vibración': 'Trilling',
+    'Permite vibración en avisos compatibles':
+        'Sta trilling toe voor ondersteunde meldingen',
+    'Activadas': 'Aan',
+    'Desactivadas': 'Uit',
+    'Cuéntanos qué mejorarías': 'Vertel ons wat je zou verbeteren',
+    'Enviar sugerencia': 'Suggestie verzenden',
+    'Enviando...': 'Verzenden...',
+    'Sugerencia enviada': 'Suggestie verzonden',
+    'Sugerencia enviada. ¡Gracias!': 'Suggestie verzonden. Bedankt!',
+    'Escribe un poco más para enviar la sugerencia':
+        'Schrijf iets meer om de suggestie te verzenden',
+    'La sugerencia no puede superar 1000 caracteres':
+        'De suggestie mag niet langer zijn dan 1000 tekens',
+  },
+  'pl': {
+    'No se pudo iniciar Sunday Selfie': 'Nie udało się uruchomić Sunday Selfie',
+    'No se pudo preparar tu perfil': 'Nie udało się przygotować profilu',
+    'Reintentar': 'Spróbuj ponownie',
+    'Elige una foto': 'Wybierz zdjęcie',
+    '¿De dónde quieres añadirla?': 'Skąd chcesz je dodać?',
+    'Galería': 'Galeria',
+    'Elige una foto guardada': 'Wybierz zapisane zdjęcie',
+    'Haz una foto ahora': 'Zrób zdjęcie teraz',
+    'Error guardando idioma: ': 'Błąd podczas zapisywania języka: ',
+    'Error guardando notificaciones: ':
+        'Błąd podczas zapisywania powiadomień: ',
+    'Error enviando sugerencia: ': 'Błąd podczas wysyłania sugestii: ',
+    'Error borrando la cuenta: ': 'Błąd podczas usuwania konta: ',
+    'No se pudo borrar la caché local: ':
+        'Nie udało się wyczyścić lokalnej cache: ',
+    'No se pudo abrir la galería: ': 'Nie udało się otworzyć galerii: ',
+    'Error guardando perfil: ': 'Błąd podczas zapisywania profilu: ',
+    'Error: ': 'Błąd: ',
+    'Usuario': 'Użytkownik',
+    'Grupo': 'Grupa',
+    'Grupos': 'Grupy',
+    'Mis selfies': 'Moje selfie',
+    'Cámara': 'Aparat',
+    'Montaje': 'Montaż',
+    'Perfil': 'Profil',
+    'Miembro desde ahora': 'Członek od teraz',
+    'Notificaciones': 'Powiadomienia',
+    'Editar perfil': 'Edytuj profil',
+    'Sugerencias': 'Sugestie',
+    'Ajustes': 'Ustawienia',
+    'Idioma': 'Język',
+    'Mis Sunday Selfies': 'Moje Sunday Selfies',
+    '1 selfie publicado': 'Opublikowano 1 selfie',
+    '{count} selfies publicados': 'Opublikowano {count} selfie',
+    'Semanas activo': 'Aktywne tygodnie',
+    'Selfies': 'Selfie',
+    'Perfil Sunday Selfie': 'Profil Sunday Selfie',
+    'Puedes cambiarlo en cualquier momento':
+        'Możesz to zmienić w dowolnej chwili',
+    'Tu nombre': 'Twoje imię',
+    'Siguiente': 'Dalej',
+    'Foto de perfil': 'Zdjęcie profilowe',
+    'La foto de perfil se puede cambiar cada domingo':
+        'Zdjęcie profilowe można zmieniać w każdą niedzielę',
+    'Añadir foto de perfil': 'Dodaj zdjęcie profilowe',
+    'Elige una imagen de galería o hazla ahora':
+        'Wybierz zdjęcie z galerii albo zrób je teraz',
+    'Cambiar foto de perfil': 'Zmień zdjęcie profilowe',
+    'Elige otra imagen o haz una nueva': 'Wybierz inne zdjęcie albo zrób nowe',
+    'Guardando...': 'Zapisywanie...',
+    '¡Empezar!': 'Start',
+    'Atrás': 'Wstecz',
+    'Hoy puedes cambiar tu foto de perfil':
+        'Dzisiaj możesz zmienić zdjęcie profilowe',
+    'NOMBRE': 'IMIĘ',
+    'Este es tu nombre en Sunday Selfie': 'To jest Twoje imię w Sunday Selfie',
+    'Guardado': 'Zapisano',
+    'Guardar cambios': 'Zapisz zmiany',
+    'Perfil actualizado': 'Profil zaktualizowany',
+    'El nombre no puede estar vacío': 'Imię nie może być puste',
+    'Escribe tu nombre para continuar': 'Wpisz imię, aby kontynuować',
+    'IDIOMA': 'JĘZYK',
+    'Idioma de la app': 'Język aplikacji',
+    'Elige el idioma de Sunday Selfie': 'Wybierz język Sunday Selfie',
+    'Idioma actualizado': 'Język zaktualizowany',
+    'ALMACENAMIENTO': 'PAMIĘĆ',
+    'LEGAL': 'PRAWNE',
+    'CUENTA': 'KONTO',
+    'Borrar caché local': 'Wyczyść lokalną pamięć cache',
+    'Libera espacio descargado localmente': 'Zwalnia miejsce pobrane lokalnie',
+    'Borrando caché...': 'Czyszczenie cache...',
+    '✅ Caché borrada': 'Cache wyczyszczona',
+    'Las fotos originales permanecen en la nube':
+        'Oryginalne zdjęcia pozostają w chmurze',
+    'Política de privacidad': 'Polityka prywatności',
+    'Términos de uso': 'Warunki korzystania',
+    'Borrar cuenta': 'Usuń konto',
+    'Borrando cuenta...': 'Usuwanie konta...',
+    'Elimina definitivamente tu perfil y contenido personal':
+        'Trwale usuwa profil i treści osobiste',
+    'Cerrar sesión': 'Wyloguj',
+    'Sale de Sunday Selfie en este dispositivo':
+        'Wylogowuje z Sunday Selfie na tym urządzeniu',
+    '¿Borrar el contenido descargado?': 'Usunąć pobrane treści?',
+    'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.':
+        'Nie wpływa to na treści w chmurze. Możesz pobrać je ponownie w dowolnym momencie.',
+    'Borrar caché': 'Wyczyść cache',
+    'Cancelar': 'Anuluj',
+    'La caché local ya estaba vacía': 'Lokalna cache była już pusta',
+    'Caché local borrada': 'Lokalna cache wyczyszczona',
+    'Borrar cuenta definitivamente': 'Trwale usuń konto',
+    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.':
+        'Twój profil, selfie, reakcje, wiadomości i dostęp do Sunday Selfie zostaną usunięte. Tej akcji nie można cofnąć.',
+    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.':
+        'Jeśli jesteś jedynym administratorem grupy, innemu członkowi zostanie nadana ta rola. Zgłoszenia bezpieczeństwa mogą być przechowywane do weryfikacji.',
+    'Escribe BORRAR para confirmar:': 'Wpisz BORRAR, aby potwierdzić:',
+    'Borrar definitivamente': 'Usuń trwale',
+    '¿Quieres salir de Sunday Selfie en este dispositivo?':
+        'Czy chcesz wylogować się z Sunday Selfie na tym urządzeniu?',
+    'Salir': 'Wyloguj',
+    'Notificaciones activadas': 'Powiadomienia włączone',
+    'Activa o desactiva todas las notificaciones':
+        'Włącz lub wyłącz wszystkie powiadomienia',
+    'TIPOS DE NOTIFICACIÓN': 'TYPY POWIADOMIEŃ',
+    'Recordatorio del domingo': 'Niedzielne przypomnienie',
+    'Aviso el domingo para subir tu selfie':
+        'Przypomnienie w niedzielę, aby przesłać selfie',
+    'Nuevos selfies': 'Nowe selfie',
+    'Cuando alguien publica una selfie en tus grupos':
+        'Gdy ktoś opublikuje selfie w Twoich grupach',
+    'Recordatorios de amigos': 'Przypomnienia od znajomych',
+    'Cuando un amigo te envía un zumbido para recordarte subir tu selfie':
+        'Gdy znajomy przypomina Ci o przesłaniu selfie',
+    'Nuevas reacciones': 'Nowe reakcje',
+    'Cuando alguien reacciona a tu selfie':
+        'Gdy ktoś zareaguje na Twoje selfie',
+    'Miembros y solicitudes': 'Członkowie i prośby',
+    'Cuando alguien solicita entrar, se une o te aceptan':
+        'Gdy ktoś prosi o dołączenie, dołącza albo akceptuje Ciebie',
+    'Resumen semanal': 'Podsumowanie tygodnia',
+    'Cada lunes con las fotos de la semana':
+        'W każdy poniedziałek ze zdjęciami tygodnia',
+    'Mensajes del chat': 'Wiadomości czatu',
+    'Cuando alguien escribe o envía un GIF en un chat de grupo':
+        'Gdy ktoś pisze lub wysyła GIF na czacie grupowym',
+    'POR GRUPO': 'WEDŁUG GRUPY',
+    'Sin grupos todavía': 'Brak grup',
+    'Cuando tengas grupos, podrás ajustar las notificaciones de cada uno.':
+        'Gdy będziesz mieć grupy, możesz dostosować powiadomienia dla każdej z nich.',
+    'DISPOSITIVO': 'URZĄDZENIE',
+    'Sonido': 'Dźwięk',
+    'Permite que las notificaciones suenen si el sistema lo permite':
+        'Pozwala powiadomieniom wydawać dźwięk, jeśli system na to pozwala',
+    'Vibración': 'Wibracja',
+    'Permite vibración en avisos compatibles':
+        'Pozwala na wibrację w obsługiwanych alertach',
+    'Activadas': 'Włączone',
+    'Desactivadas': 'Wyłączone',
+    'Cuéntanos qué mejorarías': 'Powiedz nam, co byś ulepszył',
+    'Enviar sugerencia': 'Wyślij sugestię',
+    'Enviando...': 'Wysyłanie...',
+    'Sugerencia enviada': 'Sugestia wysłana',
+    'Sugerencia enviada. ¡Gracias!': 'Sugestia wysłana. Dziękujemy!',
+    'Escribe un poco más para enviar la sugerencia':
+        'Napisz trochę więcej, aby wysłać sugestię',
+    'La sugerencia no puede superar 1000 caracteres':
+        'Sugestia nie może przekraczać 1000 znaków',
+  },
+  'ro': {
+    'No se pudo iniciar Sunday Selfie': 'Nu s-a putut porni Sunday Selfie',
+    'No se pudo preparar tu perfil': 'Nu s-a putut pregăti profilul',
+    'Reintentar': 'Încearcă din nou',
+    'Elige una foto': 'Alege o fotografie',
+    '¿De dónde quieres añadirla?': 'De unde vrei să o adaugi?',
+    'Galería': 'Galerie',
+    'Elige una foto guardada': 'Alege o fotografie salvată',
+    'Haz una foto ahora': 'Fă o fotografie acum',
+    'Error guardando idioma: ': 'Eroare la salvarea limbii: ',
+    'Error guardando notificaciones: ': 'Eroare la salvarea notificărilor: ',
+    'Error enviando sugerencia: ': 'Eroare la trimiterea sugestiei: ',
+    'Error borrando la cuenta: ': 'Eroare la ștergerea contului: ',
+    'No se pudo borrar la caché local: ':
+        'Nu s-a putut șterge cache-ul local: ',
+    'No se pudo abrir la galería: ': 'Nu s-a putut deschide galeria: ',
+    'Error guardando perfil: ': 'Eroare la salvarea profilului: ',
+    'Error: ': 'Eroare: ',
+    'Usuario': 'Utilizator',
+    'Grupo': 'Grup',
+    'Grupos': 'Grupuri',
+    'Mis selfies': 'Selfie-urile mele',
+    'Cámara': 'Cameră',
+    'Montaje': 'Montaj',
+    'Perfil': 'Profil',
+    'Miembro desde ahora': 'Membru de acum',
+    'Notificaciones': 'Notificări',
+    'Editar perfil': 'Editează profilul',
+    'Sugerencias': 'Sugestii',
+    'Ajustes': 'Setări',
+    'Idioma': 'Limbă',
+    'Mis Sunday Selfies': 'Sunday Selfies ale mele',
+    '1 selfie publicado': '1 selfie publicat',
+    '{count} selfies publicados': '{count} selfie-uri publicate',
+    'Semanas activo': 'Săptămâni active',
+    'Selfies': 'Selfie-uri',
+    'Perfil Sunday Selfie': 'Profil Sunday Selfie',
+    'Puedes cambiarlo en cualquier momento': 'Îl poți schimba oricând',
+    'Tu nombre': 'Numele tău',
+    'Siguiente': 'Următorul',
+    'Foto de perfil': 'Fotografie de profil',
+    'La foto de perfil se puede cambiar cada domingo':
+        'Fotografia de profil poate fi schimbată în fiecare duminică',
+    'Añadir foto de perfil': 'Adaugă fotografie de profil',
+    'Elige una imagen de galería o hazla ahora':
+        'Alege o imagine din galerie sau fă una acum',
+    'Cambiar foto de perfil': 'Schimbă fotografia de profil',
+    'Elige otra imagen o haz una nueva': 'Alege altă imagine sau fă una nouă',
+    'Guardando...': 'Se salvează...',
+    '¡Empezar!': 'Începe',
+    'Atrás': 'Înapoi',
+    'Hoy puedes cambiar tu foto de perfil':
+        'Astăzi îți poți schimba fotografia de profil',
+    'NOMBRE': 'NUME',
+    'Este es tu nombre en Sunday Selfie':
+        'Acesta este numele tău în Sunday Selfie',
+    'Guardado': 'Salvat',
+    'Guardar cambios': 'Salvează modificările',
+    'Perfil actualizado': 'Profil actualizat',
+    'El nombre no puede estar vacío': 'Numele nu poate fi gol',
+    'Escribe tu nombre para continuar': 'Scrie numele pentru a continua',
+    'IDIOMA': 'LIMBĂ',
+    'Idioma de la app': 'Limba aplicației',
+    'Elige el idioma de Sunday Selfie': 'Alege limba Sunday Selfie',
+    'Idioma actualizado': 'Limbă actualizată',
+    'ALMACENAMIENTO': 'STOCARE',
+    'LEGAL': 'LEGAL',
+    'CUENTA': 'CONT',
+    'Borrar caché local': 'Șterge cache-ul local',
+    'Libera espacio descargado localmente': 'Eliberează spațiu descărcat local',
+    'Borrando caché...': 'Se șterge cache-ul...',
+    '✅ Caché borrada': 'Cache șters',
+    'Las fotos originales permanecen en la nube':
+        'Fotografiile originale rămân în cloud',
+    'Política de privacidad': 'Politica de confidențialitate',
+    'Términos de uso': 'Termeni de utilizare',
+    'Borrar cuenta': 'Șterge contul',
+    'Borrando cuenta...': 'Se șterge contul...',
+    'Elimina definitivamente tu perfil y contenido personal':
+        'Șterge definitiv profilul și conținutul personal',
+    'Cerrar sesión': 'Deconectare',
+    'Sale de Sunday Selfie en este dispositivo':
+        'Te deconectează de la Sunday Selfie pe acest dispozitiv',
+    '¿Borrar el contenido descargado?': 'Ștergi conținutul descărcat?',
+    'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.':
+        'Nu afectează conținutul din cloud. Îl poți descărca din nou oricând.',
+    'Borrar caché': 'Șterge cache',
+    'Cancelar': 'Anulează',
+    'La caché local ya estaba vacía': 'Cache-ul local era deja gol',
+    'Caché local borrada': 'Cache local șters',
+    'Borrar cuenta definitivamente': 'Șterge definitiv contul',
+    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.':
+        'Profilul, selfie-urile, reacțiile, mesajele și accesul la Sunday Selfie vor fi șterse. Această acțiune nu poate fi anulată.',
+    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.':
+        'Dacă ești singura persoană administrator a unui grup, un alt membru va deveni administrator. Raportările de siguranță pot fi păstrate pentru revizuire.',
+    'Escribe BORRAR para confirmar:': 'Scrie BORRAR pentru confirmare:',
+    'Borrar definitivamente': 'Șterge definitiv',
+    '¿Quieres salir de Sunday Selfie en este dispositivo?':
+        'Vrei să ieși din Sunday Selfie pe acest dispozitiv?',
+    'Salir': 'Ieși',
+    'Notificaciones activadas': 'Notificări activate',
+    'Activa o desactiva todas las notificaciones':
+        'Activează sau dezactivează toate notificările',
+    'TIPOS DE NOTIFICACIÓN': 'TIPURI DE NOTIFICĂRI',
+    'Recordatorio del domingo': 'Memento de duminică',
+    'Aviso el domingo para subir tu selfie':
+        'Memento duminică pentru a încărca selfie-ul',
+    'Nuevos selfies': 'Selfie-uri noi',
+    'Cuando alguien publica una selfie en tus grupos':
+        'Când cineva publică un selfie în grupurile tale',
+    'Recordatorios de amigos': 'Mementouri de la prieteni',
+    'Cuando un amigo te envía un zumbido para recordarte subir tu selfie':
+        'Când un prieten îți amintește să încarci selfie-ul',
+    'Nuevas reacciones': 'Reacții noi',
+    'Cuando alguien reacciona a tu selfie':
+        'Când cineva reacționează la selfie-ul tău',
+    'Miembros y solicitudes': 'Membri și cereri',
+    'Cuando alguien solicita entrar, se une o te aceptan':
+        'Când cineva cere să intre, se alătură sau te acceptă',
+    'Resumen semanal': 'Rezumat săptămânal',
+    'Cada lunes con las fotos de la semana':
+        'În fiecare luni cu fotografiile săptămânii',
+    'Mensajes del chat': 'Mesaje de chat',
+    'Cuando alguien escribe o envía un GIF en un chat de grupo':
+        'Când cineva scrie sau trimite un GIF într-un chat de grup',
+    'POR GRUPO': 'PE GRUP',
+    'Sin grupos todavía': 'Încă nu există grupuri',
+    'Cuando tengas grupos, podrás ajustar las notificaciones de cada uno.':
+        'Când vei avea grupuri, vei putea ajusta notificările fiecăruia.',
+    'DISPOSITIVO': 'DISPOZITIV',
+    'Sonido': 'Sunet',
+    'Permite que las notificaciones suenen si el sistema lo permite':
+        'Permite notificărilor să emită sunet dacă sistemul permite',
+    'Vibración': 'Vibrație',
+    'Permite vibración en avisos compatibles':
+        'Permite vibrația pentru alerte compatibile',
+    'Activadas': 'Activate',
+    'Desactivadas': 'Dezactivate',
+    'Cuéntanos qué mejorarías': 'Spune-ne ce ai îmbunătăți',
+    'Enviar sugerencia': 'Trimite sugestia',
+    'Enviando...': 'Se trimite...',
+    'Sugerencia enviada': 'Sugestie trimisă',
+    'Sugerencia enviada. ¡Gracias!': 'Sugestie trimisă. Mulțumim!',
+    'Escribe un poco más para enviar la sugerencia':
+        'Scrie puțin mai mult pentru a trimite sugestia',
+    'La sugerencia no puede superar 1000 caracteres':
+        'Sugestia nu poate depăși 1000 de caractere',
+  },
+};
+
+const Map<String, Map<String, String>> kSundayExtraTranslations = {
+  'en': {
+    'Continuar': 'Continue',
+    'Volver': 'Back',
+    'Cerrar': 'Close',
+    'Opciones': 'Options',
+    'Ordenar': 'Sort',
+    'Filtrar': 'Filter',
+    'Guardar': 'Save',
+    'Crear grupo': 'Create group',
+    'Creando...': 'Creating...',
+    'Nuevo grupo': 'New group',
+    '+ Nuevo grupo': '+ New group',
+    'Crear un grupo nuevo': 'Create a new group',
+    'Elige un nombre y empieza como administrador.':
+        'Choose a name and start as admin.',
+    'FOTO O EMOTICONO': 'PHOTO OR EMOJI',
+    'NOMBRE DEL GRUPO': 'GROUP NAME',
+    'COLOR': 'COLOR',
+    'Emoticono': 'Emoji',
+    'Ej: Los de siempre': 'E.g. The usual ones',
+    'Entrada con aprobación': 'Entry with approval',
+    'Quien use tu invitación enviará una solicitud. Tú decides si entra al grupo.':
+        'Anyone who uses your invitation sends a request. You decide whether they join the group.',
+    'Solicitud de acceso': 'Access request',
+    'Unirme a un grupo': 'Join a group',
+    'Revisa el grupo antes de enviar tu solicitud.':
+        'Review the group before sending your request.',
+    'Pega el enlace o escribe el código de invitación que te hayan enviado.':
+        'Paste the link or enter the invitation code you were sent.',
+    'INVITACIÓN': 'INVITATION',
+    'Pegar desde portapapeles': 'Paste from clipboard',
+    'Comprobando invitación': 'Checking invitation',
+    'Sin acceso al grupo': 'No access to the group',
+    'Introduce el código que te ha pasado un administrador.':
+        'Enter the code an admin gave you.',
+    'Entrar al grupo': 'Enter group',
+    'Volver a grupos': 'Back to groups',
+    'Unirme con código': 'Join with code',
+    'INFORMACIÓN': 'INFORMATION',
+    'Tiempo activo': 'Active time',
+    '1 semana': '1 week',
+    '{count} semanas': '{count} weeks',
+    'semana': 'week',
+    'semanas': 'weeks',
+    'foto': 'photo',
+    'fotos': 'photos',
+    'MIEMBROS': 'MEMBERS',
+    'SOLICITUDES': 'REQUESTS',
+    'REPORTES': 'REPORTS',
+    'EXPULSADOS': 'REMOVED',
+    '{section} — {count}': '{section} — {count}',
+    'AJUSTES DEL GRUPO': 'GROUP SETTINGS',
+    'INVITAR AMIGOS': 'INVITE FRIENDS',
+    'Foto': 'Photo',
+    'Nombre': 'Name',
+    'Descargar': 'Download',
+    'Invitar': 'Invite',
+    'Código': 'Code',
+    'SIN CÓDIGO': 'NO CODE',
+    'Regenerar código': 'Regenerate code',
+    'Regenerar invitación': 'Regenerate invitation',
+    'El código anterior dejará de funcionar. Tendrás que compartir el nuevo código.':
+        'The previous code will stop working. You will need to share the new code.',
+    'Regenerar': 'Regenerate',
+    'Abandonar grupo': 'Leave group',
+    '¿Seguro que quieres abandonar {groupName}?':
+        'Are you sure you want to leave {groupName}?',
+    'Abandonar': 'Leave',
+    'Cambiar nombre del grupo': 'Change group name',
+    'Nombre del grupo': 'Group name',
+    'Cambiar nombre en este grupo': 'Change name in this group',
+    'Tu nombre en este grupo': 'Your name in this group',
+    'Grupo no encontrado': 'Group not found',
+    'No hay miembros todavía.': 'No members yet.',
+    'Publicó esta semana': 'Posted this week',
+    'Aún no ha publicado': 'Has not posted yet',
+    'Tú': 'You',
+    'Administrador': 'Admin',
+    'Miembro': 'Member',
+    'Enviar otro zumbido': 'Send another buzz',
+    'Cada miembro del grupo solo puede recibir un zumbido por domingo y por grupo. Para poder enviar otro zumbido se debe ver un anuncio.':
+        'Each group member can only receive one buzz per Sunday per group. To send another buzz, you need to watch an ad.',
+    'Zumbido enviado': 'Buzz sent',
+    'Enviar zumbido': 'Send buzz',
+    'Anuncio...': 'Ad...',
+    'Cargando anuncio': 'Loading ad',
+    'Cargando anuncio...': 'Loading ad...',
+    'Anuncio visto': 'Ad watched',
+    'Ver anuncio': 'Watch ad',
+    'Ver anuncio para confirmar': 'Watch ad to confirm',
+    'Ver anuncio para reemplazar': 'Watch ad to replace',
+    'Ver anuncio y rehacer': 'Watch ad and retake',
+    'Subir Sunday Selfie': 'Upload Sunday Selfie',
+    'Completa el anuncio para enviar otro zumbido':
+        'Complete the ad to send another buzz',
+    'Completa el anuncio para reemplazar la foto de perfil':
+        'Complete the ad to replace the profile photo',
+    'Completa el anuncio para reemplazar tu selfie':
+        'Complete the ad to replace your selfie',
+    'Anuncio completado. Actualizando foto...':
+        'Ad completed. Updating photo...',
+    'Anuncio completado. Preparando montaje...':
+        'Ad completed. Preparing montage...',
+    'Anuncio completado. Ya puedes enviar el zumbido.':
+        'Ad completed. You can send the buzz now.',
+    'Reemplazar foto de perfil': 'Replace profile photo',
+    'Para usar esta selfie como foto de perfil tienes que ver un anuncio.':
+        'To use this selfie as your profile photo, you need to watch an ad.',
+    'Subir con un día de retraso': 'Upload one day late',
+    'Para poder subir el Sunday Selfie el lunes hay que ver un anuncio.':
+        'To upload the Sunday Selfie on Monday, you need to watch an ad.',
+    'Una selfie por domingo': 'One selfie per Sunday',
+    'Ya has publicado tu Sunday Selfie en {groupName}.':
+        'You have already posted your Sunday Selfie in {groupName}.',
+    'Publicada hoy': 'Posted today',
+    'Reemplazo excepcional': 'Exceptional replacement',
+    'Sunday Selfie está pensado para guardar un único momento real de cada domingo.':
+        'Sunday Selfie is designed to keep one real moment from each Sunday.',
+    'Puedes rehacerla una sola vez viendo un anuncio. La cámara se abrirá al terminar.':
+        'You can retake it once after watching an ad. The camera will open when it ends.',
+    'Puedes reemplazarla de forma excepcional después de ver un anuncio. La cámara se abrirá cuando el anuncio termine.':
+        'You can replace it exceptionally after watching an ad. The camera will open when the ad ends.',
+    'Conservar mi selfie actual': 'Keep my current selfie',
+    'Sunday Selfie pendiente': 'Sunday Selfie pending',
+    'Sunday Selfie no publicado': 'Sunday Selfie not posted',
+    'La ventana de subida está cerrada': 'The upload window is closed',
+    'Solo cámara in-app · sin galería': 'In-app camera only · no gallery',
+    'Reportar esta selfie': 'Report this selfie',
+    'El reporte será privado y se enviará para revisión.':
+        'The report will be private and sent for review.',
+    'Reportar selfie': 'Report selfie',
+    'Enviar para revisión privada': 'Send for private review',
+    'Contenido inapropiado': 'Inappropriate content',
+    'Acoso o intimidación': 'Harassment or intimidation',
+    'Spam o contenido engañoso': 'Spam or misleading content',
+    'Otro motivo': 'Other reason',
+    'Reporte enviado para revisión': 'Report sent for review',
+    'Retirar selfie reportada': 'Remove reported selfie',
+    'La selfie de {name} dejará de verse en el grupo y el reporte quedará resuelto.':
+        "{name}'s selfie will no longer be shown in the group and the report will be resolved.",
+    'Retirar selfie': 'Remove selfie',
+    'Borrar selfie': 'Delete selfie',
+    'Esta selfie se eliminará definitivamente, también de la nube. Esta acción no se puede deshacer.':
+        'This selfie will be permanently deleted, including from the cloud. This action cannot be undone.',
+    'Sí, borrar': 'Yes, delete',
+    'Eliminar definitivamente': 'Delete permanently',
+    'Descargar selfie': 'Download selfie',
+    'Guardar en galería': 'Save to gallery',
+    'Esta selfie no tiene una imagen disponible':
+        'This selfie does not have an available image',
+    'Foto de perfil actualizada': 'Profile photo updated',
+    'Guardando selfie...': 'Saving selfie...',
+    'Selfie guardada en el teléfono': 'Selfie saved to the phone',
+    'Selfie borrada definitivamente': 'Selfie permanently deleted',
+    'Solo puedes usar tus propias selfies': 'You can only use your own selfies',
+    'Solo puedes borrar tus propias selfies':
+        'You can only delete your own selfies',
+    'Inicia sesión para reaccionar': 'Sign in to react',
+    'Sube tu selfie semanal para poder reaccionar':
+        'Upload your weekly selfie to react',
+    'Mensaje': 'Message',
+    'Chat de domingo finalizado': 'Sunday chat finished',
+    'CHAT · {weekLabel}': 'CHAT · {weekLabel}',
+    'Minimizar chat': 'Minimize chat',
+    'Buscar en Tenor': 'Search Tenor',
+    'Buscar GIFs': 'Search GIFs',
+    'Todos': 'All',
+    'Favoritos': 'Favorites',
+    'Caras': 'Faces',
+    'Corazones': 'Hearts',
+    'Banderas': 'Flags',
+    'Comida': 'Food',
+    'Naturaleza': 'Nature',
+    'Objetos': 'Objects',
+    'Personas': 'People',
+    'Planes': 'Plans',
+    'Símbolos': 'Symbols',
+    'Viajes': 'Travel',
+    'Más recientes': 'Newest',
+    'Anteriores': 'Earlier',
+    'Más antiguas': 'Oldest',
+    'Por grupo': 'By group',
+    'Por semana': 'By week',
+    'Todos los grupos': 'All groups',
+    '1 Sunday Selfie': '1 Sunday Selfie',
+    '{count} Sunday Selfies': '{count} Sunday Selfies',
+    'Última selfie': 'Latest selfie',
+    'Semana {weekNumber} / {year}': 'Week {weekNumber} / {year}',
+    'Semana {weekNumber}': 'Week {weekNumber}',
+    'Sem {weekNumber} · {year}': 'Wk {weekNumber} · {year}',
+    'ESTA SEMANA': 'THIS WEEK',
+    'HOY ES': 'TODAY IS',
+    'Lunes': 'Monday',
+    'Martes': 'Tuesday',
+    'Miércoles': 'Wednesday',
+    'Jueves': 'Thursday',
+    'Viernes': 'Friday',
+    'Sábado': 'Saturday',
+    'Domingo': 'Sunday',
+    '¡Sube tu selfie del domingo!': 'Upload your Sunday selfie!',
+    '¡Toca esperar!': 'Time to wait!',
+    'día hasta el domingo': 'day until Sunday',
+    'días hasta el domingo': 'days until Sunday',
+    'Falta para publicar': 'Time until posting',
+    'Tiempo restante': 'Time remaining',
+    'Próxima ventana': 'Next window',
+    'La subida se abrirá el domingo a las {time}':
+        'Uploads open on Sunday at {time}',
+    'Puedes publicar hasta las {time}': 'You can post until {time}',
+    'La subida volverá a abrirse el próximo domingo a las {time}':
+        'Uploads will reopen next Sunday at {time}',
+    'Hoy se actualiza el grupo': 'The group updates today',
+    'Selfies publicados esta semana': 'Selfies posted this week',
+    'Todavía no hay selfies': 'No selfies yet',
+    'Selecciona semanas': 'Select weeks',
+    'Descargar {weekCount} {weekLabel} · {photoCount} {photoLabel}':
+        'Download {weekCount} {weekLabel} · {photoCount} {photoLabel}',
+    'Únete a mi grupo de Sunday Selfie: {inviteLink}':
+        'Join my Sunday Selfie group: {inviteLink}',
+    'Invitación a {groupName}': 'Invitation to {groupName}',
+    'Únete a "{groupName}"': 'Join "{groupName}"',
+    'Compartido por {channelName}': 'Shared via {channelName}',
+    'Compartiendo...': 'Sharing...',
+    'Copiar enlace': 'Copy link',
+    '📤 Enviar enlace de invitación': '📤 Send invitation link',
+    '🔑 Copiar código de invitación': '🔑 Copy invitation code',
+    '🔄 Regenerar código': '🔄 Regenerate code',
+    'Expulsar usuario': 'Remove user',
+    '¿Quieres expulsar a {name} del grupo?':
+        'Do you want to remove {name} from the group?',
+    'Expulsar': 'Remove',
+    'Permitir nueva solicitud': 'Allow new request',
+    '{name} podrá volver a solicitar entrada usando una invitación válida.':
+        '{name} will be able to request access again using a valid invitation.',
+    'Permitir': 'Allow',
+    '{name} ahora es administrador': '{name} is now an admin',
+    '{name} expulsado del grupo': '{name} removed from the group',
+    '{name} puede volver a solicitar entrada':
+        '{name} can request access again',
+    '{count} selfies guardadas en el teléfono':
+        '{count} selfies saved to the phone',
+    'No hay texto copiado': 'No copied text',
+    'Invitación no válida': 'Invalid invitation',
+    'No hay invitación disponible todavía': 'No invitation available yet',
+    'Código copiado': 'Code copied',
+    'Código de invitación regenerado': 'Invitation code regenerated',
+    'Grupo eliminado de la app': 'Group removed from the app',
+    'Has abandonado el grupo': 'You left the group',
+    'Nombre del grupo actualizado': 'Group name updated',
+    'Actualizando foto del grupo...': 'Updating group photo...',
+    'Foto del grupo actualizada': 'Group photo updated',
+    'Nombre actualizado sólo en este grupo': 'Name updated only in this group',
+    'Solicitud aceptada': 'Request accepted',
+    'Solicitud rechazada': 'Request rejected',
+    'No hay selfies para descargar': 'No selfies to download',
+    'No hay semanas para descargar': 'No weeks to download',
+    'Guardando selfies...': 'Saving selfies...',
+    'Guardando montaje...': 'Saving montage...',
+    'No se pudo generar el montaje': 'Could not generate the montage',
+    'No se pudo compartir el montaje': 'Could not share the montage',
+    'Aún no tienes grupos': 'You do not have groups yet',
+    'Crea o únete a un grupo para empezar a guardar tus Sunday Selfies.':
+        'Create or join a group to start saving your Sunday Selfies.',
+    'Crea o únete a un grupo para preparar montajes semanales.':
+        'Create or join a group to prepare weekly montages.',
+    'Crea uno o únete con un código de invitación':
+        'Create one or join with an invitation code',
+    'Error abandonando grupo: ': 'Error leaving group: ',
+    'Error actualizando foto: ': 'Error updating photo: ',
+    'Error actualizando nombre: ': 'Error updating name: ',
+    'Error al reaccionar: ': 'Error reacting: ',
+    'Error borrando la selfie: ': 'Error deleting selfie: ',
+    'Error enviando el reporte: ': 'Error sending report: ',
+    'Error haciendo foto: ': 'Error taking photo: ',
+    'Error regenerando invitación: ': 'Error regenerating invitation: ',
+    'Error resolviendo reporte: ': 'Error resolving report: ',
+    'No se pudo eliminar el grupo: ': 'Could not remove the group: ',
+    'No se pudo iniciar sesión con Apple: ': 'Could not sign in with Apple: ',
+    'No se pudo iniciar sesión con Google: ': 'Could not sign in with Google: ',
+    'No se pudo completar el anuncio: ': 'Could not complete the ad: ',
+  },
+  'fr': {
+    'Continuar': 'Continuer',
+    'Volver': 'Retour',
+    'Cerrar': 'Fermer',
+    'Opciones': 'Options',
+    'Ordenar': 'Trier',
+    'Filtrar': 'Filtrer',
+    'Guardar': 'Enregistrer',
+    'Crear grupo': 'Créer le groupe',
+    'Creando...': 'Création...',
+    'Nuevo grupo': 'Nouveau groupe',
+    '+ Nuevo grupo': '+ Nouveau groupe',
+    'Crear un grupo nuevo': 'Créer un nouveau groupe',
+    'Elige un nombre y empieza como administrador.':
+        'Choisissez un nom et commencez comme administrateur.',
+    'FOTO O EMOTICONO': 'PHOTO OU EMOJI',
+    'NOMBRE DEL GRUPO': 'NOM DU GROUPE',
+    'COLOR': 'COULEUR',
+    'Emoticono': 'Emoji',
+    'Ej: Los de siempre': 'Ex. : Les habituels',
+    'Entrada con aprobación': 'Entrée avec approbation',
+    'Quien use tu invitación enviará una solicitud. Tú decides si entra al grupo.':
+        'Toute personne utilisant votre invitation envoie une demande. Vous décidez si elle rejoint le groupe.',
+    'Solicitud de acceso': 'Demande d’accès',
+    'Unirme a un grupo': 'Rejoindre un groupe',
+    'Revisa el grupo antes de enviar tu solicitud.':
+        'Vérifiez le groupe avant d’envoyer votre demande.',
+    'Pega el enlace o escribe el código de invitación que te hayan enviado.':
+        'Collez le lien ou saisissez le code d’invitation reçu.',
+    'INVITACIÓN': 'INVITATION',
+    'Pegar desde portapapeles': 'Coller depuis le presse-papiers',
+    'Comprobando invitación': 'Vérification de l’invitation',
+    'Sin acceso al grupo': 'Aucun accès au groupe',
+    'Introduce el código que te ha pasado un administrador.':
+        'Saisissez le code fourni par un administrateur.',
+    'Entrar al grupo': 'Entrer dans le groupe',
+    'Volver a grupos': 'Retour aux groupes',
+    'Unirme con código': 'Rejoindre avec un code',
+    'INFORMACIÓN': 'INFORMATIONS',
+    'Tiempo activo': 'Temps actif',
+    '1 semana': '1 semaine',
+    '{count} semanas': '{count} semaines',
+    'semana': 'semaine',
+    'semanas': 'semaines',
+    'foto': 'photo',
+    'fotos': 'photos',
+    'MIEMBROS': 'MEMBRES',
+    'SOLICITUDES': 'DEMANDES',
+    'REPORTES': 'SIGNALEMENTS',
+    'EXPULSADOS': 'EXCLUS',
+    '{section} — {count}': '{section} — {count}',
+    'AJUSTES DEL GRUPO': 'RÉGLAGES DU GROUPE',
+    'INVITAR AMIGOS': 'INVITER DES AMIS',
+    'Foto': 'Photo',
+    'Nombre': 'Nom',
+    'Descargar': 'Télécharger',
+    'Invitar': 'Inviter',
+    'Código': 'Code',
+    'SIN CÓDIGO': 'AUCUN CODE',
+    'Regenerar código': 'Régénérer le code',
+    'Regenerar invitación': 'Régénérer l’invitation',
+    'El código anterior dejará de funcionar. Tendrás que compartir el nuevo código.':
+        'L’ancien code cessera de fonctionner. Vous devrez partager le nouveau code.',
+    'Regenerar': 'Régénérer',
+    'Abandonar grupo': 'Quitter le groupe',
+    '¿Seguro que quieres abandonar {groupName}?':
+        'Voulez-vous vraiment quitter {groupName} ?',
+    'Abandonar': 'Quitter',
+    'Cambiar nombre del grupo': 'Changer le nom du groupe',
+    'Nombre del grupo': 'Nom du groupe',
+    'Cambiar nombre en este grupo': 'Changer le nom dans ce groupe',
+    'Tu nombre en este grupo': 'Votre nom dans ce groupe',
+    'Grupo no encontrado': 'Groupe introuvable',
+    'No hay miembros todavía.': 'Aucun membre pour le moment.',
+    'Publicó esta semana': 'A publié cette semaine',
+    'Aún no ha publicado': 'N’a pas encore publié',
+    'Tú': 'Vous',
+    'Administrador': 'Administrateur',
+    'Miembro': 'Membre',
+    'Enviar otro zumbido': 'Envoyer un autre rappel',
+    'Cada miembro del grupo solo puede recibir un zumbido por domingo y por grupo. Para poder enviar otro zumbido se debe ver un anuncio.':
+        'Chaque membre du groupe ne peut recevoir qu’un rappel par dimanche et par groupe. Pour en envoyer un autre, il faut regarder une annonce.',
+    'Zumbido enviado': 'Rappel envoyé',
+    'Enviar zumbido': 'Envoyer un rappel',
+    'Anuncio...': 'Annonce...',
+    'Cargando anuncio': 'Chargement de l’annonce',
+    'Cargando anuncio...': 'Chargement de l’annonce...',
+    'Anuncio visto': 'Annonce vue',
+    'Ver anuncio': 'Voir l’annonce',
+    'Ver anuncio para confirmar': 'Voir l’annonce pour confirmer',
+    'Ver anuncio para reemplazar': 'Voir l’annonce pour remplacer',
+    'Ver anuncio y rehacer': 'Voir l’annonce et refaire',
+    'Subir Sunday Selfie': 'Publier Sunday Selfie',
+    'Completa el anuncio para enviar otro zumbido':
+        'Terminez l’annonce pour envoyer un autre rappel',
+    'Completa el anuncio para reemplazar la foto de perfil':
+        'Terminez l’annonce pour remplacer la photo de profil',
+    'Completa el anuncio para reemplazar tu selfie':
+        'Terminez l’annonce pour remplacer votre selfie',
+    'Anuncio completado. Actualizando foto...':
+        'Annonce terminée. Mise à jour de la photo...',
+    'Anuncio completado. Preparando montaje...':
+        'Annonce terminée. Préparation du montage...',
+    'Anuncio completado. Ya puedes enviar el zumbido.':
+        'Annonce terminée. Vous pouvez envoyer le rappel.',
+    'Reemplazar foto de perfil': 'Remplacer la photo de profil',
+    'Para usar esta selfie como foto de perfil tienes que ver un anuncio.':
+        'Pour utiliser ce selfie comme photo de profil, vous devez voir une annonce.',
+    'Subir con un día de retraso': 'Publier avec un jour de retard',
+    'Para poder subir el Sunday Selfie el lunes hay que ver un anuncio.':
+        'Pour publier le Sunday Selfie le lundi, il faut voir une annonce.',
+    'Una selfie por domingo': 'Un selfie par dimanche',
+    'Ya has publicado tu Sunday Selfie en {groupName}.':
+        'Vous avez déjà publié votre Sunday Selfie dans {groupName}.',
+    'Publicada hoy': 'Publiée aujourd’hui',
+    'Reemplazo excepcional': 'Remplacement exceptionnel',
+    'Sunday Selfie está pensado para guardar un único momento real de cada domingo.':
+        'Sunday Selfie est conçu pour garder un seul moment réel de chaque dimanche.',
+    'Puedes rehacerla una sola vez viendo un anuncio. La cámara se abrirá al terminar.':
+        'Vous pouvez la refaire une seule fois après avoir vu une annonce. La caméra s’ouvrira à la fin.',
+    'Puedes reemplazarla de forma excepcional después de ver un anuncio. La cámara se abrirá cuando el anuncio termine.':
+        'Vous pouvez le remplacer exceptionnellement après avoir vu une annonce. La caméra s’ouvrira à la fin de l’annonce.',
+    'Conservar mi selfie actual': 'Conserver mon selfie actuel',
+    'Sunday Selfie pendiente': 'Sunday Selfie en attente',
+    'Sunday Selfie no publicado': 'Sunday Selfie non publié',
+    'La ventana de subida está cerrada': 'La fenêtre de publication est fermée',
+    'Solo cámara in-app · sin galería':
+        'Caméra intégrée uniquement · pas de galerie',
+    'Reportar esta selfie': 'Signaler ce selfie',
+    'El reporte será privado y se enviará para revisión.':
+        'Le signalement sera privé et envoyé pour examen.',
+    'Reportar selfie': 'Signaler le selfie',
+    'Enviar para revisión privada': 'Envoyer pour examen privé',
+    'Contenido inapropiado': 'Contenu inapproprié',
+    'Acoso o intimidación': 'Harcèlement ou intimidation',
+    'Spam o contenido engañoso': 'Spam ou contenu trompeur',
+    'Otro motivo': 'Autre motif',
+    'Reporte enviado para revisión': 'Signalement envoyé pour examen',
+    'Retirar selfie reportada': 'Retirer le selfie signalé',
+    'La selfie de {name} dejará de verse en el grupo y el reporte quedará resuelto.':
+        'Le selfie de {name} ne sera plus visible dans le groupe et le signalement sera résolu.',
+    'Retirar selfie': 'Retirer le selfie',
+    'Borrar selfie': 'Supprimer le selfie',
+    'Esta selfie se eliminará definitivamente, también de la nube. Esta acción no se puede deshacer.':
+        'Ce selfie sera définitivement supprimé, y compris du cloud. Cette action est irréversible.',
+    'Sí, borrar': 'Oui, supprimer',
+    'Eliminar definitivamente': 'Supprimer définitivement',
+    'Descargar selfie': 'Télécharger le selfie',
+    'Guardar en galería': 'Enregistrer dans la galerie',
+    'Esta selfie no tiene una imagen disponible':
+        'Ce selfie n’a pas d’image disponible',
+    'Foto de perfil actualizada': 'Photo de profil mise à jour',
+    'Guardando selfie...': 'Enregistrement du selfie...',
+    'Selfie guardada en el teléfono': 'Selfie enregistré sur le téléphone',
+    'Selfie borrada definitivamente': 'Selfie supprimé définitivement',
+    'Solo puedes usar tus propias selfies':
+        'Vous ne pouvez utiliser que vos propres selfies',
+    'Solo puedes borrar tus propias selfies':
+        'Vous ne pouvez supprimer que vos propres selfies',
+    'Inicia sesión para reaccionar': 'Connectez-vous pour réagir',
+    'Sube tu selfie semanal para poder reaccionar':
+        'Publiez votre selfie hebdomadaire pour réagir',
+    'Mensaje': 'Message',
+    'Chat de domingo finalizado': 'Chat du dimanche terminé',
+    'CHAT · {weekLabel}': 'CHAT · {weekLabel}',
+    'Minimizar chat': 'Réduire le chat',
+    'Buscar en Tenor': 'Rechercher sur Tenor',
+    'Buscar GIFs': 'Rechercher des GIF',
+    'Todos': 'Tous',
+    'Favoritos': 'Favoris',
+    'Caras': 'Visages',
+    'Corazones': 'Cœurs',
+    'Banderas': 'Drapeaux',
+    'Comida': 'Nourriture',
+    'Naturaleza': 'Nature',
+    'Objetos': 'Objets',
+    'Personas': 'Personnes',
+    'Planes': 'Projets',
+    'Símbolos': 'Symboles',
+    'Viajes': 'Voyages',
+    'Más recientes': 'Plus récents',
+    'Anteriores': 'Précédents',
+    'Más antiguas': 'Plus anciens',
+    'Por grupo': 'Par groupe',
+    'Por semana': 'Par semaine',
+    'Todos los grupos': 'Tous les groupes',
+    '1 Sunday Selfie': '1 Sunday Selfie',
+    '{count} Sunday Selfies': '{count} Sunday Selfies',
+    'Última selfie': 'Dernier selfie',
+    'Semana {weekNumber} / {year}': 'Semaine {weekNumber} / {year}',
+    'Semana {weekNumber}': 'Semaine {weekNumber}',
+    'Sem {weekNumber} · {year}': 'Sem. {weekNumber} · {year}',
+    'ESTA SEMANA': 'CETTE SEMAINE',
+    'HOY ES': 'AUJOURD’HUI',
+    'Lunes': 'Lundi',
+    'Martes': 'Mardi',
+    'Miércoles': 'Mercredi',
+    'Jueves': 'Jeudi',
+    'Viernes': 'Vendredi',
+    'Sábado': 'Samedi',
+    'Domingo': 'Dimanche',
+    '¡Sube tu selfie del domingo!': 'Publiez votre selfie du dimanche !',
+    '¡Toca esperar!': 'Il faut attendre !',
+    'día hasta el domingo': 'jour avant dimanche',
+    'días hasta el domingo': 'jours avant dimanche',
+    'Falta para publicar': 'Temps avant publication',
+    'Tiempo restante': 'Temps restant',
+    'Próxima ventana': 'Prochaine fenêtre',
+    'La subida se abrirá el domingo a las {time}':
+        'La publication ouvrira dimanche à {time}',
+    'Puedes publicar hasta las {time}': 'Vous pouvez publier jusqu’à {time}',
+    'La subida volverá a abrirse el próximo domingo a las {time}':
+        'La publication rouvrira dimanche prochain à {time}',
+    'Hoy se actualiza el grupo': 'Le groupe se met à jour aujourd’hui',
+    'Selfies publicados esta semana': 'Selfies publiés cette semaine',
+    'Todavía no hay selfies': 'Aucun selfie pour le moment',
+    'Selecciona semanas': 'Sélectionnez des semaines',
+    'Descargar {weekCount} {weekLabel} · {photoCount} {photoLabel}':
+        'Télécharger {weekCount} {weekLabel} · {photoCount} {photoLabel}',
+    'Únete a mi grupo de Sunday Selfie: {inviteLink}':
+        'Rejoins mon groupe Sunday Selfie : {inviteLink}',
+    'Invitación a {groupName}': 'Invitation à {groupName}',
+    'Únete a "{groupName}"': 'Rejoignez « {groupName} »',
+    'Compartido por {channelName}': 'Partagé via {channelName}',
+    'Compartiendo...': 'Partage...',
+    'Copiar enlace': 'Copier le lien',
+    '📤 Enviar enlace de invitación': '📤 Envoyer le lien d’invitation',
+    '🔑 Copiar código de invitación': '🔑 Copier le code d’invitation',
+    '🔄 Regenerar código': '🔄 Régénérer le code',
+    'Expulsar usuario': 'Expulser l’utilisateur',
+    '¿Quieres expulsar a {name} del grupo?':
+        'Voulez-vous expulser {name} du groupe ?',
+    'Expulsar': 'Expulser',
+    'Permitir nueva solicitud': 'Autoriser une nouvelle demande',
+    '{name} podrá volver a solicitar entrada usando una invitación válida.':
+        '{name} pourra redemander l’accès avec une invitation valide.',
+    'Permitir': 'Autoriser',
+    '{name} ahora es administrador': '{name} est maintenant administrateur',
+    '{name} expulsado del grupo': '{name} expulsé du groupe',
+    '{name} puede volver a solicitar entrada': '{name} peut redemander l’accès',
+    '{count} selfies guardadas en el teléfono':
+        '{count} selfies enregistrés sur le téléphone',
+    'No hay texto copiado': 'Aucun texte copié',
+    'Invitación no válida': 'Invitation non valide',
+    'No hay invitación disponible todavía':
+        'Aucune invitation disponible pour le moment',
+    'Código copiado': 'Code copié',
+    'Código de invitación regenerado': 'Code d’invitation régénéré',
+    'Grupo eliminado de la app': 'Groupe supprimé de l’app',
+    'Has abandonado el grupo': 'Vous avez quitté le groupe',
+    'Nombre del grupo actualizado': 'Nom du groupe mis à jour',
+    'Actualizando foto del grupo...': 'Mise à jour de la photo du groupe...',
+    'Foto del grupo actualizada': 'Photo du groupe mise à jour',
+    'Nombre actualizado sólo en este grupo':
+        'Nom mis à jour uniquement dans ce groupe',
+    'Solicitud aceptada': 'Demande acceptée',
+    'Solicitud rechazada': 'Demande refusée',
+    'No hay selfies para descargar': 'Aucun selfie à télécharger',
+    'No hay semanas para descargar': 'Aucune semaine à télécharger',
+    'Guardando selfies...': 'Enregistrement des selfies...',
+    'Guardando montaje...': 'Enregistrement du montage...',
+    'No se pudo generar el montaje': 'Impossible de générer le montage',
+    'No se pudo compartir el montaje': 'Impossible de partager le montage',
+    'Aún no tienes grupos': 'Vous n’avez pas encore de groupes',
+    'Crea o únete a un grupo para empezar a guardar tus Sunday Selfies.':
+        'Créez ou rejoignez un groupe pour commencer à garder vos Sunday Selfies.',
+    'Crea o únete a un grupo para preparar montajes semanales.':
+        'Créez ou rejoignez un groupe pour préparer des montages hebdomadaires.',
+    'Crea uno o únete con un código de invitación':
+        'Créez-en un ou rejoignez avec un code d’invitation',
+    'Error abandonando grupo: ': 'Erreur en quittant le groupe : ',
+    'Error actualizando foto: ': 'Erreur lors de la mise à jour de la photo : ',
+    'Error actualizando nombre: ': 'Erreur lors de la mise à jour du nom : ',
+    'Error al reaccionar: ': 'Erreur lors de la réaction : ',
+    'Error borrando la selfie: ': 'Erreur lors de la suppression du selfie : ',
+    'Error enviando el reporte: ': 'Erreur lors de l’envoi du signalement : ',
+    'Error haciendo foto: ': 'Erreur lors de la prise de photo : ',
+    'Error regenerando invitación: ':
+        'Erreur lors de la régénération de l’invitation : ',
+    'Error resolviendo reporte: ':
+        'Erreur lors de la résolution du signalement : ',
+    'No se pudo eliminar el grupo: ': 'Impossible de supprimer le groupe : ',
+    'No se pudo iniciar sesión con Apple: ':
+        'Impossible de se connecter avec Apple : ',
+    'No se pudo iniciar sesión con Google: ':
+        'Impossible de se connecter avec Google : ',
+    'No se pudo completar el anuncio: ': 'Impossible de terminer l’annonce : ',
+  },
+};
+
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  runApp(const MyApp());
+}
+
+Future<void> inicializarServiciosDeArranque() async {
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]);
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  await FirebaseAppCheck.instance.activate(
-    providerAndroid: kDebugMode
-        ? const AndroidDebugProvider()
-        : const AndroidPlayIntegrityProvider(),
-    providerApple: kDebugMode
-        ? const AppleDebugProvider()
-        : const AppleAppAttestWithDeviceCheckFallbackProvider(),
-  );
+  if (Firebase.apps.isEmpty) {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+  }
+  if (kIsWeb) {
+    await FirebaseAppCheck.instance.activate(providerWeb: WebDebugProvider());
+  } else {
+    await FirebaseAppCheck.instance.activate(
+      providerAndroid: kDebugMode
+          ? const AndroidDebugProvider()
+          : const AndroidPlayIntegrityProvider(),
+      providerApple: kDebugMode
+          ? const AppleDebugProvider()
+          : const AppleAppAttestWithDeviceCheckFallbackProvider(),
+    );
+  }
   if (!kIsWeb && (Platform.isAndroid || Platform.isIOS)) {
     unawaited(MobileAds.instance.initialize());
   }
-
-  runApp(const MyApp());
 }
 
 Future<void> crearUsuarioSiNoExiste(User user) async {
@@ -929,6 +3246,7 @@ Future<void> crearUsuarioSiNoExiste(User user) async {
         'lastActiveAt': FieldValue.serverTimestamp(),
         'profileOnboardingCompleted': false,
         'profileOnboardingCompletedAt': null,
+        'languageCode': sundayLanguageController.languageCode,
         'notificationSettings': kDefaultNotificationSettings,
         'notificationSettingsDefaultsVersion': 3,
       });
@@ -1046,7 +3364,7 @@ Future<String> actualizarFotoPerfilUsuario({
     throw Exception('La foto de perfil solo se puede cambiar los domingos');
   }
 
-  await validarFotoSelfie(foto);
+  await validarFotoPerfil(foto);
 
   final firestore = FirebaseFirestore.instance;
   final storage = FirebaseStorage.instance;
@@ -1097,7 +3415,14 @@ Future<String> actualizarFotoPerfilUsuario({
 Future<void> reemplazarFotoPerfilConSelfie({
   required User user,
   required String selfieUrl,
+  required String weekKey,
 }) async {
+  if (!puedeUsarSelfieComoFotoPerfil(weekKey)) {
+    throw Exception(
+      'Solo puedes usar como foto de perfil tu selfie de este domingo o del lunes posterior',
+    );
+  }
+
   final trimmedUrl = selfieUrl.trim();
   if (trimmedUrl.isEmpty) {
     throw Exception('Esta selfie no tiene una imagen disponible');
@@ -1261,7 +3586,7 @@ Future<void> actualizarPerfilInicialUsuario({
     throw Exception('El nombre no puede estar vacío');
   }
 
-  await validarFotoSelfie(foto);
+  await validarFotoPerfil(foto);
 
   final firestore = FirebaseFirestore.instance;
   final storage = FirebaseStorage.instance;
@@ -1347,6 +3672,8 @@ const int kSelfieUploadMaxLongEdge = 1920;
 const int kSelfieUploadJpegQuality = 88;
 const int kSelfieThumbnailMaxLongEdge = 720;
 const int kSelfieThumbnailJpegQuality = 82;
+const int kProfilePhotoOutputSize = 1024;
+const int kProfilePhotoJpegQuality = 88;
 
 final Set<String> _validatedSelfiePhotoPaths = <String>{};
 
@@ -1359,6 +3686,29 @@ class SelfiePhotoValidationException implements Exception {
   String toString() => message;
 }
 
+class ProfilePhotoDraft {
+  final XFile photo;
+  final int imageWidth;
+  final int imageHeight;
+  final Alignment alignment;
+
+  const ProfilePhotoDraft({
+    required this.photo,
+    required this.imageWidth,
+    required this.imageHeight,
+    this.alignment = Alignment.center,
+  });
+
+  ProfilePhotoDraft copyWith({Alignment? alignment}) {
+    return ProfilePhotoDraft(
+      photo: photo,
+      imageWidth: imageWidth,
+      imageHeight: imageHeight,
+      alignment: alignment ?? this.alignment,
+    );
+  }
+}
+
 Map<String, int>? _decodeOrientedImageSize(Uint8List bytes) {
   final decodedImage = image_lib.decodeImage(bytes);
   if (decodedImage == null) return null;
@@ -1367,6 +3717,52 @@ Map<String, int>? _decodeOrientedImageSize(Uint8List bytes) {
     'width': decodedImage.width,
     'height': decodedImage.height,
   };
+}
+
+Uint8List? _createProfilePhotoAvatarBytes(Map<String, Object> payload) {
+  final bytes = payload['bytes'] as Uint8List?;
+  final alignmentX = (payload['alignmentX'] as num?)?.toDouble() ?? 0;
+  final alignmentY = (payload['alignmentY'] as num?)?.toDouble() ?? 0;
+  if (bytes == null || bytes.isEmpty) return null;
+
+  final decodedImage = image_lib.decodeImage(bytes);
+  if (decodedImage == null) return null;
+
+  final orientedImage = image_lib.bakeOrientation(decodedImage);
+  final width = orientedImage.width;
+  final height = orientedImage.height;
+  final side = math.min(width, height);
+  if (width <= 0 || height <= 0 || side <= 0) return null;
+
+  final extraX = math.max(0, width - side);
+  final extraY = math.max(0, height - side);
+  final normalizedX = ((alignmentX.clamp(-1.0, 1.0) + 1) / 2).toDouble();
+  final normalizedY = ((alignmentY.clamp(-1.0, 1.0) + 1) / 2).toDouble();
+  final cropX = (extraX * normalizedX).round().clamp(0, extraX).toInt();
+  final cropY = (extraY * normalizedY).round().clamp(0, extraY).toInt();
+  final croppedImage = image_lib.copyCrop(
+    orientedImage,
+    x: cropX,
+    y: cropY,
+    width: side,
+    height: side,
+  );
+
+  final image_lib.Image outputImage;
+  if (side > kProfilePhotoOutputSize) {
+    outputImage = image_lib.copyResize(
+      croppedImage,
+      width: kProfilePhotoOutputSize,
+      height: kProfilePhotoOutputSize,
+      interpolation: image_lib.Interpolation.cubic,
+    );
+  } else {
+    outputImage = croppedImage;
+  }
+
+  return Uint8List.fromList(
+    image_lib.encodeJpg(outputImage, quality: kProfilePhotoJpegQuality),
+  );
 }
 
 Uint8List? _createSelfieThumbnailBytes(Uint8List bytes) {
@@ -1462,6 +3858,54 @@ String _safeTempFilePart(String value) {
       .trim();
 }
 
+Future<ProfilePhotoDraft> crearBorradorFotoPerfil(XFile foto) async {
+  final bytes = await foto.readAsBytes();
+  final dimensions = await compute<Uint8List, Map<String, int>?>(
+    _decodeOrientedImageSize,
+    bytes,
+  );
+
+  final width = dimensions?['width'] ?? 0;
+  final height = dimensions?['height'] ?? 0;
+
+  if (width <= 0 || height <= 0) {
+    throw const SelfiePhotoValidationException(kSelfieValidationFailedMessage);
+  }
+
+  await _validarFotoTieneCara(foto);
+
+  return ProfilePhotoDraft(photo: foto, imageWidth: width, imageHeight: height);
+}
+
+Future<XFile> crearArchivoFotoPerfilAjustadaTemporal({
+  required ProfilePhotoDraft draft,
+}) async {
+  final bytes = await draft.photo.readAsBytes();
+  final avatarBytes = await compute<Map<String, Object>, Uint8List?>(
+    _createProfilePhotoAvatarBytes,
+    <String, Object>{
+      'bytes': bytes,
+      'alignmentX': draft.alignment.x,
+      'alignmentY': draft.alignment.y,
+    },
+  );
+
+  if (avatarBytes == null || avatarBytes.isEmpty) {
+    throw const SelfiePhotoValidationException(kSelfieValidationFailedMessage);
+  }
+
+  final timestamp = DateTime.now().microsecondsSinceEpoch;
+  final file = File(
+    '${Directory.systemTemp.path}/sunday_profile_avatar_$timestamp.jpg',
+  );
+  await file.writeAsBytes(avatarBytes, flush: true);
+  return XFile(
+    file.path,
+    mimeType: 'image/jpeg',
+    name: 'profile_avatar_$timestamp.jpg',
+  );
+}
+
 Future<File> _prepararArchivoSelfieParaSubidaTemporal({
   required XFile foto,
   required String groupId,
@@ -1552,6 +3996,42 @@ Future<void> validarFotoSelfie(XFile foto) async {
     throw const SelfiePhotoValidationException(kSelfieNotPortraitMessage);
   }
 
+  await _validarFotoTieneCara(
+    foto,
+    cacheKey: cacheKey,
+    validatedCache: _validatedSelfiePhotoPaths,
+  );
+}
+
+Future<void> validarFotoPerfil(XFile foto) async {
+  final bytes = await foto.readAsBytes();
+  final dimensions = await compute<Uint8List, Map<String, int>?>(
+    _decodeOrientedImageSize,
+    bytes,
+  );
+
+  final width = dimensions?['width'] ?? 0;
+  final height = dimensions?['height'] ?? 0;
+
+  if (width <= 0 || height <= 0) {
+    throw const SelfiePhotoValidationException(kSelfieValidationFailedMessage);
+  }
+
+  await _validarFotoTieneCara(foto);
+}
+
+Future<void> _validarFotoTieneCara(
+  XFile foto, {
+  String? cacheKey,
+  Set<String>? validatedCache,
+}) async {
+  final trimmedCacheKey = cacheKey?.trim();
+  if (trimmedCacheKey != null &&
+      trimmedCacheKey.isNotEmpty &&
+      validatedCache?.contains(trimmedCacheKey) == true) {
+    return;
+  }
+
   final detector = FaceDetector(
     options: FaceDetectorOptions(
       performanceMode: FaceDetectorMode.fast,
@@ -1571,8 +4051,8 @@ Future<void> validarFotoSelfie(XFile foto) async {
       throw const SelfiePhotoValidationException(kSelfieNoFaceMessage);
     }
 
-    if (cacheKey.isNotEmpty) {
-      _validatedSelfiePhotoPaths.add(cacheKey);
+    if (trimmedCacheKey != null && trimmedCacheKey.isNotEmpty) {
+      validatedCache?.add(trimmedCacheKey);
     }
   } on SelfiePhotoValidationException {
     rethrow;
@@ -1634,15 +4114,95 @@ bool _isEmojiSkinToneModifier(int value) {
   return value >= 0x1F3FB && value <= 0x1F3FF;
 }
 
+const int _emojiZeroWidthJoiner = 0x200D;
+const int _emojiVariationSelector16 = 0xFE0F;
+const int _emojiMaleSign = 0x2642;
+const int _emojiFemaleSign = 0x2640;
+const int _emojiMan = 0x1F468;
+const int _emojiWoman = 0x1F469;
+const int _emojiPerson = 0x1F9D1;
+
+const Set<int> _emojiNeutralPersonSequenceComponents = {
+  0x2695, // health worker
+  0x2696, // judge
+  0x2708, // pilot
+  0x1F33E, // farmer
+  0x1F373, // cook
+  0x1F37C, // feeding baby
+  0x1F393, // student
+  0x1F3A4, // singer
+  0x1F3A8, // artist
+  0x1F3EB, // teacher
+  0x1F3ED, // factory worker
+  0x1F4BB, // technologist
+  0x1F4BC, // office worker
+  0x1F527, // mechanic
+  0x1F52C, // scientist
+  0x1F680, // astronaut
+  0x1F692, // firefighter
+  0x1F9AF, // person with white cane
+  0x1F9B0, // red hair
+  0x1F9B1, // curly hair
+  0x1F9B2, // bald
+  0x1F9B3, // white hair
+  0x1F9BC, // person in motorized wheelchair
+  0x1F9BD, // person in manual wheelchair
+};
+
+bool _isEmojiGenderSign(int value) {
+  return value == _emojiMaleSign || value == _emojiFemaleSign;
+}
+
+List<int> _emojiWithoutSkinToneAndGenderMarkers(String emoji) {
+  final codePoints = emoji.runes
+      .where((value) => !_isEmojiSkinToneModifier(value))
+      .toList(growable: false);
+  final normalized = <int>[];
+
+  for (var index = 0; index < codePoints.length; index += 1) {
+    final value = codePoints[index];
+    if (value == _emojiZeroWidthJoiner &&
+        index + 1 < codePoints.length &&
+        _isEmojiGenderSign(codePoints[index + 1])) {
+      index += 1;
+      if (index + 1 < codePoints.length &&
+          codePoints[index + 1] == _emojiVariationSelector16) {
+        index += 1;
+      }
+      continue;
+    }
+
+    normalized.add(value);
+  }
+
+  return normalized;
+}
+
+List<int> _emojiWithNeutralPersonLeader(List<int> codePoints) {
+  if (codePoints.length < 3 ||
+      codePoints[1] != _emojiZeroWidthJoiner ||
+      (codePoints.first != _emojiMan && codePoints.first != _emojiWoman)) {
+    return codePoints;
+  }
+
+  final sequenceComponent = codePoints[2];
+  if (!_emojiNeutralPersonSequenceComponents.contains(sequenceComponent)) {
+    return codePoints;
+  }
+
+  return [_emojiPerson, ...codePoints.skip(1)];
+}
+
 String emojiReactionGroupKey(String emoji) {
   final cleanEmoji = normalizarEmojiReaccion(emoji);
   if (cleanEmoji.isEmpty) return '';
 
-  final codePoints = cleanEmoji.runes
-      .where((value) => !_isEmojiSkinToneModifier(value))
-      .toList(growable: false);
-  final base = String.fromCharCodes(codePoints);
-  return normalizarEmojiReaccion(base).isEmpty ? cleanEmoji : base;
+  final codePoints = _emojiWithNeutralPersonLeader(
+    _emojiWithoutSkinToneAndGenderMarkers(cleanEmoji),
+  );
+  if (codePoints.isEmpty) return cleanEmoji;
+
+  return String.fromCharCodes(codePoints);
 }
 
 List<EmojiReactionChoiceGroup> agruparEmojisReaccion(List<String> emojis) {
@@ -1675,6 +4235,188 @@ List<EmojiReactionChoiceGroup> agruparEmojisReaccion(List<String> emojis) {
         );
       })
       .toList(growable: false);
+}
+
+Future<String?> _showEmojiVariantPopover({
+  required BuildContext context,
+  required EmojiReactionChoiceGroup group,
+  required String selectedEmoji,
+  Offset? anchor,
+}) {
+  return showGeneralDialog<String>(
+    context: context,
+    barrierDismissible: true,
+    barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
+    barrierColor: Colors.transparent,
+    transitionDuration: const Duration(milliseconds: 130),
+    pageBuilder: (context, _, _) => _EmojiVariantPopoverRouteBody(
+      anchor: anchor,
+      selectedEmoji: selectedEmoji,
+      variants: group.variants,
+    ),
+    transitionBuilder: (context, animation, _, child) {
+      final curved = CurvedAnimation(
+        parent: animation,
+        curve: Curves.easeOutCubic,
+        reverseCurve: Curves.easeInCubic,
+      );
+
+      return FadeTransition(
+        opacity: curved,
+        child: ScaleTransition(
+          scale: Tween<double>(begin: 0.96, end: 1).animate(curved),
+          child: child,
+        ),
+      );
+    },
+  );
+}
+
+class _EmojiVariantPopoverRouteBody extends StatelessWidget {
+  final Offset? anchor;
+  final String selectedEmoji;
+  final List<String> variants;
+
+  const _EmojiVariantPopoverRouteBody({
+    required this.anchor,
+    required this.selectedEmoji,
+    required this.variants,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final mediaQuery = MediaQuery.of(context);
+    final screenSize = mediaQuery.size;
+    const screenPadding = 12.0;
+    const popoverPadding = 8.0;
+    const itemExtent = 42.0;
+    const itemSpacing = 5.0;
+
+    final availableWidth = math.max(
+      itemExtent + popoverPadding * 2,
+      screenSize.width - screenPadding * 2,
+    );
+    final maxColumns = math.max(
+      1,
+      ((availableWidth - popoverPadding * 2 + itemSpacing) /
+              (itemExtent + itemSpacing))
+          .floor(),
+    );
+    final columnCount = math.max(1, math.min(variants.length, maxColumns));
+    final rowCount = (variants.length / columnCount).ceil();
+    final popoverWidth =
+        popoverPadding * 2 +
+        columnCount * itemExtent +
+        math.max(0, columnCount - 1) * itemSpacing;
+    final naturalHeight =
+        popoverPadding * 2 +
+        rowCount * itemExtent +
+        math.max(0, rowCount - 1) * itemSpacing;
+    final maxPopoverHeight = math.min(
+      284.0,
+      math.max(
+        itemExtent + popoverPadding * 2,
+        screenSize.height - mediaQuery.padding.vertical - 32,
+      ),
+    );
+    final popoverHeight = math.min(naturalHeight, maxPopoverHeight);
+    final resolvedAnchor =
+        anchor ?? Offset(screenSize.width / 2, screenSize.height / 2);
+    final maxLeft = math.max(
+      screenPadding,
+      screenSize.width - popoverWidth - screenPadding,
+    );
+    final left = (resolvedAnchor.dx - popoverWidth / 2)
+        .clamp(screenPadding, maxLeft)
+        .toDouble();
+    final safeTop = mediaQuery.padding.top + 8;
+    final safeBottom = screenSize.height - mediaQuery.padding.bottom - 8;
+    final maxTop = math.max(safeTop, safeBottom - popoverHeight);
+    var top = resolvedAnchor.dy - popoverHeight - 12;
+
+    if (top < safeTop) {
+      top = resolvedAnchor.dy + 12;
+    }
+
+    top = top.clamp(safeTop, maxTop).toDouble();
+
+    return Material(
+      type: MaterialType.transparency,
+      child: Stack(
+        children: [
+          Positioned(
+            left: left,
+            top: top,
+            width: popoverWidth,
+            height: popoverHeight,
+            child: _EmojiVariantPopoverContent(
+              selectedEmoji: selectedEmoji,
+              variants: variants,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _EmojiVariantPopoverContent extends StatelessWidget {
+  final String selectedEmoji;
+  final List<String> variants;
+
+  const _EmojiVariantPopoverContent({
+    required this.selectedEmoji,
+    required this.variants,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white,
+      elevation: 14,
+      shadowColor: Colors.black.withValues(alpha: 0.18),
+      borderRadius: BorderRadius.circular(24),
+      clipBehavior: Clip.antiAlias,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(8),
+        physics: const BouncingScrollPhysics(),
+        child: Wrap(
+          spacing: 5,
+          runSpacing: 5,
+          children: variants
+              .map((emoji) {
+                final selected = emoji == selectedEmoji;
+
+                return Material(
+                  color: selected ? ssOrangeLight : Colors.transparent,
+                  borderRadius: BorderRadius.circular(14),
+                  child: InkWell(
+                    onTap: () => Navigator.of(context).pop(emoji),
+                    borderRadius: BorderRadius.circular(14),
+                    child: Container(
+                      width: 42,
+                      height: 42,
+                      alignment: Alignment.center,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(
+                          color: selected ? ssOrange : Colors.transparent,
+                          width: selected ? 1.5 : 1,
+                        ),
+                      ),
+                      child: Text(
+                        emoji,
+                        style: const TextStyle(fontSize: 24, height: 1),
+                      ),
+                    ),
+                  ),
+                );
+              })
+              .toList(growable: false),
+        ),
+      ),
+    );
+  }
 }
 
 const List<EmojiReactionSection> kSundayReactionEmojiCategorySections = [
@@ -6083,6 +8825,26 @@ class CreatedGroupInfo {
   const CreatedGroupInfo({required this.groupId, required this.inviteCode});
 }
 
+class GroupInvitePreview {
+  final String groupId;
+  final String name;
+  final int memberCount;
+  final String? emoji;
+  final int? colorValue;
+  final bool isMember;
+  final bool hasRequest;
+
+  const GroupInvitePreview({
+    required this.groupId,
+    required this.name,
+    required this.memberCount,
+    required this.emoji,
+    required this.colorValue,
+    required this.isMember,
+    required this.hasRequest,
+  });
+}
+
 Future<CreatedGroupInfo> crearGrupoMinimo({
   required String nombreGrupo,
   XFile? groupPhoto,
@@ -6266,6 +9028,40 @@ Future<String?> resolverGroupIdDesdeInvitacion(String codigo) async {
   return null;
 }
 
+Future<GroupInvitePreview?> resolverVistaPreviaInvitacion(String codigo) async {
+  final inviteCode = normalizarEntradaInvitacion(codigo);
+  if (inviteCode.isEmpty) return null;
+
+  try {
+    final callable = FirebaseFunctions.instance.httpsCallable(
+      'resolverInvitacionGrupo',
+    );
+    final result = await callable.call<dynamic>({'inviteCode': inviteCode});
+    final data = result.data;
+
+    if (data is! Map) return null;
+
+    final groupId = (data['groupId'] ?? '').toString().trim();
+    if (groupId.isEmpty) return null;
+
+    return GroupInvitePreview(
+      groupId: groupId,
+      name: (data['name'] ?? 'Grupo').toString(),
+      memberCount: intFromValue(data['memberCount']),
+      emoji: nonEmptyStringOrNull(data['emoji']),
+      colorValue: data['colorValue'] is int ? data['colorValue'] as int : null,
+      isMember: data['isMember'] == true,
+      hasRequest: data['hasRequest'] == true,
+    );
+  } on FirebaseFunctionsException catch (error) {
+    logDebug('No se pudo resolver la vista previa de invitación: $error');
+    return null;
+  } catch (error) {
+    logDebug('No se pudo resolver la vista previa de invitación: $error');
+    return null;
+  }
+}
+
 int calcularNumeroSemanaISO(DateTime fecha) {
   final jueves = fecha.add(Duration(days: 3 - ((fecha.weekday + 6) % 7)));
   final primerJueves = DateTime(jueves.year, 1, 4);
@@ -6356,6 +9152,19 @@ bool sundaySelfieSiguePendiente(String weekKey, {DateTime? now}) {
 
   return isCurrentSunday ||
       puedeSubirSelfieLunesConRetraso(weekKey, now: current);
+}
+
+bool puedeUsarSelfieComoFotoPerfil(String weekKey, {DateTime? now}) {
+  final cleanWeekKey = weekKey.trim();
+  if (cleanWeekKey.isEmpty) return false;
+
+  final current = now ?? DateTime.now();
+  final isCurrentSundaySelfie =
+      esDomingo(now: current) &&
+      cleanWeekKey == obtenerWeekKeyActual(now: current);
+
+  return isCurrentSundaySelfie ||
+      puedeSubirSelfieLunesConRetraso(cleanWeekKey, now: current);
 }
 
 String missingSundaySelfieStatusLabel(String weekKey, {DateTime? now}) {
@@ -6595,6 +9404,24 @@ int comparableTimestampMillis(dynamic value) {
   if (value is DateTime) return value.millisecondsSinceEpoch;
   if (value is int) return value;
   return 0;
+}
+
+int compareUserGroupsBySelfieOrChatActivity(
+  Map<String, dynamic> aData,
+  Map<String, dynamic> bData,
+) {
+  final aActivity = comparableTimestampMillis(
+    aData['lastSelfieOrChatActivityAt'],
+  );
+  final bActivity = comparableTimestampMillis(
+    bData['lastSelfieOrChatActivityAt'],
+  );
+  final activityComparison = bActivity.compareTo(aActivity);
+  if (activityComparison != 0) return activityComparison;
+
+  final aJoined = comparableTimestampMillis(aData['joinedAt']);
+  final bJoined = comparableTimestampMillis(bData['joinedAt']);
+  return bJoined.compareTo(aJoined);
 }
 
 int intFromValue(dynamic value, {int fallback = 0}) {
@@ -7201,6 +10028,7 @@ Future<void> publicarSelfieReal({
   required XFile foto,
   String? weekKey,
   bool rewardedAdWatched = false,
+  bool replaceExisting = false,
 }) async {
   final currentWeekKey = obtenerWeekKeyActual();
   final targetWeekKey = weekKey ?? currentWeekKey;
@@ -7209,9 +10037,19 @@ Future<void> publicarSelfieReal({
       targetWeekKey == currentWeekKey && window.canUpload;
   final isLateMondayUpload =
       rewardedAdWatched && puedeSubirSelfieLunesConRetraso(targetWeekKey);
+  final isRewardedReplacement =
+      replaceExisting && rewardedAdWatched && isRegularSundayUpload;
 
   if (!isRegularSundayUpload && !isLateMondayUpload) {
     throw Exception('La ventana de subida está cerrada');
+  }
+
+  if (replaceExisting && !isRewardedReplacement) {
+    throw Exception(
+      rewardedAdWatched
+          ? 'El reemplazo solo está disponible durante la ventana de subida'
+          : 'Completa el anuncio para reemplazar tu selfie',
+    );
   }
 
   final firestore = FirebaseFirestore.instance;
@@ -7225,17 +10063,39 @@ Future<void> publicarSelfieReal({
   final postRef = weekRef.collection('posts').doc(user.uid);
   final existingPost = await postRef.get();
 
-  if (existingPost.exists) {
+  if (existingPost.exists && !isRewardedReplacement) {
     throw Exception('Ya has publicado tu selfie de esta semana');
+  }
+  if (!existingPost.exists && isRewardedReplacement) {
+    throw Exception('No se encontró una selfie para reemplazar');
   }
 
   await validarFotoSelfie(foto);
 
-  final storagePath = 'groups/$groupId/weeks/$targetWeekKey/${user.uid}.jpg';
-  final thumbnailStoragePath =
-      'groups/$groupId/weeks/$targetWeekKey/thumbs/${user.uid}.jpg';
+  final replacementUploadId = isRewardedReplacement
+      ? DateTime.now().microsecondsSinceEpoch.toString()
+      : null;
+  final replacementFileName = replacementUploadId == null
+      ? null
+      : '${user.uid}_$replacementUploadId.jpg';
+  final storagePath = isRewardedReplacement
+      ? 'groups/$groupId/weeks/$targetWeekKey/replacements/$replacementFileName'
+      : 'groups/$groupId/weeks/$targetWeekKey/${user.uid}.jpg';
+  final thumbnailStoragePath = isRewardedReplacement
+      ? 'groups/$groupId/weeks/$targetWeekKey/replacements/thumbs/$replacementFileName'
+      : 'groups/$groupId/weeks/$targetWeekKey/thumbs/${user.uid}.jpg';
   final storageRef = storage.ref().child(storagePath);
   final thumbnailStorageRef = storage.ref().child(thumbnailStoragePath);
+  final selfieMetadata = <String, String>{
+    'groupId': groupId,
+    'weekKey': targetWeekKey,
+    'uid': user.uid,
+    if (isLateMondayUpload) 'lateUpload': 'true',
+    if (isLateMondayUpload || isRewardedReplacement)
+      'rewardedAdWatched': 'true',
+    if (isRewardedReplacement) 'replacement': 'true',
+    'replacementUploadId': ?replacementUploadId,
+  };
   final uploadFile = await _prepararArchivoSelfieParaSubidaTemporal(
     foto: foto,
     groupId: groupId,
@@ -7248,13 +10108,7 @@ Future<void> publicarSelfieReal({
       uploadFile,
       SettableMetadata(
         contentType: 'image/jpeg',
-        customMetadata: {
-          'groupId': groupId,
-          'weekKey': targetWeekKey,
-          'uid': user.uid,
-          if (isLateMondayUpload) 'lateUpload': 'true',
-          if (isLateMondayUpload) 'rewardedAdWatched': 'true',
-        },
+        customMetadata: selfieMetadata,
       ),
     );
   } on FirebaseException catch (uploadError) {
@@ -7287,14 +10141,7 @@ Future<void> publicarSelfieReal({
         thumbnailFile,
         SettableMetadata(
           contentType: 'image/jpeg',
-          customMetadata: {
-            'groupId': groupId,
-            'weekKey': targetWeekKey,
-            'uid': user.uid,
-            'kind': 'selfieThumb',
-            if (isLateMondayUpload) 'lateUpload': 'true',
-            if (isLateMondayUpload) 'rewardedAdWatched': 'true',
-          },
+          customMetadata: {...selfieMetadata, 'kind': 'selfieThumb'},
         ),
       );
     }
@@ -7318,7 +10165,10 @@ Future<void> publicarSelfieReal({
     await callable.call<void>({
       'groupId': groupId,
       if (targetWeekKey != currentWeekKey) 'weekKey': targetWeekKey,
-      if (isLateMondayUpload) 'rewardedAdWatched': true,
+      if (isLateMondayUpload || isRewardedReplacement)
+        'rewardedAdWatched': true,
+      if (isRewardedReplacement) 'replaceExisting': true,
+      'replacementUploadId': ?replacementUploadId,
     });
   } on FirebaseFunctionsException catch (error) {
     throw Exception(error.message ?? 'No se pudo registrar la selfie');
@@ -7352,23 +10202,129 @@ Future<void> reaccionarASelfie({
   }
 }
 
+const String kProtectedCallableUnauthenticatedMessage =
+    'No pudimos verificar la app o tu sesión. Cierra y vuelve a abrir Sunday Selfie e inténtalo de nuevo.';
+
+String mensajeErrorCallableProtegida({
+  required String code,
+  String? message,
+  required String fallback,
+}) {
+  final normalizedCode = code.trim().toLowerCase();
+  final cleanMessage = message?.trim();
+
+  if (normalizedCode == 'unauthenticated') {
+    return kProtectedCallableUnauthenticatedMessage;
+  }
+
+  final normalizedMessage = cleanMessage?.toLowerCase();
+  if ((normalizedCode == 'internal' || normalizedCode == 'unknown') &&
+      (normalizedMessage == null ||
+          normalizedMessage.isEmpty ||
+          normalizedMessage == 'internal' ||
+          normalizedMessage == 'unknown')) {
+    return fallback;
+  }
+
+  if (cleanMessage != null && cleanMessage.isNotEmpty) {
+    return cleanMessage;
+  }
+
+  return fallback;
+}
+
+String mensajeErrorFirebaseFunction(
+  FirebaseFunctionsException error, {
+  required String fallback,
+}) {
+  return mensajeErrorCallableProtegida(
+    code: error.code,
+    message: error.message,
+    fallback: fallback,
+  );
+}
+
+Future<User> asegurarUsuarioAutenticadoParaCallable() async {
+  final currentUser = FirebaseAuth.instance.currentUser;
+  if (currentUser == null) {
+    throw Exception('Inicia sesión otra vez para continuar');
+  }
+
+  try {
+    await currentUser.getIdToken();
+  } catch (error) {
+    logDebug('No se pudo obtener el token de Auth: $error');
+    throw Exception('Inicia sesión otra vez para continuar');
+  }
+
+  return currentUser;
+}
+
+Future<void> refrescarSesionAuthParaReintentoCallable(User user) async {
+  try {
+    await user.getIdToken(true);
+  } catch (error) {
+    logDebug('No se pudo refrescar el token de Auth: $error');
+  }
+}
+
+Future<void> refrescarAppCheckParaReintentoCallable() async {
+  try {
+    await FirebaseAppCheck.instance.getToken(true);
+  } catch (error) {
+    logDebug('No se pudo refrescar el token de App Check: $error');
+  }
+}
+
+Future<void> prepararReintentoCallableProtegida(User user) async {
+  await Future.wait([
+    refrescarSesionAuthParaReintentoCallable(user),
+    refrescarAppCheckParaReintentoCallable(),
+  ]);
+}
+
+Future<HttpsCallableResult<dynamic>> llamarCallableAutenticadoConReintento({
+  required String name,
+  required Map<String, dynamic> data,
+}) async {
+  final currentUser = await asegurarUsuarioAutenticadoParaCallable();
+  final callable = FirebaseFunctions.instance.httpsCallable(name);
+
+  try {
+    return await callable.call<dynamic>(data);
+  } on FirebaseFunctionsException catch (error) {
+    if (error.code.trim().toLowerCase() == 'unauthenticated') {
+      await prepararReintentoCallableProtegida(currentUser);
+      return callable.call<dynamic>(data);
+    }
+
+    rethrow;
+  }
+}
+
 Future<void> enviarZumbidoSelfie({
   required String groupId,
   required String targetUid,
   bool rewardedAdWatched = false,
 }) async {
-  try {
-    final callable = FirebaseFunctions.instance.httpsCallable(
-      'enviarZumbidoSelfie',
-    );
+  final payload = <String, dynamic>{
+    'groupId': groupId,
+    'targetUid': targetUid,
+    if (rewardedAdWatched) 'rewardedAdWatched': true,
+  };
 
-    await callable.call<void>({
-      'groupId': groupId,
-      'targetUid': targetUid,
-      if (rewardedAdWatched) 'rewardedAdWatched': true,
-    });
+  try {
+    await llamarCallableAutenticadoConReintento(
+      name: 'enviarZumbidoSelfie',
+      data: payload,
+    );
   } on FirebaseFunctionsException catch (error) {
-    throw Exception(error.message ?? 'No se pudo enviar el zumbido');
+    throw Exception(
+      mensajeErrorFirebaseFunction(
+        error,
+        fallback: 'No se pudo enviar el zumbido',
+      ),
+    );
   }
 }
 
@@ -7390,18 +10346,20 @@ Future<bool> confirmarAnuncioZumbidoExtra(BuildContext context) async {
       return AlertDialog(
         backgroundColor: Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
-        title: const Text('Enviar otro zumbido'),
-        content: const Text(
-          'Cada miembro del grupo solo puede recibir un zumbido por domingo y por grupo. Para poder enviar otro zumbido se debe ver un anuncio.',
+        title: Text(dialogContext.tr('Enviar otro zumbido')),
+        content: Text(
+          dialogContext.tr(
+            'Cada miembro del grupo solo puede recibir un zumbido por domingo y por grupo. Para poder enviar otro zumbido se debe ver un anuncio.',
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Salir'),
+            child: Text(dialogContext.tr('Salir')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Continuar'),
+            child: Text(dialogContext.tr('Continuar')),
           ),
         ],
       );
@@ -7476,18 +10434,20 @@ Future<bool> confirmarAnuncioFotoPerfil(BuildContext context) async {
       return AlertDialog(
         backgroundColor: Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
-        title: const Text('Reemplazar foto de perfil'),
-        content: const Text(
-          'Para usar esta selfie como foto de perfil tienes que ver un anuncio.',
+        title: Text(dialogContext.tr('Reemplazar foto de perfil')),
+        content: Text(
+          dialogContext.tr(
+            'Para usar esta selfie como foto de perfil tienes que ver un anuncio.',
+          ),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Cancelar'),
+            child: Text(dialogContext.tr('Cancelar')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Ver anuncio'),
+            child: Text(dialogContext.tr('Ver anuncio')),
           ),
         ],
       );
@@ -7913,10 +10873,10 @@ class _LateSelfieUploadDialogState extends State<LateSelfieUploadDialog> {
                 ),
               ),
               const SizedBox(height: 18),
-              const Text(
-                'Subir con un día de retraso',
+              Text(
+                context.tr('Subir con un día de retraso'),
                 textAlign: TextAlign.center,
-                style: TextStyle(
+                style: const TextStyle(
                   color: ssText,
                   fontSize: 23,
                   height: 1.12,
@@ -7924,10 +10884,12 @@ class _LateSelfieUploadDialogState extends State<LateSelfieUploadDialog> {
                 ),
               ),
               const SizedBox(height: 14),
-              const Text(
-                'Para poder subir el Sunday Selfie el lunes hay que ver un anuncio.',
+              Text(
+                context.tr(
+                  'Para poder subir el Sunday Selfie el lunes hay que ver un anuncio.',
+                ),
                 textAlign: TextAlign.center,
-                style: TextStyle(
+                style: const TextStyle(
                   color: ssText2,
                   fontSize: 15,
                   height: 1.42,
@@ -7955,7 +10917,7 @@ class _LateSelfieUploadDialogState extends State<LateSelfieUploadDialog> {
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(
-                          message!,
+                          context.tr(message!),
                           style: TextStyle(
                             color: statusColor,
                             fontSize: 14,
@@ -7974,7 +10936,7 @@ class _LateSelfieUploadDialogState extends State<LateSelfieUploadDialog> {
                     ? null
                     : () => Navigator.pop(context, false),
                 icon: const Icon(Icons.close_rounded, size: 19),
-                label: const Text('Cancelar'),
+                label: Text(context.tr('Cancelar')),
                 style: TextButton.styleFrom(
                   foregroundColor: ssOrangeDark,
                   disabledForegroundColor: ssText3,
@@ -8001,11 +10963,13 @@ class _LateSelfieUploadDialogState extends State<LateSelfieUploadDialog> {
                         size: 19,
                       ),
                 label: Text(
-                  adWatched
-                      ? 'Anuncio visto'
-                      : loadingAd
-                      ? 'Cargando anuncio'
-                      : 'Ver anuncio',
+                  context.tr(
+                    adWatched
+                        ? 'Anuncio visto'
+                        : loadingAd
+                        ? 'Cargando anuncio'
+                        : 'Ver anuncio',
+                  ),
                 ),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: ssOrangeDark,
@@ -8024,7 +10988,7 @@ class _LateSelfieUploadDialogState extends State<LateSelfieUploadDialog> {
                     ? null
                     : () => Navigator.pop(context, true),
                 icon: const Icon(Icons.photo_camera_rounded, size: 19),
-                label: const Text('Subir Sunday Selfie'),
+                label: Text(context.tr('Subir Sunday Selfie')),
                 style: ElevatedButton.styleFrom(
                   elevation: 0,
                   backgroundColor: ssOrange,
@@ -8245,29 +11209,32 @@ Future<void> enviarSugerenciaUsuario({
       : null;
 
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable(
-      'enviarSugerencia',
-    );
-    final payload = <String, Object>{
+    final payload = <String, dynamic>{
       'authorName': safeAuthorName.isEmpty ? 'Usuario' : safeAuthorName,
       'text': cleanText,
     };
 
     if (safeEmail != null) payload['authorEmail'] = safeEmail;
 
-    final result = await callable.call<dynamic>(payload);
+    final result = await llamarCallableAutenticadoConReintento(
+      name: 'enviarSugerencia',
+      data: payload,
+    );
     final resultData = result.data;
     final emailStatus = resultData is Map
         ? resultData['emailStatus']?.toString()
         : null;
 
     if (emailStatus == 'failed' || emailStatus == 'not_configured') {
-      throw Exception(
-        'La sugerencia se guardó, pero el correo no quedó configurado',
-      );
+      logDebug('Sugerencia guardada sin correo en cola: $emailStatus');
     }
   } on FirebaseFunctionsException catch (error) {
-    throw Exception(error.message ?? 'No se pudo enviar la sugerencia');
+    throw Exception(
+      mensajeErrorFirebaseFunction(
+        error,
+        fallback: 'No se pudo enviar la sugerencia',
+      ),
+    );
   }
 }
 
@@ -8786,16 +11753,37 @@ class MyApp extends StatefulWidget {
 class _MyAppState extends State<MyApp> {
   final AppLinks _appLinks = AppLinks();
   late final SundayClock _sundayClock;
+  late Future<void> appStartupFuture;
   StreamSubscription<Uri>? _linkSubscription;
   StreamSubscription<User?>? _authSubscription;
   String? _pendingInviteInput;
   String? _lastOpenedInviteInput;
   bool _pendingInviteFrameScheduled = false;
+  bool _postStartupServicesStarted = false;
 
   @override
   void initState() {
     super.initState();
     _sundayClock = SundayClock();
+    appStartupFuture = inicializarServiciosDeArranque();
+    unawaited(_startPostStartupServices(appStartupFuture));
+  }
+
+  Future<void> _startPostStartupServices(Future<void> startupFuture) async {
+    try {
+      await startupFuture;
+    } catch (error) {
+      logDebug('No se pudo completar el arranque inicial: $error');
+      return;
+    }
+
+    if (!mounted ||
+        !identical(startupFuture, appStartupFuture) ||
+        _postStartupServicesStarted) {
+      return;
+    }
+
+    _postStartupServicesStarted = true;
     _linkSubscription = _appLinks.uriLinkStream.listen(
       _handleIncomingLink,
       onError: (error) {
@@ -8808,6 +11796,20 @@ class _MyAppState extends State<MyApp> {
         _openPendingInvite(user);
       }
     });
+  }
+
+  void _retryStartup() {
+    _linkSubscription?.cancel();
+    _authSubscription?.cancel();
+    _linkSubscription = null;
+    _authSubscription = null;
+    _postStartupServicesStarted = false;
+
+    final nextStartupFuture = inicializarServiciosDeArranque();
+    setState(() {
+      appStartupFuture = nextStartupFuture;
+    });
+    unawaited(_startPostStartupServices(nextStartupFuture));
   }
 
   @override
@@ -8900,36 +11902,124 @@ class _MyAppState extends State<MyApp> {
     showSundaySnack(context, message);
   }
 
+  Widget _buildAuthGate() {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, authSnapshot) {
+        if (authSnapshot.connectionState == ConnectionState.waiting) {
+          return const LoadingScreen();
+        }
+
+        if (authSnapshot.hasData) {
+          return AuthenticatedUserGate(user: authSnapshot.data!);
+        }
+
+        return const LoginScreen();
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return SundayClockScope(
       clock: _sundayClock,
-      child: MaterialApp(
-        navigatorKey: sundayNavigatorKey,
-        debugShowCheckedModeBanner: false,
-        title: 'Sunday Selfie',
-        theme: ThemeData(
-          useMaterial3: true,
-          scaffoldBackgroundColor: ssBg,
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: ssOrange,
-            brightness: Brightness.light,
-          ),
-          textTheme: GoogleFonts.dmSansTextTheme(),
-        ),
-        home: StreamBuilder<User?>(
-          stream: FirebaseAuth.instance.authStateChanges(),
-          builder: (context, authSnapshot) {
-            if (authSnapshot.connectionState == ConnectionState.waiting) {
-              return const LoadingScreen();
-            }
+      child: SundayLanguageScope(
+        controller: sundayLanguageController,
+        child: AnimatedBuilder(
+          animation: sundayLanguageController,
+          builder: (context, _) {
+            return MaterialApp(
+              navigatorKey: sundayNavigatorKey,
+              debugShowCheckedModeBanner: false,
+              title: 'Sunday Selfie',
+              locale: sundayLanguageController.locale,
+              supportedLocales: kSundaySupportedLocales,
+              localizationsDelegates: const [
+                GlobalMaterialLocalizations.delegate,
+                GlobalCupertinoLocalizations.delegate,
+                GlobalWidgetsLocalizations.delegate,
+              ],
+              theme: ThemeData(
+                useMaterial3: true,
+                scaffoldBackgroundColor: ssBg,
+                colorScheme: ColorScheme.fromSeed(
+                  seedColor: ssOrange,
+                  brightness: Brightness.light,
+                ),
+                textTheme: GoogleFonts.dmSansTextTheme(),
+              ),
+              home: FutureBuilder<void>(
+                future: appStartupFuture,
+                builder: (context, startupSnapshot) {
+                  if (startupSnapshot.connectionState ==
+                      ConnectionState.waiting) {
+                    return const LoadingScreen();
+                  }
 
-            if (authSnapshot.hasData) {
-              return AuthenticatedUserGate(user: authSnapshot.data!);
-            }
+                  if (startupSnapshot.hasError) {
+                    return AppStartupErrorScreen(
+                      error: startupSnapshot.error.toString(),
+                      onRetry: _retryStartup,
+                    );
+                  }
 
-            return const LoginScreen();
+                  return _buildAuthGate();
+                },
+              ),
+            );
           },
+        ),
+      ),
+    );
+  }
+}
+
+class AppStartupErrorScreen extends StatelessWidget {
+  final String error;
+  final VoidCallback onRetry;
+
+  const AppStartupErrorScreen({
+    super.key,
+    required this.error,
+    required this.onRetry,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: ssBg,
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const SundaySelfieLogoMark(size: 86),
+              const SizedBox(height: 20),
+              Text(
+                context.tr('No se pudo iniciar Sunday Selfie'),
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: ssTitle,
+                  fontSize: 22,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                error,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: ssText2,
+                  fontSize: 14,
+                  height: 1.5,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              const SizedBox(height: 22),
+              SundayButton(text: 'Reintentar', onPressed: onRetry),
+            ],
+          ),
         ),
       ),
     );
@@ -8949,6 +12039,7 @@ class _AuthenticatedUserGateState extends State<AuthenticatedUserGate> {
   late Future<void> initialUserFuture;
   late Stream<DocumentSnapshot<Map<String, dynamic>>> userStream;
   late Widget authenticatedShell;
+  String? lastSyncedLanguageCode;
 
   @override
   void initState() {
@@ -8971,6 +12062,7 @@ class _AuthenticatedUserGateState extends State<AuthenticatedUserGate> {
           .doc(widget.user.uid)
           .snapshots();
       authenticatedShell = SundayShell(user: widget.user);
+      lastSyncedLanguageCode = null;
     }
   }
 
@@ -9002,6 +12094,15 @@ class _AuthenticatedUserGateState extends State<AuthenticatedUserGate> {
             }
 
             final userData = userSnapshot.data?.data();
+            final rawLanguageCode = userData?['languageCode'];
+            if (rawLanguageCode is String &&
+                rawLanguageCode.trim().isNotEmpty &&
+                rawLanguageCode != lastSyncedLanguageCode) {
+              lastSyncedLanguageCode = rawLanguageCode;
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                sundayLanguageController.syncFromUserData(userData);
+              });
+            }
 
             if (perfilInicialPendiente(userData)) {
               return OnboardingNameScreen(user: widget.user);
@@ -9037,10 +12138,10 @@ class AuthSetupErrorScreen extends StatelessWidget {
             children: [
               const SundaySelfieLogoMark(size: 86),
               const SizedBox(height: 20),
-              const Text(
-                'No se pudo preparar tu perfil',
+              Text(
+                context.tr('No se pudo preparar tu perfil'),
                 textAlign: TextAlign.center,
-                style: TextStyle(
+                style: const TextStyle(
                   color: ssTitle,
                   fontSize: 22,
                   fontWeight: FontWeight.w900,
@@ -9131,9 +12232,9 @@ class _OnboardingNameScreenState extends State<OnboardingNameScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Perfil Sunday Selfie',
-                      style: TextStyle(
+                    Text(
+                      context.tr('Perfil Sunday Selfie'),
+                      style: const TextStyle(
                         color: ssTitle,
                         fontSize: 26,
                         fontWeight: FontWeight.w800,
@@ -9141,9 +12242,9 @@ class _OnboardingNameScreenState extends State<OnboardingNameScreen> {
                       ),
                     ),
                     const SizedBox(height: 8),
-                    const Text(
-                      'Puedes cambiarlo en cualquier momento',
-                      style: TextStyle(
+                    Text(
+                      context.tr('Puedes cambiarlo en cualquier momento'),
+                      style: const TextStyle(
                         color: ssText2,
                         fontSize: 14,
                         height: 1.45,
@@ -9196,8 +12297,34 @@ class OnboardingPhotoScreen extends StatefulWidget {
 }
 
 class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
-  XFile? selectedPhoto;
+  ProfilePhotoDraft? selectedPhoto;
   bool saving = false;
+
+  Future<void> _setSelectedProfilePhoto(XFile photo) async {
+    try {
+      final draft = await crearBorradorFotoPerfil(photo);
+      if (!mounted) return;
+      setState(() {
+        selectedPhoto = draft;
+      });
+    } on SelfiePhotoValidationException catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, error.message);
+    } catch (error) {
+      logDebug('No se pudo comprobar la foto de perfil: $error');
+      if (!mounted) return;
+      showSundaySnack(context, kSelfieValidationFailedMessage);
+    }
+  }
+
+  void _updateSelectedPhotoAlignment(Alignment alignment) {
+    final draft = selectedPhoto;
+    if (draft == null) return;
+
+    setState(() {
+      selectedPhoto = draft.copyWith(alignment: alignment);
+    });
+  }
 
   Future<void> _choosePhotoSource() async {
     final source = await showModalBottomSheet<image_picker.ImageSource>(
@@ -9218,12 +12345,7 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
       );
 
       if (!mounted || photo == null) return;
-      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
-      if (!mounted || !validPhoto) return;
-
-      setState(() {
-        selectedPhoto = photo;
-      });
+      await _setSelectedProfilePhoto(photo);
       return;
     }
 
@@ -9236,12 +12358,7 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
       );
 
       if (!mounted || photo == null) return;
-      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
-      if (!mounted || !validPhoto) return;
-
-      setState(() {
-        selectedPhoto = photo;
-      });
+      await _setSelectedProfilePhoto(photo);
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'No se pudo abrir la galería: $error');
@@ -9256,18 +12373,18 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
       return;
     }
 
-    final validPhoto = await validarFotoSelfieParaSubida(context, photo);
-    if (!mounted || !validPhoto) return;
-
     if (saving) return;
 
     setState(() => saving = true);
 
+    XFile? uploadPhoto;
     try {
+      uploadPhoto = await crearArchivoFotoPerfilAjustadaTemporal(draft: photo);
+
       await actualizarPerfilInicialUsuario(
         user: widget.user,
         nombre: widget.name,
-        foto: photo,
+        foto: uploadPhoto,
       );
 
       if (!mounted) return;
@@ -9279,6 +12396,13 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
       if (!mounted) return;
       showSundaySnack(context, 'Error guardando perfil: $error');
     } finally {
+      if (uploadPhoto != null) {
+        try {
+          await File(uploadPhoto.path).delete();
+        } catch (error) {
+          logDebug('No se pudo borrar la foto de perfil temporal: $error');
+        }
+      }
       if (mounted) setState(() => saving = false);
     }
   }
@@ -9296,9 +12420,9 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
               child: ListView(
                 padding: const EdgeInsets.fromLTRB(24, 28, 24, 24),
                 children: [
-                  const Text(
-                    'Foto de perfil',
-                    style: TextStyle(
+                  Text(
+                    context.tr('Foto de perfil'),
+                    style: const TextStyle(
                       color: ssTitle,
                       fontSize: 26,
                       fontWeight: FontWeight.w800,
@@ -9306,9 +12430,11 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  const Text(
-                    'La foto de perfil se puede cambiar cada domingo',
-                    style: TextStyle(
+                  Text(
+                    context.tr(
+                      'La foto de perfil se puede cambiar cada domingo',
+                    ),
+                    style: const TextStyle(
                       color: ssText2,
                       fontSize: 14,
                       height: 1.45,
@@ -9321,6 +12447,9 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
                       photo: selectedPhoto,
                       name: widget.name,
                       onTap: saving ? null : _choosePhotoSource,
+                      onAlignmentChanged: saving
+                          ? null
+                          : _updateSelectedPhotoAlignment,
                     ),
                   ),
                   const SizedBox(height: 28),
@@ -9427,7 +12556,7 @@ class SundayTextField extends StatelessWidget {
         fontWeight: FontWeight.w600,
       ),
       decoration: InputDecoration(
-        hintText: hintText,
+        hintText: context.tr(hintText),
         hintStyle: const TextStyle(
           color: ssText3,
           fontSize: 16,
@@ -9452,24 +12581,103 @@ class SundayTextField extends StatelessWidget {
   }
 }
 
-class OnboardingProfilePhotoPreview extends StatelessWidget {
-  final XFile? photo;
+Alignment _profilePhotoAlignmentAfterLongPressDrag({
+  required ProfilePhotoDraft draft,
+  required Alignment startAlignment,
+  required Offset offsetFromOrigin,
+  required double previewSize,
+}) {
+  final width = math.max(draft.imageWidth, 1).toDouble();
+  final height = math.max(draft.imageHeight, 1).toDouble();
+  final coverScale = math.max(previewSize / width, previewSize / height);
+  final extraX = math.max(0.0, width * coverScale - previewSize);
+  final extraY = math.max(0.0, height * coverScale - previewSize);
+  final x = extraX > 0.5
+      ? (startAlignment.x - offsetFromOrigin.dx * 2 / extraX)
+            .clamp(-1.0, 1.0)
+            .toDouble()
+      : 0.0;
+  final y = extraY > 0.5
+      ? (startAlignment.y - offsetFromOrigin.dy * 2 / extraY)
+            .clamp(-1.0, 1.0)
+            .toDouble()
+      : 0.0;
+
+  return Alignment(x, y);
+}
+
+class OnboardingProfilePhotoPreview extends StatefulWidget {
+  final ProfilePhotoDraft? photo;
   final String name;
   final VoidCallback? onTap;
+  final ValueChanged<Alignment>? onAlignmentChanged;
 
   const OnboardingProfilePhotoPreview({
     super.key,
     required this.photo,
     required this.name,
     required this.onTap,
+    required this.onAlignmentChanged,
   });
 
   @override
+  State<OnboardingProfilePhotoPreview> createState() =>
+      _OnboardingProfilePhotoPreviewState();
+}
+
+class _OnboardingProfilePhotoPreviewState
+    extends State<OnboardingProfilePhotoPreview> {
+  Alignment? dragStartAlignment;
+  bool dragging = false;
+
+  bool get _canAdjust =>
+      widget.photo != null && widget.onAlignmentChanged != null;
+
+  void _startAdjusting() {
+    final draft = widget.photo;
+    if (draft == null) return;
+
+    HapticFeedback.selectionClick();
+    setState(() {
+      dragStartAlignment = draft.alignment;
+      dragging = true;
+    });
+  }
+
+  void _movePhoto(LongPressMoveUpdateDetails details) {
+    final draft = widget.photo;
+    final onAlignmentChanged = widget.onAlignmentChanged;
+    if (draft == null || onAlignmentChanged == null) return;
+
+    onAlignmentChanged(
+      _profilePhotoAlignmentAfterLongPressDrag(
+        draft: draft,
+        startAlignment: dragStartAlignment ?? draft.alignment,
+        offsetFromOrigin: details.offsetFromOrigin,
+        previewSize: 120,
+      ),
+    );
+  }
+
+  void _stopAdjusting() {
+    if (!dragging) return;
+    setState(() {
+      dragStartAlignment = null;
+      dragging = false;
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final photo = widget.photo;
     final hasPhoto = photo != null;
 
     return GestureDetector(
-      onTap: onTap,
+      onTap: widget.onTap,
+      onLongPressStart: _canAdjust ? (_) => _startAdjusting() : null,
+      onLongPressMoveUpdate: _canAdjust ? _movePhoto : null,
+      onLongPressEnd: _canAdjust ? (_) => _stopAdjusting() : null,
+      onLongPressUp: _canAdjust ? _stopAdjusting : null,
       child: Stack(
         clipBehavior: Clip.none,
         children: [
@@ -9490,23 +12698,41 @@ class OnboardingProfilePhotoPreview extends StatelessWidget {
             ),
             child: ClipOval(
               child: hasPhoto
-                  ? Image.file(
-                      File(photo!.path),
-                      width: 120,
-                      height: 120,
-                      fit: BoxFit.cover,
-                      alignment: Alignment.center,
-                      filterQuality: FilterQuality.high,
-                      errorBuilder: (_, _, _) => Center(
-                        child: Text(
-                          initialsFromName(name),
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 38,
-                            fontWeight: FontWeight.w800,
+                  ? Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        Image.file(
+                          File(photo.photo.path),
+                          width: 120,
+                          height: 120,
+                          fit: BoxFit.cover,
+                          alignment: photo.alignment,
+                          filterQuality: FilterQuality.high,
+                          errorBuilder: (_, _, _) => Center(
+                            child: Text(
+                              initialsFromName(widget.name),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 38,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
                           ),
                         ),
-                      ),
+                        if (dragging)
+                          DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: Colors.black.withValues(alpha: 0.12),
+                            ),
+                            child: const Center(
+                              child: Icon(
+                                Icons.open_with_rounded,
+                                color: Colors.white,
+                                size: 26,
+                              ),
+                            ),
+                          ),
+                      ],
                     )
                   : const Center(
                       child: Icon(
@@ -9638,7 +12864,7 @@ class SundayDashedActionCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        title,
+                        context.tr(title),
                         style: const TextStyle(
                           color: ssTitle,
                           fontSize: 14,
@@ -9647,7 +12873,7 @@ class SundayDashedActionCard extends StatelessWidget {
                       ),
                       const SizedBox(height: 3),
                       Text(
-                        subtitle,
+                        context.tr(subtitle),
                         style: const TextStyle(
                           color: ssText2,
                           fontSize: 12,
@@ -9700,14 +12926,14 @@ class ProfilePhotoSourceSheet extends StatelessWidget {
                 ),
               ),
             ),
-            const Padding(
-              padding: EdgeInsets.fromLTRB(8, 0, 8, 16),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 0, 8, 16),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Elige una foto',
-                    style: TextStyle(
+                    context.tr('Elige una foto'),
+                    style: const TextStyle(
                       color: ssTitle,
                       fontSize: 18,
                       fontWeight: FontWeight.w900,
@@ -9715,8 +12941,8 @@ class ProfilePhotoSourceSheet extends StatelessWidget {
                   ),
                   SizedBox(height: 2),
                   Text(
-                    '¿De dónde quieres añadirla?',
-                    style: TextStyle(
+                    context.tr('¿De dónde quieres añadirla?'),
+                    style: const TextStyle(
                       color: ssText2,
                       fontSize: 13,
                       fontWeight: FontWeight.w500,
@@ -9757,10 +12983,13 @@ class ProfilePhotoSourceSheet extends StatelessWidget {
             ),
             TextButton(
               onPressed: () => Navigator.pop(context),
-              child: const Center(
+              child: Center(
                 child: Text(
-                  'Cancelar',
-                  style: TextStyle(color: ssText2, fontWeight: FontWeight.w800),
+                  context.tr('Cancelar'),
+                  style: const TextStyle(
+                    color: ssText2,
+                    fontWeight: FontWeight.w800,
+                  ),
                 ),
               ),
             ),
@@ -9810,7 +13039,7 @@ class ProfilePhotoSourceRow extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      title,
+                      context.tr(title),
                       style: const TextStyle(
                         color: ssTitle,
                         fontSize: 15,
@@ -9819,7 +13048,7 @@ class ProfilePhotoSourceRow extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      subtitle,
+                      context.tr(subtitle),
                       style: const TextStyle(
                         color: ssText2,
                         fontSize: 12,
@@ -10217,17 +13446,21 @@ class SundayShell extends StatefulWidget {
 }
 
 class _SundayShellState extends State<SundayShell> {
+  static const int profileTabIndex = 4;
+
   late int selectedIndex;
   late List<Widget> pages;
   DateTime? pagesCalendarDay;
   StreamSubscription<RemoteMessage>? foregroundNotificationSubscription;
   StreamSubscription<RemoteMessage>? notificationOpenSubscription;
   String? lastHandledNotificationKey;
+  final GlobalKey<_ProfileScreenState> profileScreenKey =
+      GlobalKey<_ProfileScreenState>();
 
   @override
   void initState() {
     super.initState();
-    selectedIndex = widget.initialIndex.clamp(0, 4).toInt();
+    selectedIndex = widget.initialIndex.clamp(0, profileTabIndex).toInt();
     pages = buildPages(widget.user);
     pagesCalendarDay = inicioDiaLocal(DateTime.now());
     registrarTokenNotificaciones(widget.user);
@@ -10240,7 +13473,7 @@ class _SundayShellState extends State<SundayShell> {
       MySelfiesScreen(user: user),
       CameraTabScreen(user: user),
       MontageScreen(user: user),
-      ProfileScreen(user: user),
+      ProfileScreen(key: profileScreenKey, user: user),
     ];
   }
 
@@ -10483,6 +13716,43 @@ class _SundayShellState extends State<SundayShell> {
     });
   }
 
+  void resetProfileScrollAfterFrame() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+
+      resetProfileScroll();
+    });
+  }
+
+  void resetProfileScroll() {
+    profileScreenKey.currentState?.scrollToTop();
+  }
+
+  void selectTab(int index) {
+    final nextIndex = index.clamp(0, profileTabIndex).toInt();
+    final leavingProfile =
+        selectedIndex == profileTabIndex && nextIndex != profileTabIndex;
+    final showingProfile = nextIndex == profileTabIndex;
+
+    if (selectedIndex == nextIndex) {
+      if (showingProfile) {
+        resetProfileScroll();
+        resetProfileScrollAfterFrame();
+      }
+      return;
+    }
+
+    if (leavingProfile || showingProfile) {
+      resetProfileScroll();
+    }
+
+    setState(() => selectedIndex = nextIndex);
+
+    if (leavingProfile || showingProfile) {
+      resetProfileScrollAfterFrame();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -10490,7 +13760,7 @@ class _SundayShellState extends State<SundayShell> {
       body: IndexedStack(index: selectedIndex, children: pages),
       bottomNavigationBar: SundayTabBar(
         selectedIndex: selectedIndex,
-        onSelected: (index) => setState(() => selectedIndex = index),
+        onSelected: selectTab,
       ),
     );
   }
@@ -10551,7 +13821,7 @@ class SundayTabBar extends StatelessWidget {
                             ),
                             const SizedBox(height: 2),
                             Text(
-                              items[index].$2,
+                              context.tr(items[index].$2),
                               style: TextStyle(
                                 fontSize: 9,
                                 fontWeight: FontWeight.w500,
@@ -10717,15 +13987,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
                   final groupDocs = [...(groupsSnapshot.data?.docs ?? [])]
                     ..sort((a, b) {
-                      final aData = a.data();
-                      final bData = b.data();
-                      final aValue = comparableTimestampMillis(
-                        aData['lastActivityAt'] ?? aData['joinedAt'],
-                      );
-                      final bValue = comparableTimestampMillis(
-                        bData['lastActivityAt'] ?? bData['joinedAt'],
-                      );
-                      return bValue.compareTo(aValue);
+                      final comparison =
+                          compareUserGroupsBySelfieOrChatActivity(
+                            a.data(),
+                            b.data(),
+                          );
+                      if (comparison != 0) return comparison;
+                      return a.id.compareTo(b.id);
                     });
 
                   return ListView(
@@ -11293,7 +14561,7 @@ class GroupCreationSectionLabel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Text(
-      text,
+      context.tr(text),
       style: const TextStyle(
         color: ssText2,
         fontSize: 12,
@@ -11432,7 +14700,7 @@ class CreateGroupSourceButton extends StatelessWidget {
                 ),
               const SizedBox(width: 10),
               Text(
-                label,
+                context.tr(label),
                 style: const TextStyle(
                   color: ssTitle,
                   fontSize: 15,
@@ -11497,6 +14765,7 @@ class GroupEmojiPickerSheet extends StatefulWidget {
 
 class _GroupEmojiPickerSheetState extends State<GroupEmojiPickerSheet> {
   late int selectedSectionIndex;
+  Offset? lastEmojiTapPosition;
 
   @override
   void initState() {
@@ -11517,11 +14786,33 @@ class _GroupEmojiPickerSheetState extends State<GroupEmojiPickerSheet> {
     return 0;
   }
 
+  Future<void> _selectEmojiGroup({
+    required EmojiReactionChoiceGroup group,
+    required String selectedEmoji,
+    Offset? anchor,
+  }) async {
+    if (group.variants.length <= 1) {
+      Navigator.pop(context, group.displayEmoji);
+      return;
+    }
+
+    final selected = await _showEmojiVariantPopover(
+      context: context,
+      group: group,
+      selectedEmoji: selectedEmoji,
+      anchor: anchor,
+    );
+
+    if (!mounted || selected == null) return;
+    Navigator.pop(context, selected);
+  }
+
   @override
   Widget build(BuildContext context) {
     final height = math.min(MediaQuery.sizeOf(context).height * 0.76, 640.0);
     final section = kGroupEmojiSections[selectedSectionIndex];
     final selectedEmoji = normalizarEmojiReaccion(widget.selectedEmoji ?? '');
+    final emojiGroups = agruparEmojisReaccion(section.emojis);
 
     return SafeArea(
       top: false,
@@ -11621,13 +14912,34 @@ class _GroupEmojiPickerSheetState extends State<GroupEmojiPickerSheet> {
                       mainAxisSpacing: 8,
                       crossAxisSpacing: 8,
                     ),
-                    itemCount: section.emojis.length,
+                    itemCount: emojiGroups.length,
                     itemBuilder: (context, index) {
-                      final emoji = section.emojis[index];
-                      final selected = emoji == selectedEmoji;
+                      final group = emojiGroups[index];
+                      final selected = group.variants.contains(selectedEmoji);
+                      final hasVariants = group.variants.length > 1;
 
                       return InkWell(
-                        onTap: () => Navigator.pop(context, emoji),
+                        onTapDown: (details) {
+                          lastEmojiTapPosition = details.globalPosition;
+                        },
+                        onTap: () {
+                          unawaited(
+                            _selectEmojiGroup(
+                              group: group,
+                              selectedEmoji: selectedEmoji,
+                              anchor: lastEmojiTapPosition,
+                            ),
+                          );
+                        },
+                        onLongPress: () {
+                          unawaited(
+                            _selectEmojiGroup(
+                              group: group,
+                              selectedEmoji: selectedEmoji,
+                              anchor: lastEmojiTapPosition,
+                            ),
+                          );
+                        },
                         borderRadius: BorderRadius.circular(14),
                         child: Container(
                           alignment: Alignment.center,
@@ -11639,9 +14951,29 @@ class _GroupEmojiPickerSheetState extends State<GroupEmojiPickerSheet> {
                               width: selected ? 1.6 : 1,
                             ),
                           ),
-                          child: Text(
-                            emoji,
-                            style: const TextStyle(fontSize: 24, height: 1),
+                          child: Stack(
+                            clipBehavior: Clip.none,
+                            children: [
+                              Center(
+                                child: Text(
+                                  group.displayEmoji,
+                                  style: const TextStyle(
+                                    fontSize: 24,
+                                    height: 1,
+                                  ),
+                                ),
+                              ),
+                              if (hasVariants)
+                                const Positioned(
+                                  right: 4,
+                                  bottom: 3,
+                                  child: Icon(
+                                    Icons.expand_more_rounded,
+                                    color: ssText3,
+                                    size: 13,
+                                  ),
+                                ),
+                            ],
                           ),
                         ),
                       );
@@ -11706,31 +15038,33 @@ class InviteInfoCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(18),
         border: Border.all(color: ssBorder),
       ),
-      child: const Row(
+      child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          CircleAvatar(
+          const CircleAvatar(
             radius: 20,
             backgroundColor: ssOrangeLight,
             child: Icon(Icons.lock_outline_rounded, color: ssOrange, size: 20),
           ),
-          SizedBox(width: 12),
+          const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Entrada con aprobación',
-                  style: TextStyle(
+                  context.tr('Entrada con aprobación'),
+                  style: const TextStyle(
                     color: ssTitle,
                     fontSize: 14,
                     fontWeight: FontWeight.w900,
                   ),
                 ),
-                SizedBox(height: 4),
+                const SizedBox(height: 4),
                 Text(
-                  'Quien use tu invitación enviará una solicitud. Tú decides si entra al grupo.',
-                  style: TextStyle(
+                  context.tr(
+                    'Quien use tu invitación enviará una solicitud. Tú decides si entra al grupo.',
+                  ),
+                  style: const TextStyle(
                     color: ssText2,
                     fontSize: 12,
                     height: 1.35,
@@ -12036,9 +15370,11 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     Text(
-                      openedFromInviteLink
-                          ? 'Solicitud de acceso'
-                          : 'Unirme a un grupo',
+                      context.tr(
+                        openedFromInviteLink
+                            ? 'Solicitud de acceso'
+                            : 'Unirme a un grupo',
+                      ),
                       style: TextStyle(
                         color: ssTitle,
                         fontSize: 28,
@@ -12048,9 +15384,11 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                     ),
                     const SizedBox(height: 8),
                     Text(
-                      openedFromInviteLink
-                          ? 'Revisa el grupo antes de enviar tu solicitud.'
-                          : 'Pega el enlace o escribe el código de invitación que te hayan enviado.',
+                      context.tr(
+                        openedFromInviteLink
+                            ? 'Revisa el grupo antes de enviar tu solicitud.'
+                            : 'Pega el enlace o escribe el código de invitación que te hayan enviado.',
+                      ),
                       style: TextStyle(
                         color: ssText2,
                         fontSize: 14,
@@ -12060,9 +15398,9 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                     ),
                     if (!openedFromInviteLink) ...[
                       const SizedBox(height: 28),
-                      const Text(
-                        'INVITACIÓN',
-                        style: TextStyle(
+                      Text(
+                        context.tr('INVITACIÓN'),
+                        style: const TextStyle(
                           color: ssText3,
                           fontSize: 12,
                           letterSpacing: 1.2,
@@ -12085,7 +15423,7 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                             Icons.content_paste_rounded,
                             size: 18,
                           ),
-                          label: const Text('Pegar desde portapapeles'),
+                          label: Text(context.tr('Pegar desde portapapeles')),
                           style: TextButton.styleFrom(
                             foregroundColor: ssOrange,
                             textStyle: const TextStyle(
@@ -12105,8 +15443,8 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                           return const JoinInstructionCard();
                         }
 
-                        return FutureBuilder<String?>(
-                          future: resolverGroupIdDesdeInvitacion(input),
+                        return FutureBuilder<GroupInvitePreview?>(
+                          future: resolverVistaPreviaInvitacion(input),
                           builder: (context, snapshot) {
                             if (snapshot.connectionState ==
                                 ConnectionState.waiting) {
@@ -12118,15 +15456,12 @@ class _JoinGroupScreenState extends State<JoinGroupScreen> {
                               );
                             }
 
-                            final groupId = snapshot.data;
-                            if (groupId == null) {
+                            final preview = snapshot.data;
+                            if (preview == null) {
                               return const InvalidInviteCard();
                             }
 
-                            return JoinGroupPreviewCard(
-                              groupId: groupId,
-                              currentUid: widget.user.uid,
-                            );
+                            return JoinGroupPreviewCard(preview: preview);
                           },
                         );
                       },
@@ -12239,146 +15574,74 @@ class InvalidInviteCard extends StatelessWidget {
 }
 
 class JoinGroupPreviewCard extends StatelessWidget {
-  final String groupId;
-  final String currentUid;
+  final GroupInvitePreview preview;
 
-  const JoinGroupPreviewCard({
-    super.key,
-    required this.groupId,
-    required this.currentUid,
-  });
+  const JoinGroupPreviewCard({super.key, required this.preview});
 
   @override
   Widget build(BuildContext context) {
-    final groupRef = FirebaseFirestore.instance
-        .collection('groups')
-        .doc(groupId);
-
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: groupRef.snapshots(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(
-            child: Padding(
-              padding: EdgeInsets.symmetric(vertical: 18),
-              child: CircularProgressIndicator(color: ssOrange),
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: ssBorder),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.035),
+            blurRadius: 14,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          GroupIcon(
+            name: preview.name,
+            photoUrl: null,
+            emoji: preview.emoji,
+            colorValue: preview.colorValue,
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  formatGroupDisplayName(preview.name),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: ssTitle,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  formatMemberCount(preview.memberCount),
+                  style: const TextStyle(
+                    color: ssText2,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                JoinStatusPill(
+                  label: preview.isMember
+                      ? 'Ya eres miembro'
+                      : preview.hasRequest
+                      ? 'Solicitud enviada'
+                      : 'Listo para solicitar entrada',
+                  color: preview.isMember || preview.hasRequest
+                      ? ssText3
+                      : ssOrange,
+                ),
+              ],
             ),
-          );
-        }
-
-        if (snapshot.hasError) {
-          return JoinPreviewMessageCard(
-            icon: Icons.visibility_off_outlined,
-            title: 'Invitación detectada',
-            message:
-                'No se puede previsualizar el grupo, pero puedes enviar la solicitud.',
-          );
-        }
-
-        if (!snapshot.hasData || !snapshot.data!.exists) {
-          return const JoinPreviewMessageCard(
-            icon: Icons.search_off_rounded,
-            title: 'Grupo no encontrado',
-            message: 'La invitación puede haber caducado o estar mal copiada.',
-          );
-        }
-
-        final data = snapshot.data!.data() ?? {};
-        if (data['deleted'] == true) {
-          return const JoinPreviewMessageCard(
-            icon: Icons.block_rounded,
-            title: 'Grupo no disponible',
-            message: 'Este grupo ya no acepta nuevas solicitudes.',
-          );
-        }
-
-        final name = (data['name'] ?? 'Grupo').toString();
-        final memberCountRaw = data['memberCount'] ?? 0;
-        final memberCount = memberCountRaw is int
-            ? memberCountRaw
-            : int.tryParse('$memberCountRaw') ?? 0;
-
-        return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-          stream: groupRef.collection('members').doc(currentUid).snapshots(),
-          builder: (context, memberSnapshot) {
-            final isMember = memberSnapshot.data?.exists ?? false;
-
-            return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-              stream: groupRef
-                  .collection('joinRequests')
-                  .doc(currentUid)
-                  .snapshots(),
-              builder: (context, requestSnapshot) {
-                final hasRequest = requestSnapshot.data?.exists ?? false;
-
-                return Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(22),
-                    border: Border.all(color: ssBorder),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.035),
-                        blurRadius: 14,
-                        offset: const Offset(0, 4),
-                      ),
-                    ],
-                  ),
-                  child: Row(
-                    children: [
-                      GroupIcon(
-                        name: name,
-                        photoUrl: data['photoUrl'] as String?,
-                        emoji: data['emoji'] as String?,
-                        colorValue: data['colorValue'],
-                      ),
-                      const SizedBox(width: 14),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              formatGroupDisplayName(name),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: ssTitle,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w900,
-                              ),
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              formatMemberCount(memberCount),
-                              style: const TextStyle(
-                                color: ssText2,
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            JoinStatusPill(
-                              label: isMember
-                                  ? 'Ya eres miembro'
-                                  : hasRequest
-                                  ? 'Solicitud enviada'
-                                  : 'Listo para solicitar entrada',
-                              color: isMember || hasRequest
-                                  ? ssText3
-                                  : ssOrange,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              },
-            );
-          },
-        );
-      },
+          ),
+        ],
+      ),
     );
   }
 }
@@ -12952,8 +16215,6 @@ class _GroupScreenState extends State<GroupScreen> {
                             );
                           }
 
-                          final keyboardChatOpen =
-                              keyboardVisible && chatExpanded;
                           final allWeeksMode = showingAllWeeks;
                           final chatCanWrite =
                               effectiveSelectedWeekKey.isNotEmpty &&
@@ -12963,7 +16224,7 @@ class _GroupScreenState extends State<GroupScreen> {
                           final expandedChatHeight =
                               resolverAlturaPanelChatSemanal(
                                 screenHeight: MediaQuery.sizeOf(context).height,
-                                keyboardOpen: false,
+                                keyboardOpen: keyboardVisible,
                                 canWrite: chatCanWrite,
                               );
 
@@ -12998,7 +16259,6 @@ class _GroupScreenState extends State<GroupScreen> {
                                     groupId: widget.groupId,
                                     weekKey: effectiveSelectedWeekKey,
                                     expanded: chatExpanded,
-                                    fillAvailableHeight: keyboardChatOpen,
                                     onDragOffsetChanged:
                                         _handleChatDragOffsetChanged,
                                     onToggle: () => setState(
@@ -13044,21 +16304,6 @@ class GroupWeeklyContentLayout extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final keyboardChatOpen = showChatPanel && keyboardVisible && chatExpanded;
-
-    if (keyboardChatOpen) {
-      return Column(
-        children: [
-          weekSelector,
-          Flexible(
-            key: const ValueKey('weekly_chat_panel_slot'),
-            fit: FlexFit.tight,
-            child: chatPanel,
-          ),
-        ],
-      );
-    }
-
     return Column(
       children: [
         weekSelector,
@@ -13599,8 +16844,10 @@ class GroupMembersScreen extends StatelessWidget {
               return Column(
                 children: [
                   AppHeader(onBack: () => Navigator.pop(context)),
-                  const Expanded(
-                    child: Center(child: Text('Grupo no encontrado')),
+                  Expanded(
+                    child: Center(
+                      child: Text(context.tr('Grupo no encontrado')),
+                    ),
                   ),
                 ],
               );
@@ -13729,18 +16976,20 @@ class GroupMembersHtmlContent extends StatelessWidget {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(22),
           ),
-          title: const Text('Abandonar grupo'),
+          title: Text(dialogContext.tr('Abandonar grupo')),
           content: Text(
-            '¿Seguro que quieres abandonar ${formatGroupDisplayName(groupName)}?',
+            dialogContext
+                .tr('¿Seguro que quieres abandonar {groupName}?')
+                .replaceAll('{groupName}', formatGroupDisplayName(groupName)),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancelar'),
+              child: Text(dialogContext.tr('Cancelar')),
             ),
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Abandonar'),
+              child: Text(dialogContext.tr('Abandonar')),
             ),
           ],
         );
@@ -13863,8 +17112,8 @@ class GroupMembersHtmlContent extends StatelessWidget {
     unawaited(
       SharePlus.instance.share(
         ShareParams(
-          text: 'Únete a mi grupo de Sunday Selfie: $_inviteLink',
-          subject: 'Invitación a $groupName',
+          text: localizedInviteShareText(context, _inviteLink),
+          subject: localizedInviteShareSubject(context, groupName),
           sharePositionOrigin: origin,
         ),
       ),
@@ -13888,18 +17137,20 @@ class GroupMembersHtmlContent extends StatelessWidget {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(22),
           ),
-          title: const Text('Regenerar invitación'),
-          content: const Text(
-            'El código anterior dejará de funcionar. Tendrás que compartir el nuevo código.',
+          title: Text(dialogContext.tr('Regenerar invitación')),
+          content: Text(
+            dialogContext.tr(
+              'El código anterior dejará de funcionar. Tendrás que compartir el nuevo código.',
+            ),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancelar'),
+              child: Text(dialogContext.tr('Cancelar')),
             ),
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Regenerar'),
+              child: Text(dialogContext.tr('Regenerar')),
             ),
           ],
         );
@@ -13993,7 +17244,7 @@ class GroupMembersHtmlContent extends StatelessWidget {
                 GroupInfoInlineRow(
                   icon: Icons.calendar_month_outlined,
                   label: 'Tiempo activo',
-                  value: activeWeeks == 1 ? '1 semana' : '$activeWeeks semanas',
+                  value: localizedActiveWeekCount(context, activeWeeks),
                 ),
                 const SizedBox(height: 24),
                 if (isCurrentAdmin)
@@ -14135,7 +17386,7 @@ class _GroupNameEditDialogState extends State<GroupNameEditDialog> {
     return AlertDialog(
       backgroundColor: Colors.white,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
-      title: const Text('Cambiar nombre del grupo'),
+      title: Text(context.tr('Cambiar nombre del grupo')),
       content: TextField(
         controller: _controller,
         focusNode: _focusNode,
@@ -14143,11 +17394,14 @@ class _GroupNameEditDialogState extends State<GroupNameEditDialog> {
         textCapitalization: TextCapitalization.sentences,
         textInputAction: TextInputAction.done,
         onSubmitted: (_) => _save(),
-        decoration: const InputDecoration(hintText: 'Nombre del grupo'),
+        decoration: InputDecoration(hintText: context.tr('Nombre del grupo')),
       ),
       actions: [
-        TextButton(onPressed: () => _close(), child: const Text('Cancelar')),
-        TextButton(onPressed: _save, child: const Text('Guardar')),
+        TextButton(
+          onPressed: () => _close(),
+          child: Text(context.tr('Cancelar')),
+        ),
+        TextButton(onPressed: _save, child: Text(context.tr('Guardar'))),
       ],
     );
   }
@@ -14199,7 +17453,7 @@ class _GroupMemberNameEditDialogState extends State<GroupMemberNameEditDialog> {
     return AlertDialog(
       backgroundColor: Colors.white,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
-      title: const Text('Cambiar nombre en este grupo'),
+      title: Text(context.tr('Cambiar nombre en este grupo')),
       content: TextField(
         controller: _controller,
         focusNode: _focusNode,
@@ -14208,11 +17462,16 @@ class _GroupMemberNameEditDialogState extends State<GroupMemberNameEditDialog> {
         textCapitalization: TextCapitalization.words,
         textInputAction: TextInputAction.done,
         onSubmitted: (_) => _save(),
-        decoration: const InputDecoration(hintText: 'Tu nombre en este grupo'),
+        decoration: InputDecoration(
+          hintText: context.tr('Tu nombre en este grupo'),
+        ),
       ),
       actions: [
-        TextButton(onPressed: () => _close(), child: const Text('Cancelar')),
-        TextButton(onPressed: _save, child: const Text('Guardar')),
+        TextButton(
+          onPressed: () => _close(),
+          child: Text(context.tr('Cancelar')),
+        ),
+        TextButton(onPressed: _save, child: Text(context.tr('Guardar'))),
       ],
     );
   }
@@ -14223,10 +17482,23 @@ class MembersHtmlSectionLabel extends StatelessWidget {
 
   const MembersHtmlSectionLabel({super.key, required this.text});
 
+  String _localizedText(BuildContext context) {
+    const separator = ' — ';
+    final separatorIndex = text.indexOf(separator);
+    if (separatorIndex == -1) return context.tr(text);
+
+    final section = text.substring(0, separatorIndex);
+    final count = text.substring(separatorIndex + separator.length);
+    return context
+        .tr('{section} — {count}')
+        .replaceAll('{section}', context.tr(section))
+        .replaceAll('{count}', count);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Text(
-      text,
+      _localizedText(context),
       style: const TextStyle(
         color: ssText3,
         fontSize: 12,
@@ -14264,7 +17536,7 @@ class GroupInfoInlineRow extends StatelessWidget {
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              label,
+              context.tr(label),
               style: const TextStyle(
                 color: ssText2,
                 fontSize: 13,
@@ -14273,7 +17545,7 @@ class GroupInfoInlineRow extends StatelessWidget {
             ),
           ),
           Text(
-            value,
+            context.tr(value),
             style: const TextStyle(
               color: ssTitle,
               fontSize: 14,
@@ -14297,7 +17569,7 @@ class MembersInlineEmptyText extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 14),
       child: Text(
-        text,
+        context.tr(text),
         style: const TextStyle(
           color: ssText3,
           fontSize: 13,
@@ -14493,9 +17765,11 @@ class GroupMemberHtmlRow extends StatelessWidget {
                         ),
                         const SizedBox(width: 6),
                         Text(
-                          posted
-                              ? 'Publicó esta semana'
-                              : 'Aún no ha publicado',
+                          context.tr(
+                            posted
+                                ? 'Publicó esta semana'
+                                : 'Aún no ha publicado',
+                          ),
                           style: TextStyle(
                             color: posted ? const Color(0xFF4CAF50) : ssText3,
                             fontSize: 12,
@@ -14510,19 +17784,19 @@ class GroupMemberHtmlRow extends StatelessWidget {
             ),
             const SizedBox(width: 12),
             if (isMe)
-              const Row(
+              Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    'Tú',
-                    style: TextStyle(
+                    context.tr('Tú'),
+                    style: const TextStyle(
                       color: ssText3,
                       fontSize: 11,
                       fontWeight: FontWeight.w700,
                     ),
                   ),
-                  SizedBox(width: 5),
-                  Icon(Icons.edit_outlined, color: ssText3, size: 17),
+                  const SizedBox(width: 5),
+                  const Icon(Icons.edit_outlined, color: ssText3, size: 17),
                 ],
               )
             else if (!posted && esDomingo())
@@ -14589,7 +17863,7 @@ class GroupOptionsSection extends StatelessWidget {
                         height: 1,
                         thickness: 1,
                         color: ssSeparator,
-                        indent: 76,
+                        indent: 66,
                       ),
                   ],
                 ],
@@ -14640,16 +17914,6 @@ class GroupOptionRow extends StatelessWidget {
         : highlighted
         ? ssOrangeDark
         : ssText;
-    final iconBackground = destructive
-        ? const Color(0xFFFFF5F3)
-        : highlighted
-        ? ssOrangeLight
-        : ssBg;
-    final iconBorderColor = destructive
-        ? const Color(0xFFF3C9C4)
-        : highlighted
-        ? ssOrangeMid
-        : ssBorder;
     final iconColor = destructive ? dangerColor : ssOrangeDark;
     final chevronColor = destructive ? dangerColor : ssText3;
 
@@ -14660,28 +17924,23 @@ class GroupOptionRow extends StatelessWidget {
         child: ConstrainedBox(
           constraints: const BoxConstraints(minHeight: 64),
           child: Padding(
-            padding: const EdgeInsets.fromLTRB(14, 9, 12, 9),
+            padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
             child: Row(
               children: [
-                Container(
-                  width: 46,
-                  height: 46,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: iconBackground,
-                    borderRadius: BorderRadius.circular(15),
-                    border: Border.all(color: iconBorderColor, width: 1.1),
+                SizedBox(
+                  width: 36,
+                  child: Center(
+                    child: GroupOptionLineIcon(icon: icon, color: iconColor),
                   ),
-                  child: GroupOptionLineIcon(icon: icon, color: iconColor),
                 ),
-                const SizedBox(width: 12),
+                const SizedBox(width: 14),
                 Expanded(
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        title,
+                        context.tr(title),
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         style: TextStyle(
@@ -14694,7 +17953,7 @@ class GroupOptionRow extends StatelessWidget {
                       if (subtitle != null) ...[
                         const SizedBox(height: 3),
                         Text(
-                          subtitle!,
+                          context.tr(subtitle!),
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
@@ -14713,7 +17972,7 @@ class GroupOptionRow extends StatelessWidget {
                   ConstrainedBox(
                     constraints: const BoxConstraints(maxWidth: 112),
                     child: Text(
-                      trailingText!,
+                      context.tr(trailingText!),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       textAlign: TextAlign.right,
@@ -14775,7 +18034,7 @@ class _GroupOptionLineIconPainter extends CustomPainter {
     final paint = Paint()
       ..color = color
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 5.8
+      ..strokeWidth = 4.6
       ..strokeCap = StrokeCap.round
       ..strokeJoin = StrokeJoin.round;
 
@@ -15385,20 +18644,24 @@ class _GroupModerationReportsInlineSectionState
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(22),
           ),
-          title: const Text('Retirar selfie reportada'),
+          title: Text(dialogContext.tr('Retirar selfie reportada')),
           content: Text(
-            'La selfie de ${report.authorName} dejará de verse en el grupo y el reporte quedará resuelto.',
+            dialogContext
+                .tr(
+                  'La selfie de {name} dejará de verse en el grupo y el reporte quedará resuelto.',
+                )
+                .replaceAll('{name}', report.authorName),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancelar'),
+              child: Text(dialogContext.tr('Cancelar')),
             ),
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text(
-                'Retirar selfie',
-                style: TextStyle(
+              child: Text(
+                dialogContext.tr('Retirar selfie'),
+                style: const TextStyle(
                   color: Color(0xFFE74C3C),
                   fontWeight: FontWeight.w800,
                 ),
@@ -15483,7 +18746,7 @@ class _GroupModerationReportsInlineSectionState
                 const SizedBox(height: 8),
                 TextButton(
                   onPressed: () => _loadReports(),
-                  child: const Text('Reintentar'),
+                  child: Text(context.tr('Reintentar')),
                 ),
               ],
             ),
@@ -15713,18 +18976,22 @@ class _GroupBlockedUserHtmlRowState extends State<GroupBlockedUserHtmlRow> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Permitir nueva solicitud'),
+        title: Text(dialogContext.tr('Permitir nueva solicitud')),
         content: Text(
-          '$name podrá volver a solicitar entrada usando una invitación válida.',
+          dialogContext
+              .tr(
+                '{name} podrá volver a solicitar entrada usando una invitación válida.',
+              )
+              .replaceAll('{name}', name),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Cancelar'),
+            child: Text(dialogContext.tr('Cancelar')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Permitir'),
+            child: Text(dialogContext.tr('Permitir')),
           ),
         ],
       ),
@@ -15929,11 +19196,10 @@ class GroupInviteActionButtons extends StatelessWidget {
   }
 
   Future<void> _openShareSheet(BuildContext context) async {
-    final text = 'Únete a mi grupo de Sunday Selfie: $inviteLink';
     await SharePlus.instance.share(
       ShareParams(
-        text: text,
-        subject: 'Invitación a $groupName',
+        text: localizedInviteShareText(context, inviteLink),
+        subject: localizedInviteShareSubject(context, groupName),
         sharePositionOrigin: const Rect.fromLTWH(0, 0, 1, 1),
       ),
     );
@@ -15956,18 +19222,20 @@ class GroupInviteActionButtons extends StatelessWidget {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(22),
           ),
-          title: const Text('Regenerar invitación'),
-          content: const Text(
-            'El código anterior dejará de funcionar. Tendrás que compartir el nuevo código.',
+          title: Text(dialogContext.tr('Regenerar invitación')),
+          content: Text(
+            dialogContext.tr(
+              'El código anterior dejará de funcionar. Tendrás que compartir el nuevo código.',
+            ),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancelar'),
+              child: Text(dialogContext.tr('Cancelar')),
             ),
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Regenerar'),
+              child: Text(dialogContext.tr('Regenerar')),
             ),
           ],
         );
@@ -16052,7 +19320,7 @@ class InviteActionButton extends StatelessWidget {
           ),
           child: Center(
             child: Text(
-              text,
+              context.tr(text),
               textAlign: TextAlign.center,
               style: TextStyle(
                 color: isPrimary
@@ -16145,7 +19413,7 @@ class InviteShareSheet extends StatelessWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'Únete a "$groupName"',
+                          localizedJoinGroupTitle(context, groupName),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
@@ -16188,8 +19456,8 @@ class InviteShareSheet extends StatelessWidget {
                       showSundaySnack(
                         feedbackContext,
                         option.$2 == 'Más'
-                            ? 'Compartiendo…'
-                            : 'Compartido por ${option.$2}',
+                            ? 'Compartiendo...'
+                            : localizedSharedVia(feedbackContext, option.$2),
                       );
                     }
                   },
@@ -16211,7 +19479,7 @@ class InviteShareSheet extends StatelessWidget {
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        option.$2,
+                        context.tr(option.$2),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -16270,7 +19538,7 @@ class InviteSheetButton extends StatelessWidget {
           height: 48,
           child: Center(
             child: Text(
-              text,
+              context.tr(text),
               style: TextStyle(
                 color: muted ? ssText3 : ssText,
                 fontSize: 15,
@@ -16376,16 +19644,20 @@ class _MemberActionsSheetState extends State<MemberActionsSheet> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('Expulsar usuario'),
-        content: Text('¿Quieres expulsar a $name del grupo?'),
+        title: Text(dialogContext.tr('Expulsar usuario')),
+        content: Text(
+          dialogContext
+              .tr('¿Quieres expulsar a {name} del grupo?')
+              .replaceAll('{name}', name),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Cancelar'),
+            child: Text(dialogContext.tr('Cancelar')),
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Expulsar'),
+            child: Text(dialogContext.tr('Expulsar')),
           ),
         ],
       ),
@@ -16487,7 +19759,7 @@ class _MemberActionsSheetState extends State<MemberActionsSheet> {
                       ),
                       const SizedBox(height: 2),
                       Text(
-                        isAdmin ? 'Administrador' : 'Miembro',
+                        context.tr(isAdmin ? 'Administrador' : 'Miembro'),
                         style: const TextStyle(
                           color: ssText3,
                           fontSize: 13,
@@ -17072,6 +20344,7 @@ const Duration kWeeklyChatPanelAnimationDuration = Duration(milliseconds: 240);
 const Curve kWeeklyChatPanelAnimationCurve = Curves.easeOutCubic;
 const double kWeeklyChatDragDismissDistance = 24.0;
 const double kWeeklyChatDragDismissVelocity = 320.0;
+const double kWeeklyChatExpandedDragInfluenceHeight = 112.0;
 
 double resolverAlturaPanelChatSemanal({
   required double screenHeight,
@@ -17202,20 +20475,6 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
     return widget.weekKey.isNotEmpty &&
         esDomingo() &&
         widget.weekKey == obtenerWeekKeyActual();
-  }
-
-  String get weekLabel {
-    if (widget.weekKey == obtenerWeekKeyActual()) {
-      return 'ESTA SEMANA';
-    }
-
-    final parts = widget.weekKey.split('-W');
-    if (parts.length == 2) {
-      final weekNumber = int.tryParse(parts[1]) ?? 0;
-      if (weekNumber > 0) return 'SEMANA $weekNumber / ${parts[0]}';
-    }
-
-    return widget.weekKey.toUpperCase();
   }
 
   Future<void> _send() async {
@@ -17539,14 +20798,16 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
             ),
             child: Column(
               children: [
-                WeeklyChatDragHandle(
+                WeeklyChatExpandedDragZone(
+                  weekLabel: widget.weekKey == obtenerWeekKeyActual()
+                      ? context.tr('ESTA SEMANA')
+                      : localizedWeekLabel(context, widget.weekKey),
                   onDismiss: _collapsePanel,
                   onDragStart: _handlePanelDragStart,
                   onDragUpdate: _handlePanelDragUpdate,
                   onDragEnd: _handlePanelDragEnd,
                   onDragCancel: _handlePanelDragCancel,
                 ),
-                WeeklyChatHeader(weekLabel: weekLabel),
                 Expanded(
                   child: snapshot.connectionState == ConnectionState.waiting
                       ? const Center(
@@ -17721,7 +20982,9 @@ class WeeklyChatHeader extends StatelessWidget {
           const SizedBox(width: 6),
           Expanded(
             child: Text(
-              'CHAT · $weekLabel',
+              context
+                  .tr('CHAT · {weekLabel}')
+                  .replaceAll('{weekLabel}', weekLabel),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(
@@ -17738,15 +21001,17 @@ class WeeklyChatHeader extends StatelessWidget {
   }
 }
 
-class WeeklyChatDragHandle extends StatefulWidget {
+class WeeklyChatExpandedDragZone extends StatelessWidget {
+  final String weekLabel;
   final VoidCallback onDismiss;
   final VoidCallback? onDragStart;
   final ValueChanged<double>? onDragUpdate;
   final void Function(double distance, double velocity)? onDragEnd;
   final VoidCallback? onDragCancel;
 
-  const WeeklyChatDragHandle({
+  const WeeklyChatExpandedDragZone({
     super.key,
+    required this.weekLabel,
     required this.onDismiss,
     this.onDragStart,
     this.onDragUpdate,
@@ -17755,51 +21020,63 @@ class WeeklyChatDragHandle extends StatefulWidget {
   });
 
   @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: kWeeklyChatExpandedDragInfluenceHeight,
+      child: WeeklyChatDragArea(
+        onDismiss: onDismiss,
+        onDragStart: onDragStart,
+        onDragUpdate: onDragUpdate,
+        onDragEnd: onDragEnd,
+        onDragCancel: onDragCancel,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            WeeklyChatDragHandle(onDismiss: onDismiss, dragEnabled: false),
+            WeeklyChatHeader(weekLabel: weekLabel),
+            const Expanded(child: SizedBox.shrink()),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class WeeklyChatDragHandle extends StatefulWidget {
+  final VoidCallback onDismiss;
+  final VoidCallback? onDragStart;
+  final ValueChanged<double>? onDragUpdate;
+  final void Function(double distance, double velocity)? onDragEnd;
+  final VoidCallback? onDragCancel;
+  final bool dragEnabled;
+
+  const WeeklyChatDragHandle({
+    super.key,
+    required this.onDismiss,
+    this.onDragStart,
+    this.onDragUpdate,
+    this.onDragEnd,
+    this.onDragCancel,
+    this.dragEnabled = true,
+  });
+
+  @override
   State<WeeklyChatDragHandle> createState() => _WeeklyChatDragHandleState();
 }
 
 class _WeeklyChatDragHandleState extends State<WeeklyChatDragHandle> {
-  double dragDistance = 0;
-
-  void _resetDrag() {
-    dragDistance = 0;
-  }
-
   @override
   Widget build(BuildContext context) {
     return Semantics(
       button: true,
       label: 'Minimizar chat',
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
+      child: WeeklyChatDragArea(
         onTap: widget.onDismiss,
-        onVerticalDragStart: (_) {
-          _resetDrag();
-          widget.onDragStart?.call();
-        },
-        onVerticalDragUpdate: (details) {
-          final delta = details.primaryDelta ?? 0;
-          dragDistance = math.max(0, dragDistance + delta);
-          widget.onDragUpdate?.call(dragDistance);
-        },
-        onVerticalDragEnd: (details) {
-          final distance = dragDistance;
-          final velocity = details.primaryVelocity ?? 0;
-          final shouldDismiss =
-              distance > kWeeklyChatDragDismissDistance ||
-              velocity > kWeeklyChatDragDismissVelocity;
-          _resetDrag();
-          final onDragEnd = widget.onDragEnd;
-          if (onDragEnd != null) {
-            onDragEnd(distance, velocity);
-          } else if (shouldDismiss) {
-            widget.onDismiss();
-          }
-        },
-        onVerticalDragCancel: () {
-          _resetDrag();
-          widget.onDragCancel?.call();
-        },
+        onDismiss: widget.dragEnabled ? widget.onDismiss : null,
+        onDragStart: widget.dragEnabled ? widget.onDragStart : null,
+        onDragUpdate: widget.dragEnabled ? widget.onDragUpdate : null,
+        onDragEnd: widget.dragEnabled ? widget.onDragEnd : null,
+        onDragCancel: widget.dragEnabled ? widget.onDragCancel : null,
         child: SizedBox(
           width: double.infinity,
           height: 22,
@@ -17815,6 +21092,91 @@ class _WeeklyChatDragHandleState extends State<WeeklyChatDragHandle> {
           ),
         ),
       ),
+    );
+  }
+}
+
+class WeeklyChatDragArea extends StatefulWidget {
+  final Widget child;
+  final VoidCallback? onTap;
+  final VoidCallback? onDismiss;
+  final VoidCallback? onDragStart;
+  final ValueChanged<double>? onDragUpdate;
+  final void Function(double distance, double velocity)? onDragEnd;
+  final VoidCallback? onDragCancel;
+
+  const WeeklyChatDragArea({
+    super.key,
+    required this.child,
+    this.onTap,
+    this.onDismiss,
+    this.onDragStart,
+    this.onDragUpdate,
+    this.onDragEnd,
+    this.onDragCancel,
+  });
+
+  @override
+  State<WeeklyChatDragArea> createState() => _WeeklyChatDragAreaState();
+}
+
+class _WeeklyChatDragAreaState extends State<WeeklyChatDragArea> {
+  double dragDistance = 0;
+
+  void _resetDrag() {
+    dragDistance = 0;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dragEnabled =
+        widget.onDismiss != null ||
+        widget.onDragStart != null ||
+        widget.onDragUpdate != null ||
+        widget.onDragEnd != null ||
+        widget.onDragCancel != null;
+    final tapEnabled = widget.onTap != null;
+    if (!dragEnabled && !tapEnabled) return widget.child;
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: widget.onTap,
+      onVerticalDragStart: dragEnabled
+          ? (_) {
+              _resetDrag();
+              widget.onDragStart?.call();
+            }
+          : null,
+      onVerticalDragUpdate: dragEnabled
+          ? (details) {
+              final delta = details.primaryDelta ?? 0;
+              dragDistance = math.max(0, dragDistance + delta);
+              widget.onDragUpdate?.call(dragDistance);
+            }
+          : null,
+      onVerticalDragEnd: dragEnabled
+          ? (details) {
+              final distance = dragDistance;
+              final velocity = details.primaryVelocity ?? 0;
+              final shouldDismiss =
+                  distance > kWeeklyChatDragDismissDistance ||
+                  velocity > kWeeklyChatDragDismissVelocity;
+              _resetDrag();
+              final onDragEnd = widget.onDragEnd;
+              if (onDragEnd != null) {
+                onDragEnd(distance, velocity);
+              } else if (shouldDismiss) {
+                widget.onDismiss?.call();
+              }
+            }
+          : null,
+      onVerticalDragCancel: dragEnabled
+          ? () {
+              _resetDrag();
+              widget.onDragCancel?.call();
+            }
+          : null,
+      child: widget.child,
     );
   }
 }
@@ -18098,11 +21460,11 @@ class WeeklyChatInputBar extends StatelessWidget {
                             fontSize: 13,
                             fontWeight: FontWeight.w600,
                           ),
-                          decoration: const InputDecoration(
+                          decoration: InputDecoration(
                             isCollapsed: true,
                             counterText: '',
-                            hintText: 'Mensaje',
-                            hintStyle: TextStyle(
+                            hintText: context.tr('Mensaje'),
+                            hintStyle: const TextStyle(
                               color: ssText3,
                               fontSize: 13,
                               fontWeight: FontWeight.w700,
@@ -18120,16 +21482,17 @@ class WeeklyChatInputBar extends StatelessWidget {
             const SizedBox(width: 8),
             Material(
               color: Colors.white,
-              borderRadius: BorderRadius.circular(999),
+              borderRadius: BorderRadius.circular(8),
+              clipBehavior: Clip.antiAlias,
               child: InkWell(
-                borderRadius: BorderRadius.circular(999),
+                borderRadius: BorderRadius.circular(8),
                 onTap: sending ? null : onGif,
                 child: Container(
+                  width: 52,
                   height: 40,
-                  padding: const EdgeInsets.symmetric(horizontal: 11),
                   alignment: Alignment.center,
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(999),
+                    borderRadius: BorderRadius.circular(8),
                     border: Border.all(color: ssOrangeMid, width: 1.2),
                   ),
                   child: const Text(
@@ -18144,33 +21507,42 @@ class WeeklyChatInputBar extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 8),
-            Material(
-              color: sending ? ssOrangeMid : ssOrangeMid,
-              shape: const CircleBorder(),
-              child: InkWell(
-                customBorder: const CircleBorder(),
-                onTap: sending ? null : onSend,
-                child: SizedBox(
-                  width: 40,
-                  height: 40,
-                  child: sending
-                      ? const Center(
-                          child: SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(
+            ValueListenableBuilder<TextEditingValue>(
+              valueListenable: controller,
+              builder: (context, value, _) {
+                final hasText = value.text.trim().isNotEmpty;
+                final active = hasText || sending;
+
+                return Material(
+                  key: const ValueKey('weekly-chat-send-button'),
+                  color: active ? ssOrange : ssOrangeMid,
+                  shape: const CircleBorder(),
+                  child: InkWell(
+                    customBorder: const CircleBorder(),
+                    onTap: sending || !hasText ? null : onSend,
+                    child: SizedBox(
+                      width: 40,
+                      height: 40,
+                      child: sending
+                          ? const Center(
+                              child: SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  color: Colors.white,
+                                  strokeWidth: 2,
+                                ),
+                              ),
+                            )
+                          : const Icon(
+                              Icons.send_rounded,
                               color: Colors.white,
-                              strokeWidth: 2,
+                              size: 18,
                             ),
-                          ),
-                        )
-                      : const Icon(
-                          Icons.send_rounded,
-                          color: Colors.white,
-                          size: 18,
-                        ),
-                ),
-              ),
+                    ),
+                  ),
+                );
+              },
             ),
           ],
         ],
@@ -18221,7 +21593,7 @@ class WeeklyChatPromptPill extends StatelessWidget {
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      label,
+                      context.tr(label),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
@@ -18367,14 +21739,10 @@ class SundayGifRepository {
     final cleanPos = pos?.trim() ?? '';
 
     try {
-      final callable = FirebaseFunctions.instance.httpsCallable(
-        'buscarGifsTenor',
+      final response = await llamarCallableAutenticadoConReintento(
+        name: 'buscarGifsTenor',
+        data: {'query': cleanQuery, 'pos': cleanPos, 'limit': pageSize},
       );
-      final response = await callable.call({
-        'query': cleanQuery,
-        'pos': cleanPos,
-        'limit': pageSize,
-      });
       final data = response.data;
 
       if (data is! Map) {
@@ -18443,11 +21811,18 @@ class SundayGifRepository {
     if (paginating) return 'No se pudieron cargar más GIFs';
 
     if (error is FirebaseFunctionsException) {
+      if (error.code == 'not-found') {
+        return 'La biblioteca de GIFs se está activando. Prueba otra vez en unos minutos.';
+      }
+
       if (error.code == 'failed-precondition') {
         return 'La biblioteca de GIFs no está configurada todavía';
       }
 
-      return error.message ?? 'No se pudo cargar la biblioteca de GIFs';
+      return mensajeErrorFirebaseFunction(
+        error,
+        fallback: 'No se pudo cargar la biblioteca de GIFs',
+      );
     }
 
     return 'No se pudo cargar la biblioteca de GIFs';
@@ -18602,7 +21977,7 @@ class _SundayGifPickerSheetState extends State<SundayGifPickerSheet> {
                       top: 2,
                       right: 8,
                       child: IconButton(
-                        tooltip: 'Cerrar',
+                        tooltip: context.tr('Cerrar'),
                         onPressed: () => Navigator.pop(context),
                         icon: const Icon(Icons.close_rounded, color: ssText3),
                       ),
@@ -18637,8 +22012,8 @@ class _SundayGifPickerSheetState extends State<SundayGifPickerSheet> {
                         size: 20,
                       ),
                       hintText: showingTenorResults
-                          ? 'Buscar en Tenor'
-                          : 'Buscar GIFs',
+                          ? context.tr('Buscar en Tenor')
+                          : context.tr('Buscar GIFs'),
                       hintStyle: const TextStyle(
                         color: ssText3,
                         fontSize: 14,
@@ -18829,7 +22204,7 @@ class GroupWeekSummaryCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      obtenerEtiquetaSemana(weekKey),
+                      localizedWeekLabel(context, weekKey),
                       style: const TextStyle(
                         color: ssText,
                         fontSize: 16,
@@ -18838,9 +22213,11 @@ class GroupWeekSummaryCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 3),
                     Text(
-                      esDomingo()
-                          ? 'Hoy se actualiza el grupo'
-                          : 'Selfies publicados esta semana',
+                      context.tr(
+                        esDomingo()
+                            ? 'Hoy se actualiza el grupo'
+                            : 'Selfies publicados esta semana',
+                      ),
                       style: const TextStyle(
                         color: ssText2,
                         fontSize: 12,
@@ -18913,9 +22290,9 @@ class EmptyWeekCard extends StatelessWidget {
             child: const Icon(Icons.camera_alt_rounded, color: Colors.white),
           ),
           const SizedBox(height: 14),
-          const Text(
-            'Todavía no hay selfies',
-            style: TextStyle(
+          Text(
+            context.tr('Todavía no hay selfies'),
+            style: const TextStyle(
               color: ssOrangeDark,
               fontSize: 16,
               fontWeight: FontWeight.w800,
@@ -18923,7 +22300,7 @@ class EmptyWeekCard extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text(
-            obtenerEtiquetaSemana(weekKey),
+            localizedWeekLabel(context, weekKey),
             style: const TextStyle(
               color: ssText2,
               fontSize: 13,
@@ -18964,6 +22341,53 @@ class MissingSelfieTile extends StatefulWidget {
 
 class _MissingSelfieTileState extends State<MissingSelfieTile> {
   bool openingCameraOrUploading = false;
+  bool sendingReminder = false;
+  bool preparingExtraReminder = false;
+  bool extraReminderUnlocked = false;
+
+  Future<void> _sendReminder() async {
+    if (sendingReminder || preparingExtraReminder) return;
+
+    final currentUid = FirebaseAuth.instance.currentUser?.uid;
+    if (currentUid == null || currentUid == widget.targetUid) return;
+    if (!esDomingo() || widget.weekKey != obtenerWeekKeyActual()) return;
+
+    setState(() => sendingReminder = true);
+
+    try {
+      await enviarZumbidoSelfie(
+        groupId: widget.groupId,
+        targetUid: widget.targetUid,
+        rewardedAdWatched: extraReminderUnlocked,
+      );
+
+      if (!mounted) return;
+      showSundaySnack(context, 'Zumbido enviado');
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error: $error');
+    } finally {
+      if (mounted) setState(() => sendingReminder = false);
+    }
+  }
+
+  Future<void> _prepareExtraReminder() async {
+    if (preparingExtraReminder || sendingReminder) return;
+
+    setState(() => preparingExtraReminder = true);
+
+    try {
+      final unlocked = await prepararZumbidoExtraConAnuncio(context);
+      if (mounted && unlocked) {
+        setState(() => extraReminderUnlocked = true);
+      }
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'Error: $error');
+    } finally {
+      if (mounted) setState(() => preparingExtraReminder = false);
+    }
+  }
 
   Future<void> _openCameraAndUpload() async {
     if (openingCameraOrUploading) return;
@@ -19010,12 +22434,6 @@ class _MissingSelfieTileState extends State<MissingSelfieTile> {
         weekKey: widget.weekKey,
         rewardedAdWatched: isLateMondayUpload,
       );
-
-      if (!mounted) return;
-      showSundaySnack(
-        context,
-        'Selfie publicado en ${formatGroupDisplayName(widget.groupName)}',
-      );
     } on SelfiePhotoValidationException catch (error) {
       if (!mounted) return;
       showSundaySnack(context, error.message);
@@ -19050,6 +22468,8 @@ class _MissingSelfieTileState extends State<MissingSelfieTile> {
     SundayClockScope.watch(context);
     final currentUid = FirebaseAuth.instance.currentUser?.uid;
     final isMe = currentUid == widget.targetUid;
+    final canSendReminder =
+        !isMe && esDomingo() && widget.weekKey == obtenerWeekKeyActual();
     final canUploadSelfie =
         isMe &&
         widget.weekKey == obtenerWeekKeyActual() &&
@@ -19059,7 +22479,10 @@ class _MissingSelfieTileState extends State<MissingSelfieTile> {
         miembroPuedeSubirSelfieLunesConRetraso(widget.weekKey, widget.joinedAt);
     final canTapSelfie = canUploadSelfie || canUploadLateSelfie;
     final displayName = formatUserDisplayName(widget.name);
-    final statusLabel = missingSundaySelfieStatusLabel(widget.weekKey);
+    final statusLabel = localizedMissingSundaySelfieStatusLabel(
+      context,
+      widget.weekKey,
+    );
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -19186,7 +22609,19 @@ class _MissingSelfieTileState extends State<MissingSelfieTile> {
           ),
         ),
         const SizedBox(height: 8),
-        const MissingSelfieReactionPlaceholder(),
+        if (canSendReminder)
+          MissingSelfieReminderButton(
+            groupId: widget.groupId,
+            weekKey: widget.weekKey,
+            targetUid: widget.targetUid,
+            sending: sendingReminder,
+            preparingExtraReminder: preparingExtraReminder,
+            extraReminderUnlocked: extraReminderUnlocked,
+            onTap: _sendReminder,
+            onPrepareExtraReminder: _prepareExtraReminder,
+          )
+        else
+          const MissingSelfieReactionPlaceholder(),
       ],
     );
   }
@@ -19858,18 +23293,24 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Text(
-                  'Reportar esta selfie',
-                  style: TextStyle(
+                Text(
+                  sheetContext.tr('Reportar esta selfie'),
+                  style: const TextStyle(
                     color: ssText,
                     fontSize: 18,
                     fontWeight: FontWeight.w900,
                   ),
                 ),
                 const SizedBox(height: 6),
-                const Text(
-                  'El reporte será privado y se enviará para revisión.',
-                  style: TextStyle(color: ssText2, fontSize: 13, height: 1.35),
+                Text(
+                  sheetContext.tr(
+                    'El reporte será privado y se enviará para revisión.',
+                  ),
+                  style: const TextStyle(
+                    color: ssText2,
+                    fontSize: 13,
+                    height: 1.35,
+                  ),
                 ),
                 const SizedBox(height: 12),
                 ...kSelfieReportReasons.entries.map((entry) {
@@ -19880,7 +23321,7 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
                       color: ssOrangeDark,
                     ),
                     title: Text(
-                      entry.value,
+                      sheetContext.tr(entry.value),
                       style: const TextStyle(
                         color: ssText,
                         fontWeight: FontWeight.w700,
@@ -19927,6 +23368,14 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
       return;
     }
 
+    if (!puedeUsarSelfieComoFotoPerfil(entry.weekKey)) {
+      showSundaySnack(
+        context,
+        'Solo puedes usar como foto de perfil tu selfie de este domingo o del lunes posterior',
+      );
+      return;
+    }
+
     final imageUrl = (entry.post['imageUrl'] ?? entry.post['thumbUrl'] ?? '')
         .toString()
         .trim();
@@ -19941,7 +23390,11 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
       final unlocked = await prepararCambioFotoPerfilConAnuncio(context);
       if (!mounted || !unlocked) return;
 
-      await reemplazarFotoPerfilConSelfie(user: user, selfieUrl: imageUrl);
+      await reemplazarFotoPerfilConSelfie(
+        user: user,
+        selfieUrl: imageUrl,
+        weekKey: entry.weekKey,
+      );
 
       if (!mounted) return;
       showSundaySnack(context, 'Foto de perfil actualizada');
@@ -20014,20 +23467,22 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(22),
           ),
-          title: const Text('Borrar selfie'),
-          content: const Text(
-            'Esta selfie se eliminará definitivamente, también de la nube. Esta acción no se puede deshacer.',
+          title: Text(dialogContext.tr('Borrar selfie')),
+          content: Text(
+            dialogContext.tr(
+              'Esta selfie se eliminará definitivamente, también de la nube. Esta acción no se puede deshacer.',
+            ),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancelar'),
+              child: Text(dialogContext.tr('Cancelar')),
             ),
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text(
-                'Sí, borrar',
-                style: TextStyle(
+              child: Text(
+                dialogContext.tr('Sí, borrar'),
+                style: const TextStyle(
                   color: Color(0xFFE74C3C),
                   fontWeight: FontWeight.w800,
                 ),
@@ -20118,7 +23573,7 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
             post['authorName'] ?? 'Usuario',
           );
           final authorPhotoUrl = post['authorPhotoUrl'] as String?;
-          final weekLabel = obtenerEtiquetaSemana(weekKey);
+          final weekLabel = localizedWeekLabel(context, weekKey);
           final isOwnSelfie = currentUser?.uid == postUid;
           final imageUrl = (post['imageUrl'] ?? post['thumbUrl'] ?? '')
               .toString();
@@ -20238,7 +23693,9 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
                             sendingReport ||
                             deletingSelfie,
                         showOptions: currentUser != null,
-                        canReplaceProfilePhoto: isOwnSelfie,
+                        canReplaceProfilePhoto:
+                            isOwnSelfie &&
+                            puedeUsarSelfieComoFotoPerfil(weekKey),
                         canReport: !isOwnSelfie,
                         canDeleteSelfie: isOwnSelfie,
                         onBack: () => Navigator.pop(context),
@@ -20388,7 +23845,7 @@ class _SelfieHeaderBackButton extends StatelessWidget {
     return SizedBox.square(
       dimension: ssHeaderActionSize,
       child: IconButton(
-        tooltip: 'Volver',
+        tooltip: context.tr('Volver'),
         onPressed: onTap,
         padding: EdgeInsets.zero,
         constraints: const BoxConstraints.tightFor(
@@ -20419,7 +23876,7 @@ class _SelfieOptionsMenuButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return PopupMenuButton<_SelfieViewerAction>(
-      tooltip: 'Opciones',
+      tooltip: context.tr('Opciones'),
       enabled: !busy,
       position: PopupMenuPosition.under,
       color: Colors.white,
@@ -20438,18 +23895,18 @@ class _SelfieOptionsMenuButton extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
-                    children: const [
+                    children: [
                       Text(
-                        'Reemplazar foto de perfil',
-                        style: TextStyle(
+                        context.tr('Reemplazar foto de perfil'),
+                        style: const TextStyle(
                           color: ssText,
                           fontWeight: FontWeight.w800,
                         ),
                       ),
-                      SizedBox(height: 2),
+                      const SizedBox(height: 2),
                       Text(
-                        'Ver anuncio para confirmar',
-                        style: TextStyle(
+                        context.tr('Ver anuncio para confirmar'),
+                        style: const TextStyle(
                           color: ssText3,
                           fontSize: 12,
                           fontWeight: FontWeight.w600,
@@ -20471,18 +23928,18 @@ class _SelfieOptionsMenuButton extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
-                  children: const [
+                  children: [
                     Text(
-                      'Descargar selfie',
-                      style: TextStyle(
+                      context.tr('Descargar selfie'),
+                      style: const TextStyle(
                         color: ssText,
                         fontWeight: FontWeight.w800,
                       ),
                     ),
-                    SizedBox(height: 2),
+                    const SizedBox(height: 2),
                     Text(
-                      'Guardar en galería',
-                      style: TextStyle(
+                      context.tr('Guardar en galería'),
+                      style: const TextStyle(
                         color: ssText3,
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
@@ -20505,18 +23962,18 @@ class _SelfieOptionsMenuButton extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
-                    children: const [
+                    children: [
                       Text(
-                        'Reportar selfie',
-                        style: TextStyle(
+                        context.tr('Reportar selfie'),
+                        style: const TextStyle(
                           color: ssText,
                           fontWeight: FontWeight.w800,
                         ),
                       ),
-                      SizedBox(height: 2),
+                      const SizedBox(height: 2),
                       Text(
-                        'Enviar para revisión privada',
-                        style: TextStyle(
+                        context.tr('Enviar para revisión privada'),
+                        style: const TextStyle(
                           color: ssText3,
                           fontSize: 12,
                           fontWeight: FontWeight.w600,
@@ -20542,18 +23999,18 @@ class _SelfieOptionsMenuButton extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
-                    children: const [
+                    children: [
                       Text(
-                        'Borrar selfie',
-                        style: TextStyle(
+                        context.tr('Borrar selfie'),
+                        style: const TextStyle(
                           color: ssText,
                           fontWeight: FontWeight.w800,
                         ),
                       ),
-                      SizedBox(height: 2),
+                      const SizedBox(height: 2),
                       Text(
-                        'Eliminar definitivamente',
-                        style: TextStyle(
+                        context.tr('Eliminar definitivamente'),
+                        style: const TextStyle(
                           color: ssText3,
                           fontSize: 12,
                           fontWeight: FontWeight.w600,
@@ -21005,7 +24462,7 @@ class EmojiReactionPickerSheet extends StatefulWidget {
 
 class _EmojiReactionPickerSheetState extends State<EmojiReactionPickerSheet> {
   late int selectedSectionIndex;
-  String? expandedEmojiBase;
+  Offset? lastEmojiTapPosition;
 
   @override
   void initState() {
@@ -21026,6 +24483,27 @@ class _EmojiReactionPickerSheetState extends State<EmojiReactionPickerSheet> {
     return 0;
   }
 
+  Future<void> _selectEmojiGroup({
+    required EmojiReactionChoiceGroup group,
+    required String currentReaction,
+    Offset? anchor,
+  }) async {
+    if (group.variants.length <= 1) {
+      Navigator.pop(context, group.displayEmoji);
+      return;
+    }
+
+    final selected = await _showEmojiVariantPopover(
+      context: context,
+      group: group,
+      selectedEmoji: currentReaction,
+      anchor: anchor,
+    );
+
+    if (!mounted || selected == null) return;
+    Navigator.pop(context, selected);
+  }
+
   @override
   Widget build(BuildContext context) {
     final height = math.min(MediaQuery.sizeOf(context).height * 0.76, 640.0);
@@ -21034,11 +24512,6 @@ class _EmojiReactionPickerSheetState extends State<EmojiReactionPickerSheet> {
       widget.currentReaction ?? '',
     );
     final emojiGroups = agruparEmojisReaccion(section.emojis);
-    final expandedGroup = expandedEmojiBase == null
-        ? null
-        : emojiGroups
-              .where((group) => group.key == expandedEmojiBase)
-              .firstOrNull;
 
     return SafeArea(
       top: false,
@@ -21088,7 +24561,6 @@ class _EmojiReactionPickerSheetState extends State<EmojiReactionPickerSheet> {
                     child: InkWell(
                       onTap: () => setState(() {
                         selectedSectionIndex = index;
-                        expandedEmojiBase = null;
                       }),
                       borderRadius: BorderRadius.circular(15),
                       child: Container(
@@ -21122,53 +24594,7 @@ class _EmojiReactionPickerSheetState extends State<EmojiReactionPickerSheet> {
                 fontWeight: FontWeight.w900,
               ),
             ),
-            AnimatedSwitcher(
-              duration: const Duration(milliseconds: 160),
-              child: expandedGroup == null
-                  ? const SizedBox(height: 8)
-                  : Padding(
-                      key: ValueKey(expandedGroup.key),
-                      padding: const EdgeInsets.only(top: 8, bottom: 8),
-                      child: SizedBox(
-                        height: 44,
-                        child: ListView.separated(
-                          scrollDirection: Axis.horizontal,
-                          physics: const BouncingScrollPhysics(),
-                          itemCount: expandedGroup.variants.length,
-                          separatorBuilder: (_, _) => const SizedBox(width: 8),
-                          itemBuilder: (context, index) {
-                            final emoji = expandedGroup.variants[index];
-                            final selected = emoji == currentReaction;
-
-                            return InkWell(
-                              onTap: () => Navigator.pop(context, emoji),
-                              borderRadius: BorderRadius.circular(14),
-                              child: Container(
-                                width: 44,
-                                height: 44,
-                                alignment: Alignment.center,
-                                decoration: BoxDecoration(
-                                  color: selected ? ssOrangeLight : ssBg,
-                                  borderRadius: BorderRadius.circular(14),
-                                  border: Border.all(
-                                    color: selected ? ssOrange : ssBorder,
-                                    width: selected ? 1.6 : 1,
-                                  ),
-                                ),
-                                child: Text(
-                                  emoji,
-                                  style: const TextStyle(
-                                    fontSize: 24,
-                                    height: 1,
-                                  ),
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                    ),
-            ),
+            const SizedBox(height: 8),
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
@@ -21191,17 +24617,26 @@ class _EmojiReactionPickerSheetState extends State<EmojiReactionPickerSheet> {
                       final selected = group.variants.contains(currentReaction);
                       final hasVariants = group.variants.length > 1;
                       return InkWell(
+                        onTapDown: (details) {
+                          lastEmojiTapPosition = details.globalPosition;
+                        },
                         onTap: () {
-                          if (!hasVariants) {
-                            Navigator.pop(context, group.displayEmoji);
-                            return;
-                          }
-
-                          setState(() {
-                            expandedEmojiBase = expandedEmojiBase == group.key
-                                ? null
-                                : group.key;
-                          });
+                          unawaited(
+                            _selectEmojiGroup(
+                              group: group,
+                              currentReaction: currentReaction,
+                              anchor: lastEmojiTapPosition,
+                            ),
+                          );
+                        },
+                        onLongPress: () {
+                          unawaited(
+                            _selectEmojiGroup(
+                              group: group,
+                              currentReaction: currentReaction,
+                              anchor: lastEmojiTapPosition,
+                            ),
+                          );
                         },
                         borderRadius: BorderRadius.circular(14),
                         child: Container(
@@ -21264,19 +24699,131 @@ class CameraTabScreen extends StatefulWidget {
 class _CameraTabScreenState extends State<CameraTabScreen> {
   bool uploading = false;
   String? uploadingGroupId;
+  final math.Random _cameraGroupRandom = math.Random();
+  final Map<String, double> _cameraGroupTieBreakers = {};
+  String? _cameraSelfieCountsKey;
+  Future<Map<String, int>>? _cameraSelfieCountsFuture;
 
-  void _openReplacementInfo({required String groupName}) {
-    Navigator.push(
+  String _cameraGroupId(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data();
+    return (data['groupId'] ?? doc.id).toString();
+  }
+
+  double _cameraGroupTieBreaker(String groupId) {
+    return _cameraGroupTieBreakers.putIfAbsent(
+      groupId,
+      _cameraGroupRandom.nextDouble,
+    );
+  }
+
+  String _cameraSelfieCountsCacheKey(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
+  ) {
+    return groupDocs.map(_cameraGroupId).join('|');
+  }
+
+  void _invalidateCameraSelfieCounts() {
+    _cameraSelfieCountsKey = null;
+    _cameraSelfieCountsFuture = null;
+  }
+
+  Future<Map<String, int>> _cameraSelfieCountsFor(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
+  ) {
+    final key = _cameraSelfieCountsCacheKey(groupDocs);
+    final cachedFuture = _cameraSelfieCountsFuture;
+    if (_cameraSelfieCountsKey == key && cachedFuture != null) {
+      return cachedFuture;
+    }
+
+    _cameraSelfieCountsKey = key;
+    _cameraSelfieCountsFuture = _loadCameraSelfieCounts(groupDocs);
+    return _cameraSelfieCountsFuture!;
+  }
+
+  Future<Map<String, int>> _loadCameraSelfieCounts(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
+  ) async {
+    final entries = await Future.wait(
+      groupDocs.map((doc) async {
+        final groupId = _cameraGroupId(doc);
+        try {
+          final count = await countUserSelfiesInGroup(
+            userUid: widget.user.uid,
+            groupId: groupId,
+          );
+          return MapEntry(groupId, count);
+        } catch (error) {
+          logDebug('No se pudieron contar selfies de $groupId: $error');
+          return MapEntry(groupId, 0);
+        }
+      }),
+    );
+
+    return Map<String, int>.fromEntries(entries);
+  }
+
+  List<QueryDocumentSnapshot<Map<String, dynamic>>> _orderedCameraGroups(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
+    Map<String, int> selfieCounts,
+  ) {
+    final ordered = [...groupDocs];
+
+    ordered.sort((a, b) {
+      final aGroupId = _cameraGroupId(a);
+      final bGroupId = _cameraGroupId(b);
+      final aCount = selfieCounts[aGroupId] ?? 0;
+      final bCount = selfieCounts[bGroupId] ?? 0;
+      final countComparison = bCount.compareTo(aCount);
+      if (countComparison != 0) return countComparison;
+
+      final tieComparison = _cameraGroupTieBreaker(
+        aGroupId,
+      ).compareTo(_cameraGroupTieBreaker(bGroupId));
+      if (tieComparison != 0) return tieComparison;
+
+      return aGroupId.compareTo(bGroupId);
+    });
+
+    return ordered;
+  }
+
+  Future<void> _openReplacementInfo({
+    required String groupId,
+    required String groupName,
+    required String selfieImageUrl,
+    required String selfieThumbnailUrl,
+    required String weekKey,
+    required DateTime? publishedAt,
+  }) async {
+    if (uploading) return;
+
+    final unlocked = await Navigator.push<bool>(
       context,
       MaterialPageRoute(
-        builder: (_) => SelfieReplacementInfoScreen(groupName: groupName),
+        builder: (_) => SelfieReplacementInfoScreen(
+          selfieImageUrl: selfieImageUrl,
+          selfieThumbnailUrl: selfieThumbnailUrl,
+          weekKey: weekKey,
+          publishedAt: publishedAt,
+        ),
       ),
+    );
+
+    if (!mounted || unlocked != true) return;
+    await _openCameraAndUpload(
+      groupId: groupId,
+      groupName: groupName,
+      replaceExisting: true,
+      rewardedAdWatched: true,
     );
   }
 
   Future<void> _openCameraAndUpload({
     required String groupId,
     required String groupName,
+    bool replaceExisting = false,
+    bool rewardedAdWatched = false,
   }) async {
     if (uploading) return;
 
@@ -21305,9 +24852,16 @@ class _CameraTabScreenState extends State<CameraTabScreen> {
       final validPhoto = await validarFotoSelfieParaSubida(context, foto);
       if (!mounted || !validPhoto) return;
 
-      await publicarSelfieReal(groupId: groupId, user: widget.user, foto: foto);
-      if (!mounted) return;
-      showSundaySnack(context, 'Selfie publicado en $groupName');
+      await publicarSelfieReal(
+        groupId: groupId,
+        user: widget.user,
+        foto: foto,
+        rewardedAdWatched: rewardedAdWatched,
+        replaceExisting: replaceExisting,
+      );
+      if (!replaceExisting) {
+        _invalidateCameraSelfieCounts();
+      }
     } on SelfiePhotoValidationException catch (error) {
       if (!mounted) return;
       showSundaySnack(context, error.message);
@@ -21361,12 +24915,30 @@ class _CameraTabScreenState extends State<CameraTabScreen> {
                     return const CameraEmptyGroupsContent();
                   }
 
-                  return CameraOpenContent(
-                    groupDocs: groupDocs,
-                    uploading: uploading,
-                    uploadingGroupId: uploadingGroupId,
-                    onUpload: _openCameraAndUpload,
-                    onReplaceRequested: _openReplacementInfo,
+                  return FutureBuilder<Map<String, int>>(
+                    future: _cameraSelfieCountsFor(groupDocs),
+                    builder: (context, countsSnapshot) {
+                      if (countsSnapshot.connectionState ==
+                              ConnectionState.waiting &&
+                          !countsSnapshot.hasData) {
+                        return const Center(
+                          child: CircularProgressIndicator(color: ssOrange),
+                        );
+                      }
+
+                      final orderedGroupDocs = _orderedCameraGroups(
+                        groupDocs,
+                        countsSnapshot.data ?? const {},
+                      );
+
+                      return CameraOpenContent(
+                        groupDocs: orderedGroupDocs,
+                        uploading: uploading,
+                        uploadingGroupId: uploadingGroupId,
+                        onUpload: _openCameraAndUpload,
+                        onReplaceRequested: _openReplacementInfo,
+                      );
+                    },
                   );
                 },
               ),
@@ -21490,7 +25062,15 @@ class CameraOpenContent extends StatelessWidget {
     required String groupName,
   })
   onUpload;
-  final void Function({required String groupName}) onReplaceRequested;
+  final Future<void> Function({
+    required String groupId,
+    required String groupName,
+    required String selfieImageUrl,
+    required String selfieThumbnailUrl,
+    required String weekKey,
+    required DateTime? publishedAt,
+  })
+  onReplaceRequested;
 
   const CameraOpenContent({
     super.key,
@@ -21528,17 +25108,6 @@ class CameraOpenContent extends StatelessWidget {
             height: 1.15,
           ),
         ),
-        const SizedBox(height: 10),
-        const Text(
-          'Elige en qué grupo quieres publicar tu Sunday Selfie de esta semana.',
-          textAlign: TextAlign.center,
-          style: TextStyle(
-            color: ssText2,
-            fontSize: 15,
-            height: 1.5,
-            fontWeight: FontWeight.w500,
-          ),
-        ),
         const SizedBox(height: 22),
         ...groupDocs.map((doc) {
           final data = doc.data();
@@ -21556,7 +25125,24 @@ class CameraOpenContent extends StatelessWidget {
             uploading: isUploading,
             locked: uploading && !isUploading,
             onTap: () => onUpload(groupId: groupId, groupName: groupName),
-            onReplaceRequested: () => onReplaceRequested(groupName: groupName),
+            onReplaceRequested:
+                ({
+                  required String selfieImageUrl,
+                  required String selfieThumbnailUrl,
+                  required String weekKey,
+                  required DateTime? publishedAt,
+                }) {
+                  unawaited(
+                    onReplaceRequested(
+                      groupId: groupId,
+                      groupName: groupName,
+                      selfieImageUrl: selfieImageUrl,
+                      selfieThumbnailUrl: selfieThumbnailUrl,
+                      weekKey: weekKey,
+                      publishedAt: publishedAt,
+                    ),
+                  );
+                },
           );
         }),
       ],
@@ -21571,7 +25157,13 @@ class CameraGroupUploadCard extends StatelessWidget {
   final bool uploading;
   final bool locked;
   final VoidCallback onTap;
-  final VoidCallback onReplaceRequested;
+  final void Function({
+    required String selfieImageUrl,
+    required String selfieThumbnailUrl,
+    required String weekKey,
+    required DateTime? publishedAt,
+  })
+  onReplaceRequested;
 
   const CameraGroupUploadCard({
     super.key,
@@ -21598,7 +25190,15 @@ class CameraGroupUploadCard extends StatelessWidget {
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
       stream: postRef.snapshots(),
       builder: (context, snapshot) {
+        final postData = snapshot.data?.data();
         final hasSelfie = snapshot.data?.exists ?? false;
+        final selfieImageUrl =
+            (postData?['imageUrl'] ?? postData?['thumbUrl'] ?? '').toString();
+        final selfieThumbnailUrl = (postData?['thumbUrl'] ?? selfieImageUrl)
+            .toString();
+        final selfiePublishedAt =
+            timestampToDate(postData?['updatedAt']) ??
+            timestampToDate(postData?['createdAt']);
         final enabled = !locked && !uploading;
 
         return Container(
@@ -21621,7 +25221,12 @@ class CameraGroupUploadCard extends StatelessWidget {
               borderRadius: BorderRadius.circular(18),
               onTap: enabled
                   ? hasSelfie
-                        ? onReplaceRequested
+                        ? () => onReplaceRequested(
+                            selfieImageUrl: selfieImageUrl,
+                            selfieThumbnailUrl: selfieThumbnailUrl,
+                            weekKey: weekKey,
+                            publishedAt: selfiePublishedAt,
+                          )
                         : onTap
                   : null,
               child: Padding(
@@ -21662,8 +25267,8 @@ class CameraGroupUploadCard extends StatelessWidget {
                     ),
                     const SizedBox(width: 10),
                     Container(
-                      width: hasSelfie ? 58 : 42,
-                      height: hasSelfie ? 46 : 42,
+                      width: 42,
+                      height: 42,
                       decoration: BoxDecoration(
                         color: hasSelfie ? Colors.white : ssOrange,
                         borderRadius: BorderRadius.circular(14),
@@ -21695,7 +25300,7 @@ class CameraGroupUploadCard extends StatelessWidget {
                                 Icon(
                                   Icons.photo_camera_rounded,
                                   color: ssOrangeDark,
-                                  size: 18,
+                                  size: 15,
                                 ),
                                 SizedBox(height: 1),
                                 Text(
@@ -21703,7 +25308,7 @@ class CameraGroupUploadCard extends StatelessWidget {
                                   maxLines: 1,
                                   style: TextStyle(
                                     color: ssOrangeDark,
-                                    fontSize: 9.2,
+                                    fontSize: 7.2,
                                     fontWeight: FontWeight.w900,
                                     height: 1,
                                   ),
@@ -21727,10 +25332,61 @@ class CameraGroupUploadCard extends StatelessWidget {
   }
 }
 
-class SelfieReplacementInfoScreen extends StatelessWidget {
-  final String groupName;
+class SelfieReplacementInfoScreen extends StatefulWidget {
+  final String selfieImageUrl;
+  final String selfieThumbnailUrl;
+  final String weekKey;
+  final DateTime? publishedAt;
 
-  const SelfieReplacementInfoScreen({super.key, required this.groupName});
+  const SelfieReplacementInfoScreen({
+    super.key,
+    required this.selfieImageUrl,
+    required this.selfieThumbnailUrl,
+    required this.weekKey,
+    required this.publishedAt,
+  });
+
+  @override
+  State<SelfieReplacementInfoScreen> createState() =>
+      _SelfieReplacementInfoScreenState();
+}
+
+class _SelfieReplacementInfoScreenState
+    extends State<SelfieReplacementInfoScreen> {
+  bool loadingAd = false;
+
+  DateTime get _polaroidDate =>
+      widget.publishedAt ??
+      domingoDesdeWeekKey(widget.weekKey) ??
+      DateTime.now();
+
+  Future<void> _watchAdAndOpenCamera() async {
+    if (loadingAd) return;
+
+    setState(() => loadingAd = true);
+    showSundaySnack(context, 'Cargando anuncio...');
+
+    try {
+      final rewardEarned = await mostrarAnuncioRecompensado();
+      if (!mounted) return;
+
+      if (rewardEarned) {
+        _dismissActiveSundaySnack();
+        Navigator.pop(context, true);
+        return;
+      }
+
+      setState(() => loadingAd = false);
+      showSundaySnack(context, 'Completa el anuncio para reemplazar tu selfie');
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => loadingAd = false);
+      showSundaySnack(
+        context,
+        'No se pudo cargar el anuncio. Inténtalo de nuevo en unos segundos.',
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -21741,100 +25397,292 @@ class SelfieReplacementInfoScreen extends StatelessWidget {
           children: [
             AppHeader(onBack: () => Navigator.pop(context)),
             Expanded(
-              child: ListView(
-                padding: const EdgeInsets.fromLTRB(24, 20, 24, 28),
-                children: [
-                  Container(
-                    width: 88,
-                    height: 88,
-                    decoration: const BoxDecoration(
-                      color: ssOrangeLight,
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.looks_one_rounded,
-                      color: ssOrange,
-                      size: 46,
-                    ),
-                  ),
-                  const SizedBox(height: 24),
-                  const Text(
-                    'Una selfie por domingo',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      color: ssTitle,
-                      fontSize: 28,
-                      height: 1.1,
-                      fontWeight: FontWeight.w900,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    'Ya has publicado tu Sunday Selfie en ${formatGroupDisplayName(groupName)}.',
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      color: ssText2,
-                      fontSize: 15,
-                      height: 1.45,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(height: 26),
-                  SundayCard(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Reemplazo excepcional',
-                          style: TextStyle(
-                            color: ssTitle,
-                            fontSize: 18,
-                            fontWeight: FontWeight.w900,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(24, 0, 24, 26),
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: SingleChildScrollView(
+                        physics: const BouncingScrollPhysics(),
+                        child: Padding(
+                          padding: const EdgeInsets.only(top: 8, bottom: 18),
+                          child: Column(
+                            children: [
+                              _SelfieReplacementPolaroid(
+                                imageUrl: widget.selfieImageUrl,
+                                thumbnailUrl: widget.selfieThumbnailUrl,
+                                dateLabel: localizedSelfieDateLabel(
+                                  context,
+                                  _polaroidDate,
+                                ),
+                              ),
+                              const SizedBox(height: 22),
+                              const _SelfiePublishedTodayChip(),
+                              const SizedBox(height: 28),
+                              Text(
+                                context.tr('Una selfie por domingo'),
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: ssTitle,
+                                  fontSize: 30,
+                                  height: 1.08,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                              const SizedBox(height: 14),
+                              Text(
+                                context.tr(
+                                  'Puedes rehacerla una sola vez viendo un anuncio. La cámara se abrirá al terminar.',
+                                ),
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                  color: ssText2,
+                                  fontSize: 19,
+                                  height: 1.45,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                        const SizedBox(height: 8),
-                        const Text(
-                          'Sunday Selfie está pensado para guardar un único momento real de cada domingo.',
-                          style: TextStyle(
-                            color: ssText2,
-                            fontSize: 14,
-                            height: 1.45,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                        const Text(
-                          'Para quienes apoyan el desarrollo de Sunday Selfie, más adelante permitiremos reemplazarla después de ver un anuncio.',
-                          style: TextStyle(
-                            color: ssText2,
-                            fontSize: 14,
-                            height: 1.45,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ],
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 18),
-                  SundayButton(
-                    text: 'Próximamente: ver anuncio para reemplazar',
-                    onPressed: () {
-                      showSundaySnack(
-                        context,
-                        'El reemplazo mediante anuncio estará disponible próximamente',
-                      );
-                    },
-                  ),
-                  const SizedBox(height: 10),
-                  TextButton(
-                    onPressed: () => Navigator.pop(context),
-                    child: const Text('Conservar mi selfie actual'),
-                  ),
-                ],
+                    _SelfieReplacementPrimaryButton(
+                      loading: loadingAd,
+                      onPressed: loadingAd ? null : _watchAdAndOpenCamera,
+                    ),
+                    const SizedBox(height: 12),
+                    TextButton(
+                      onPressed: loadingAd
+                          ? null
+                          : () => Navigator.pop(context),
+                      style: TextButton.styleFrom(
+                        foregroundColor: ssOrangeDark,
+                        disabledForegroundColor: ssOrangeDark.withValues(
+                          alpha: 0.42,
+                        ),
+                        textStyle: const TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      child: Text(context.tr('Conservar mi selfie actual')),
+                    ),
+                  ],
+                ),
               ),
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _SelfieReplacementPolaroid extends StatelessWidget {
+  final String imageUrl;
+  final String thumbnailUrl;
+  final String dateLabel;
+
+  const _SelfieReplacementPolaroid({
+    required this.imageUrl,
+    required this.thumbnailUrl,
+    required this.dateLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.sizeOf(context).width;
+    final width = math.min(342.0, math.max(232.0, screenWidth * 0.64));
+    final cleanImageUrl = imageUrl.trim();
+    final cleanThumbnailUrl = thumbnailUrl.trim();
+    final loadingPreview =
+        cleanThumbnailUrl.isEmpty || cleanThumbnailUrl == cleanImageUrl
+        ? const _ImageLoadingFill()
+        : CachedRemoteImage(
+            imageUrl: cleanThumbnailUrl,
+            cacheVariant: 'thumbnail',
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+            loadingWidget: const _ImageLoadingFill(),
+            errorWidget: const _ImageLoadingFill(),
+          );
+
+    return Center(
+      child: Transform.rotate(
+        angle: -0.035,
+        child: Container(
+          width: width,
+          padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(24),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.08),
+                blurRadius: 34,
+                offset: const Offset(0, 18),
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ClipRRect(
+                borderRadius: BorderRadius.circular(17),
+                child: AspectRatio(
+                  aspectRatio: 0.82,
+                  child: cleanImageUrl.isEmpty
+                      ? const _SelfieImageFallback(fallbackText: 'SS')
+                      : CachedRemoteImage(
+                          imageUrl: cleanImageUrl,
+                          cacheVariant: 'original',
+                          fit: BoxFit.cover,
+                          width: double.infinity,
+                          height: double.infinity,
+                          loadingWidget: loadingPreview,
+                          errorWidget: const _SelfieImageFallback(
+                            fallbackText: 'SS',
+                          ),
+                        ),
+                ),
+              ),
+              const SizedBox(height: 15),
+              Text(
+                dateLabel,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: GoogleFonts.dancingScript(
+                  color: ssTitle.withValues(alpha: 0.88),
+                  fontSize: 24,
+                  fontWeight: FontWeight.w900,
+                  height: 1,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SelfiePublishedTodayChip extends StatelessWidget {
+  const _SelfiePublishedTodayChip();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 17, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFE8F7EF),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.check_rounded, color: Color(0xFF48B77D), size: 19),
+          const SizedBox(width: 8),
+          Text(
+            context.tr('Publicada hoy'),
+            style: const TextStyle(
+              color: Color(0xFF48A96F),
+              fontSize: 18,
+              fontWeight: FontWeight.w900,
+              height: 1,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SelfieReplacementPrimaryButton extends StatelessWidget {
+  final bool loading;
+  final VoidCallback? onPressed;
+
+  const _SelfieReplacementPrimaryButton({
+    required this.loading,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: double.infinity,
+      height: 70,
+      child: ElevatedButton(
+        onPressed: onPressed,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: ssOrange,
+          foregroundColor: Colors.white,
+          disabledBackgroundColor: ssOrange.withValues(alpha: 0.54),
+          disabledForegroundColor: Colors.white.withValues(alpha: 0.78),
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(999),
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 22),
+        ),
+        child: loading
+            ? Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const SizedBox(
+                    width: 21,
+                    height: 21,
+                    child: CircularProgressIndicator(
+                      color: Colors.white,
+                      strokeWidth: 2.5,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Flexible(
+                    child: Text(
+                      context.tr('Cargando anuncio...'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  ),
+                ],
+              )
+            : Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Container(
+                    width: 36,
+                    height: 36,
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.26),
+                      borderRadius: BorderRadius.circular(11),
+                    ),
+                    child: const Icon(
+                      Icons.play_arrow_rounded,
+                      color: Colors.white,
+                      size: 24,
+                    ),
+                  ),
+                  const SizedBox(width: 18),
+                  Flexible(
+                    child: Text(
+                      context.tr('Ver anuncio y rehacer'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.w900,
+                        height: 1,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
       ),
     );
   }
@@ -22643,16 +26491,16 @@ class _MemberGroupSelfiesSortPill extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return PopupMenuButton<MemberGroupSelfiesSortMode>(
-      tooltip: 'Ordenar',
+      tooltip: context.tr('Ordenar'),
       onSelected: onSelected,
-      itemBuilder: (context) => const [
+      itemBuilder: (context) => [
         PopupMenuItem(
           value: MemberGroupSelfiesSortMode.newest,
-          child: Text('Más recientes'),
+          child: Text(context.tr('Más recientes')),
         ),
         PopupMenuItem(
           value: MemberGroupSelfiesSortMode.oldest,
-          child: Text('Anteriores'),
+          child: Text(context.tr('Anteriores')),
         ),
       ],
       child: _ToolbarPill(
@@ -22730,7 +26578,7 @@ class HtmlLikePageTitle extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Text(
-      text,
+      context.tr(text),
       style: const TextStyle(
         color: ssTitle,
         fontSize: 22,
@@ -22768,12 +26616,16 @@ class _MySelfiesToolbar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final countText = count == 1
+        ? context.tr('1 Sunday Selfie')
+        : context.tr('{count} Sunday Selfies').replaceAll('{count}', '$count');
+
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
         Expanded(
           child: Text(
-            '$count Sunday Selfie${count == 1 ? '' : 's'}',
+            countText,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: const TextStyle(
@@ -22818,25 +26670,25 @@ class _SortPill extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return PopupMenuButton<MySelfiesSortMode>(
-      tooltip: 'Ordenar',
+      tooltip: context.tr('Ordenar'),
       onSelected: onSelected,
       itemBuilder: (context) => [
-        const PopupMenuItem(
+        PopupMenuItem(
           value: MySelfiesSortMode.newest,
-          child: Text('Más recientes'),
+          child: Text(context.tr('Más recientes')),
         ),
-        const PopupMenuItem(
+        PopupMenuItem(
           value: MySelfiesSortMode.oldest,
-          child: Text('Más antiguas'),
+          child: Text(context.tr('Más antiguas')),
         ),
-        if (!dateSortsOnly) ...const [
+        if (!dateSortsOnly) ...[
           PopupMenuItem(
             value: MySelfiesSortMode.group,
-            child: Text('Por grupo'),
+            child: Text(context.tr('Por grupo')),
           ),
           PopupMenuItem(
             value: MySelfiesSortMode.week,
-            child: Text('Por semana'),
+            child: Text(context.tr('Por semana')),
           ),
         ],
       ],
@@ -22865,10 +26717,13 @@ class _FilterPill extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return PopupMenuButton<String>(
-      tooltip: 'Filtrar',
+      tooltip: context.tr('Filtrar'),
       onSelected: onSelected,
       itemBuilder: (context) => [
-        const PopupMenuItem(value: 'all', child: Text('Todos los grupos')),
+        PopupMenuItem(
+          value: 'all',
+          child: Text(context.tr('Todos los grupos')),
+        ),
         ...groupNames.map(
           (group) => PopupMenuItem(value: group, child: Text(group)),
         ),
@@ -22911,7 +26766,7 @@ class _ToolbarPill extends StatelessWidget {
           ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 92),
             child: Text(
-              label,
+              context.tr(label),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
@@ -23020,6 +26875,16 @@ class MySelfieHeroCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final itemWeekLabel = item.isoWeek != null && item.isoYear != null
+        ? context
+              .tr('Semana {weekNumber} / {year}')
+              .replaceAll(
+                '{weekNumber}',
+                item.isoWeek!.toString().padLeft(2, '0'),
+              )
+              .replaceAll('{year}', '${item.isoYear}')
+        : localizedWeekLabel(context, item.weekKey);
+
     return GestureDetector(
       onTap: onTap,
       child: Container(
@@ -23062,9 +26927,9 @@ class MySelfieHeroCard extends StatelessWidget {
                         color: Colors.white.withValues(alpha: 0.90),
                         borderRadius: BorderRadius.circular(999),
                       ),
-                      child: const Text(
-                        'Última selfie',
-                        style: TextStyle(
+                      child: Text(
+                        context.tr('Última selfie'),
+                        style: const TextStyle(
                           color: ssText,
                           fontSize: 12,
                           fontWeight: FontWeight.w900,
@@ -23109,7 +26974,7 @@ class MySelfieHeroCard extends StatelessWidget {
                     const SizedBox(height: 7),
                     Row(
                       children: [
-                        _OverlayPill(text: item.weekLabel),
+                        _OverlayPill(text: itemWeekLabel),
                         const SizedBox(width: 8),
                         _OverlayPill(text: item.dateLabel),
                       ],
@@ -23220,7 +27085,7 @@ class _OverlayPill extends StatelessWidget {
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(
-        text,
+        context.tr(text),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
         style: const TextStyle(
@@ -23332,12 +27197,96 @@ class _MontageScreenState extends State<MontageScreen> {
   int montageShuffleSeed = 0;
   String? selectedMontageWeekKey;
   MontageStyle selectedMontageStyle = MontageStyle.classic;
+  bool montageShowReactions = true;
   bool exportingMontage = false;
   bool preparingMontageAction = false;
+  final ScrollController montageScrollController = ScrollController();
+  final ScrollController montageGroupSelectorScrollController =
+      ScrollController();
+  final ScrollController montageWeekSelectorScrollController =
+      ScrollController();
   final GlobalKey montageBoundaryKey = GlobalKey();
+  String? montagePostsFutureKey;
+  Future<QuerySnapshot<Map<String, dynamic>>>? montagePostsFuture;
+
+  Object? _postCountForWeek(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> weekDocs,
+    String weekKey,
+  ) {
+    for (final doc in weekDocs) {
+      if (doc.id == weekKey) return doc.data()['postCount'];
+    }
+
+    return null;
+  }
+
+  Future<QuerySnapshot<Map<String, dynamic>>> _postsFutureForMontage({
+    required String groupId,
+    required String weekKey,
+    required Object? postCount,
+    required Query<Map<String, dynamic>> postsRef,
+  }) {
+    final nextKey = '$groupId::$weekKey::${postCount ?? ''}';
+    if (montagePostsFutureKey != nextKey || montagePostsFuture == null) {
+      montagePostsFutureKey = nextKey;
+      montagePostsFuture = postsRef.get();
+    }
+
+    return montagePostsFuture!;
+  }
+
+  Future<void> _waitForMontageCapturePaint({
+    Duration delay = Duration.zero,
+  }) async {
+    await Future<void>.delayed(Duration.zero);
+    WidgetsBinding.instance.scheduleFrame();
+    await WidgetsBinding.instance.endOfFrame;
+
+    if (delay > Duration.zero) {
+      await Future<void>.delayed(delay);
+    }
+
+    WidgetsBinding.instance.scheduleFrame();
+    await WidgetsBinding.instance.endOfFrame;
+  }
+
+  Future<double?> _scrollMontageIntoViewForCapture() async {
+    final previousOffset = montageScrollController.hasClients
+        ? montageScrollController.offset
+        : null;
+    final boundaryContext = montageBoundaryKey.currentContext;
+
+    if (boundaryContext == null) return previousOffset;
+
+    try {
+      await Scrollable.ensureVisible(
+        boundaryContext,
+        alignment: 0.02,
+        alignmentPolicy: ScrollPositionAlignmentPolicy.explicit,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOutCubic,
+      );
+    } catch (error) {
+      logDebug('No se pudo desplazar al montaje antes de capturar: $error');
+    }
+
+    await _waitForMontageCapturePaint(delay: const Duration(milliseconds: 170));
+    return previousOffset;
+  }
+
+  void _restoreMontageScrollOffset(double? previousOffset) {
+    if (previousOffset == null || !montageScrollController.hasClients) return;
+
+    final position = montageScrollController.position;
+    final target = previousOffset
+        .clamp(position.minScrollExtent, position.maxScrollExtent)
+        .toDouble();
+    if ((position.pixels - target).abs() < 0.5) return;
+
+    montageScrollController.jumpTo(target);
+  }
 
   Future<XFile?> _captureMontageFile({
-    required BuildContext context,
     required String groupName,
     required String weekKey,
   }) async {
@@ -23345,29 +27294,53 @@ class _MontageScreenState extends State<MontageScreen> {
       setState(() => exportingMontage = true);
     }
 
+    double? previousScrollOffset;
     try {
-      await WidgetsBinding.instance.endOfFrame;
-      await Future<void>.delayed(const Duration(milliseconds: 30));
+      previousScrollOffset = await _scrollMontageIntoViewForCapture();
 
       final boundary =
           montageBoundaryKey.currentContext?.findRenderObject()
               as RenderRepaintBoundary?;
 
       if (boundary == null) {
-        if (context.mounted) {
-          showSundaySnack(context, 'No se pudo preparar el montaje');
-        }
-        return null;
+        throw StateError('No se encontró el RepaintBoundary del montaje');
       }
 
-      final image = await boundary.toImage(pixelRatio: 3);
-      final byteData = await image.toByteData(format: ImageByteFormat.png);
+      final logicalSize = boundary.size;
+      if (logicalSize.isEmpty ||
+          !logicalSize.width.isFinite ||
+          !logicalSize.height.isFinite) {
+        throw StateError('El montaje no tiene un tamaño válido: $logicalSize');
+      }
+
+      final pixelRatio = calcularPixelRatioCapturaMontaje(logicalSize);
+      ByteData? byteData;
+      Object? lastCaptureError;
+
+      for (var attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          final image = await boundary.toImage(pixelRatio: pixelRatio);
+          try {
+            byteData = await image.toByteData(format: ImageByteFormat.png);
+          } finally {
+            image.dispose();
+          }
+
+          if (byteData != null) break;
+          lastCaptureError = StateError('toByteData devolvió null');
+        } catch (error) {
+          lastCaptureError = error;
+        }
+
+        await _waitForMontageCapturePaint(
+          delay: Duration(milliseconds: 90 + attempt * 90),
+        );
+      }
 
       if (byteData == null) {
-        if (context.mounted) {
-          showSundaySnack(context, 'No se pudo generar la imagen del montaje');
-        }
-        return null;
+        throw StateError(
+          'No se pudo convertir el montaje a PNG: $lastCaptureError',
+        );
       }
 
       final bytes = byteData.buffer.asUint8List();
@@ -23381,15 +27354,32 @@ class _MontageScreenState extends State<MontageScreen> {
       await file.writeAsBytes(bytes, flush: true);
 
       return XFile(file.path, mimeType: 'image/png', name: fileName);
+    } catch (error, stackTrace) {
+      if (mounted) {
+        showSundaySnack(context, 'No se pudo generar el montaje');
+      }
+      logDebug(
+        'No se pudo generar el montaje: $error\n'
+        '$stackTrace',
+      );
+      return null;
     } finally {
       if (mounted) {
         setState(() => exportingMontage = false);
+        _restoreMontageScrollOffset(previousScrollOffset);
       }
     }
   }
 
+  @override
+  void dispose() {
+    montageWeekSelectorScrollController.dispose();
+    montageGroupSelectorScrollController.dispose();
+    montageScrollController.dispose();
+    super.dispose();
+  }
+
   Future<void> _shareMontage({
-    required BuildContext context,
     required String groupName,
     required String weekKey,
   }) async {
@@ -23400,10 +27390,9 @@ class _MontageScreenState extends State<MontageScreen> {
         context,
         accion: 'compartir',
       );
-      if (!mounted || !context.mounted || !unlocked) return;
+      if (!mounted || !unlocked) return;
 
       final file = await _captureMontageFile(
-        context: context,
         groupName: groupName,
         weekKey: weekKey,
       );
@@ -23418,13 +27407,16 @@ class _MontageScreenState extends State<MontageScreen> {
           sharePositionOrigin: const Rect.fromLTWH(0, 0, 1, 1),
         ),
       );
+    } catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, 'No se pudo compartir el montaje');
+      logDebug('No se pudo compartir el montaje: $error');
     } finally {
       if (mounted) setState(() => preparingMontageAction = false);
     }
   }
 
   Future<void> _downloadMontage({
-    required BuildContext context,
     required String groupName,
     required String weekKey,
   }) async {
@@ -23435,12 +27427,11 @@ class _MontageScreenState extends State<MontageScreen> {
         context,
         accion: 'descargar',
       );
-      if (!mounted || !context.mounted || !unlocked) return;
+      if (!mounted || !unlocked) return;
 
       showSundaySnack(context, 'Guardando montaje...');
 
       final file = await _captureMontageFile(
-        context: context,
         groupName: groupName,
         weekKey: weekKey,
       );
@@ -23451,15 +27442,15 @@ class _MontageScreenState extends State<MontageScreen> {
         files: [file],
       );
 
-      if (!context.mounted) return;
+      if (!mounted) return;
       showSundaySnack(
         context,
         savedCount == 0
             ? 'No se pudo guardar el montaje'
-            : 'Montaje guardado en el teléfono',
+            : 'Montaje guardado en Fotos · Sunday Selfie',
       );
     } catch (error) {
-      if (!context.mounted) return;
+      if (!mounted) return;
       final message = mensajeErrorGuardandoArchivos(error);
       showSundaySnack(
         context,
@@ -23499,6 +27490,7 @@ class _MontageScreenState extends State<MontageScreen> {
                   final groupDocs = snapshot.data?.docs ?? [];
                   if (groupDocs.isEmpty) {
                     return ListView(
+                      controller: montageScrollController,
                       padding: const EdgeInsets.fromLTRB(16, 0, 16, 28),
                       children: [
                         SundayCard(
@@ -23564,11 +27556,14 @@ class _MontageScreenState extends State<MontageScreen> {
                           if (weekKeys.isEmpty) {
                             selectedMontageWeekKey = null;
                             return ListView(
+                              controller: montageScrollController,
                               padding: EdgeInsets.zero,
                               children: [
                                 _MontageGroupSelector(
                                   groupDocs: groupDocs,
                                   selectedGroupIndex: selectedGroupIndex,
+                                  controller:
+                                      montageGroupSelectorScrollController,
                                   onSelected: (index) => setState(() {
                                     selectedGroupIndex = index;
                                     selectedMontageWeekKey = null;
@@ -23603,8 +27598,15 @@ class _MontageScreenState extends State<MontageScreen> {
                               .doc(weekKey)
                               .collection('posts')
                               .orderBy('createdAt', descending: true);
+                          final postsFuture = _postsFutureForMontage(
+                            groupId: groupId,
+                            weekKey: weekKey,
+                            postCount: _postCountForWeek(weekDocs, weekKey),
+                            postsRef: postsRef,
+                          );
 
                           return ListView(
+                            controller: montageScrollController,
                             padding: EdgeInsets.zero,
                             children: [
                               Container(
@@ -23615,6 +27617,8 @@ class _MontageScreenState extends State<MontageScreen> {
                                     _MontageGroupSelector(
                                       groupDocs: groupDocs,
                                       selectedGroupIndex: selectedGroupIndex,
+                                      controller:
+                                          montageGroupSelectorScrollController,
                                       onSelected: (index) => setState(() {
                                         selectedGroupIndex = index;
                                         selectedMontageWeekKey = null;
@@ -23658,48 +27662,79 @@ class _MontageScreenState extends State<MontageScreen> {
                                           ),
                                           const SizedBox(width: 8),
                                           Expanded(
-                                            child: ListView.separated(
-                                              scrollDirection: Axis.horizontal,
+                                            child: Padding(
                                               padding:
                                                   const EdgeInsets.fromLTRB(
                                                     0,
                                                     6,
-                                                    16,
+                                                    0,
                                                     6,
                                                   ),
-                                              itemCount:
-                                                  weekSelectorItems.length,
-                                              separatorBuilder: (_, _) =>
-                                                  const SizedBox(width: 8),
-                                              itemBuilder: (context, index) {
-                                                final item =
-                                                    weekSelectorItems[index];
-                                                if (item.startsWith('year:')) {
-                                                  return WeekYearSeparatorChip(
-                                                    year: item.substring(5),
-                                                  );
-                                                }
-
-                                                final key = item.substring(5);
-                                                final selected =
-                                                    key ==
-                                                    selectedMontageWeekKey;
-                                                return MontageWeekChip(
-                                                  key: ValueKey(
-                                                    'montage_week_${key}_$selected',
-                                                  ),
-                                                  label:
-                                                      obtenerEtiquetaSemanaCorta(
-                                                        key,
+                                              child: ClipRRect(
+                                                borderRadius:
+                                                    const BorderRadius.horizontal(
+                                                      left: Radius.circular(
+                                                        999,
                                                       ),
-                                                  selected: selected,
-                                                  onTap: () => setState(() {
-                                                    selectedMontageWeekKey =
-                                                        key;
-                                                    montageShuffleSeed = 0;
-                                                  }),
-                                                );
-                                              },
+                                                    ),
+                                                child: SizedBox(
+                                                  height: 25,
+                                                  child: ListView.separated(
+                                                    controller:
+                                                        montageWeekSelectorScrollController,
+                                                    scrollDirection:
+                                                        Axis.horizontal,
+                                                    padding:
+                                                        const EdgeInsets.fromLTRB(
+                                                          0,
+                                                          0,
+                                                          16,
+                                                          0,
+                                                        ),
+                                                    itemCount: weekSelectorItems
+                                                        .length,
+                                                    separatorBuilder: (_, _) =>
+                                                        const SizedBox(
+                                                          width: 8,
+                                                        ),
+                                                    itemBuilder: (context, index) {
+                                                      final item =
+                                                          weekSelectorItems[index];
+                                                      if (item.startsWith(
+                                                        'year:',
+                                                      )) {
+                                                        return WeekYearSeparatorChip(
+                                                          year: item.substring(
+                                                            5,
+                                                          ),
+                                                        );
+                                                      }
+
+                                                      final key = item
+                                                          .substring(5);
+                                                      final selected =
+                                                          key ==
+                                                          selectedMontageWeekKey;
+                                                      return MontageWeekChip(
+                                                        key: ValueKey(
+                                                          'montage_week_${key}_$selected',
+                                                        ),
+                                                        label:
+                                                            obtenerEtiquetaSemanaCorta(
+                                                              key,
+                                                            ),
+                                                        selected: selected,
+                                                        onTap: () => setState(() {
+                                                          selectedMontageWeekKey =
+                                                              key;
+                                                          montageShuffleSeed =
+                                                              0;
+                                                        }),
+                                                      );
+                                                    },
+                                                  ),
+                                                ),
+                                              ),
                                             ),
                                           ),
                                         ],
@@ -23709,7 +27744,7 @@ class _MontageScreenState extends State<MontageScreen> {
                                     FutureBuilder<
                                       QuerySnapshot<Map<String, dynamic>>
                                     >(
-                                      future: postsRef.get(),
+                                      future: postsFuture,
                                       builder: (context, postsSnapshot) {
                                         if (postsSnapshot.connectionState ==
                                             ConnectionState.waiting) {
@@ -23756,7 +27791,7 @@ class _MontageScreenState extends State<MontageScreen> {
                                             16,
                                             0,
                                             16,
-                                            28,
+                                            15,
                                           ),
                                           child: Column(
                                             children: [
@@ -23769,6 +27804,8 @@ class _MontageScreenState extends State<MontageScreen> {
                                                   shuffleSeed:
                                                       montageShuffleSeed,
                                                   style: selectedMontageStyle,
+                                                  showReactions:
+                                                      montageShowReactions,
                                                   showEditingControls:
                                                       !exportingMontage,
                                                 ),
@@ -23784,83 +27821,64 @@ class _MontageScreenState extends State<MontageScreen> {
                                                     }),
                                               ),
                                               const SizedBox(height: 10),
-                                              if (posts.length > 1)
-                                                OutlinedButton.icon(
-                                                  onPressed:
-                                                      preparingMontageAction
-                                                      ? null
-                                                      : () => setState(() {
-                                                          montageShuffleSeed =
-                                                              DateTime.now()
-                                                                  .millisecondsSinceEpoch;
-                                                          selectedMontageStyle =
-                                                              MontageStyle
-                                                                  .values[montageShuffleSeed %
-                                                                  MontageStyle
-                                                                      .values
-                                                                      .length];
-                                                        }),
-                                                  icon: const Icon(
-                                                    Icons.auto_awesome_rounded,
-                                                    size: 18,
-                                                  ),
-                                                  label: const Text(
-                                                    'Sorpréndeme',
-                                                  ),
-                                                  style: OutlinedButton.styleFrom(
-                                                    minimumSize:
-                                                        const Size.fromHeight(
-                                                          48,
-                                                        ),
-                                                    foregroundColor:
-                                                        ssOrangeDark,
-                                                    side: const BorderSide(
-                                                      color: ssOrangeMid,
-                                                      width: 1.5,
-                                                    ),
-                                                    shape: RoundedRectangleBorder(
-                                                      borderRadius:
-                                                          BorderRadius.circular(
-                                                            14,
-                                                          ),
-                                                    ),
-                                                  ),
-                                                ),
-                                              if (posts.length > 1)
-                                                const SizedBox(height: 10),
-                                              Row(
+                                              Column(
                                                 children: [
-                                                  Expanded(
-                                                    child: SundayButton(
-                                                      text: 'Compartir',
-                                                      onPressed:
-                                                          preparingMontageAction
-                                                          ? null
-                                                          : () => _shareMontage(
-                                                              context: context,
-                                                              groupName:
-                                                                  effectiveGroupName,
-                                                              weekKey: weekKey,
-                                                            ),
-                                                    ),
+                                                  _MontageActionButton(
+                                                    text: montageShowReactions
+                                                        ? 'Sin reacciones'
+                                                        : 'Con reacciones',
+                                                    icon: montageShowReactions
+                                                        ? Icons
+                                                              .visibility_off_rounded
+                                                        : Icons
+                                                              .add_reaction_rounded,
+                                                    emphasized:
+                                                        montageShowReactions,
+                                                    onPressed:
+                                                        preparingMontageAction
+                                                        ? null
+                                                        : () => setState(() {
+                                                            montageShowReactions =
+                                                                !montageShowReactions;
+                                                          }),
                                                   ),
-                                                  const SizedBox(width: 10),
-                                                  Expanded(
-                                                    child: SundayButton(
-                                                      text: 'Descargar',
-                                                      variant:
-                                                          SundayButtonVariant
-                                                              .outline,
-                                                      onPressed:
-                                                          preparingMontageAction
-                                                          ? null
-                                                          : () => _downloadMontage(
-                                                              context: context,
-                                                              groupName:
-                                                                  effectiveGroupName,
-                                                              weekKey: weekKey,
-                                                            ),
-                                                    ),
+                                                  const SizedBox(height: 8),
+                                                  Row(
+                                                    children: [
+                                                      Expanded(
+                                                        child: _MontageActionButton(
+                                                          text: 'Compartir',
+                                                          icon: Icons
+                                                              .ios_share_rounded,
+                                                          onPressed:
+                                                              preparingMontageAction
+                                                              ? null
+                                                              : () => _shareMontage(
+                                                                  groupName:
+                                                                      effectiveGroupName,
+                                                                  weekKey:
+                                                                      weekKey,
+                                                                ),
+                                                        ),
+                                                      ),
+                                                      const SizedBox(width: 8),
+                                                      Expanded(
+                                                        child: _MontageActionButton(
+                                                          text: 'Descargar',
+                                                          icon: Icons
+                                                              .download_rounded,
+                                                          onPressed:
+                                                              preparingMontageAction
+                                                              ? null
+                                                              : () => _downloadMontage(
+                                                                  groupName:
+                                                                      effectiveGroupName,
+                                                                  weekKey:
+                                                                      weekKey,
+                                                                ),
+                                                        ),
+                                                      ),
+                                                    ],
                                                   ),
                                                 ],
                                               ),
@@ -23891,79 +27909,101 @@ class _MontageScreenState extends State<MontageScreen> {
 class _MontageGroupSelector extends StatelessWidget {
   final List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs;
   final int selectedGroupIndex;
+  final ScrollController controller;
   final ValueChanged<int> onSelected;
 
   const _MontageGroupSelector({
     required this.groupDocs,
     required this.selectedGroupIndex,
+    required this.controller,
     required this.onSelected,
   });
 
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      height: 37,
+      height: 66,
       child: ListView.separated(
+        controller: controller,
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
+        padding: const EdgeInsets.fromLTRB(16, 3, 16, 3),
         itemBuilder: (context, index) {
           final doc = groupDocs[index];
           final data = doc.data();
           final name = (data['displayNameSnapshot'] ?? 'Grupo').toString();
+          final photoUrl = nonEmptyStringOrNull(data['groupPhotoUrlSnapshot']);
+          final emoji = nonEmptyStringOrNull(data['groupEmojiSnapshot']);
+          final colorValue = data['groupColorValueSnapshot'];
           final selected = index == selectedGroupIndex;
-          return MontageSelectorChip(
-            label: formatGroupDisplayName(name),
+          return _MontageGroupIconButton(
+            name: name,
+            photoUrl: photoUrl,
+            emoji: emoji,
+            colorValue: colorValue,
             selected: selected,
             onTap: () => onSelected(index),
           );
         },
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        separatorBuilder: (_, _) => const SizedBox(width: 9),
         itemCount: groupDocs.length,
       ),
     );
   }
 }
 
-class MontageSelectorChip extends StatelessWidget {
-  final String label;
+class _MontageGroupIconButton extends StatelessWidget {
+  final String name;
+  final String? photoUrl;
+  final String? emoji;
+  final Object? colorValue;
   final bool selected;
   final VoidCallback onTap;
 
-  const MontageSelectorChip({
-    super.key,
-    required this.label,
+  const _MontageGroupIconButton({
+    required this.name,
+    required this.photoUrl,
+    required this.emoji,
+    required this.colorValue,
     required this.selected,
     required this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    final borderRadius = BorderRadius.circular(999);
+    final displayName = formatGroupDisplayName(name);
+    final borderColor = selected ? ssOrangeDark : ssOrangeMid;
+    final borderWidth = selected ? 1.9 : 1.6;
 
-    return Material(
-      color: Colors.transparent,
-      borderRadius: borderRadius,
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onTap,
-        child: Ink(
-          height: 25,
-          padding: const EdgeInsets.symmetric(horizontal: 15),
-          decoration: BoxDecoration(
-            color: selected ? ssOrange : Colors.white,
-            borderRadius: borderRadius,
-            border: selected ? null : Border.all(color: ssBorder, width: 1.2),
-          ),
-          child: Center(
-            child: Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                color: selected ? Colors.white : ssText2,
-                fontSize: 13,
-                fontWeight: FontWeight.w800,
-                height: 1,
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: displayName,
+      child: Tooltip(
+        message: displayName,
+        child: SizedBox(
+          width: 60,
+          height: 60,
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(20),
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: onTap,
+              child: Center(
+                child: AnimatedScale(
+                  scale: selected ? 1.04 : 1,
+                  duration: const Duration(milliseconds: 140),
+                  curve: Curves.easeOutCubic,
+                  child: GroupIcon(
+                    name: name,
+                    photoUrl: photoUrl,
+                    emoji: emoji,
+                    colorValue: colorValue,
+                    size: 51,
+                    borderColor: borderColor,
+                    borderWidth: borderWidth,
+                  ),
+                ),
               ),
             ),
           ),
@@ -24015,19 +28055,22 @@ class MontageWeekChip extends StatelessWidget {
   }
 }
 
-enum MontageStyle { classic, polaroid, stickers }
+enum MontageStyle { classic, polaroid }
+
+const List<MontageStyle> kAvailableMontageStyles = [
+  MontageStyle.classic,
+  MontageStyle.polaroid,
+];
 
 extension MontageStyleMeta on MontageStyle {
   String get label => switch (this) {
     MontageStyle.classic => 'Clásico',
     MontageStyle.polaroid => 'Polaroid',
-    MontageStyle.stickers => 'Stickers',
   };
 
   IconData get icon => switch (this) {
     MontageStyle.classic => Icons.dashboard_customize_rounded,
     MontageStyle.polaroid => Icons.photo_size_select_actual_rounded,
-    MontageStyle.stickers => Icons.interests_rounded,
   };
 
   Color get accent => ssOrange;
@@ -24047,37 +28090,30 @@ class MontageStyleSelector extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      height: 44,
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: EdgeInsets.zero,
-        itemCount: MontageStyle.values.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (context, index) {
-          final style = MontageStyle.values[index];
-          final selected = style == selectedStyle;
-          final accent = style.accent;
+    Widget buildStyleButton(MontageStyle style) {
+      final selected = style == selectedStyle;
+      final accent = style.accent;
 
-          return Material(
-            color: Colors.transparent,
-            borderRadius: BorderRadius.circular(999),
-            clipBehavior: Clip.antiAlias,
-            child: InkWell(
-              onTap: () => onSelected(style),
-              child: Ink(
-                height: 44,
-                padding: const EdgeInsets.symmetric(horizontal: 13),
-                decoration: BoxDecoration(
-                  color: selected
-                      ? accent.withValues(alpha: 0.12)
-                      : Colors.white,
-                  borderRadius: BorderRadius.circular(999),
-                  border: Border.all(
-                    color: selected ? accent : ssBorder,
-                    width: selected ? 1.6 : 1.1,
-                  ),
-                ),
+      return Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(999),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => onSelected(style),
+          child: Ink(
+            height: 44,
+            padding: const EdgeInsets.symmetric(horizontal: 13),
+            decoration: BoxDecoration(
+              color: selected ? accent.withValues(alpha: 0.12) : Colors.white,
+              borderRadius: BorderRadius.circular(999),
+              border: Border.all(
+                color: selected ? accent : ssBorder,
+                width: selected ? 1.6 : 1.1,
+              ),
+            ),
+            child: Center(
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -24089,6 +28125,8 @@ class MontageStyleSelector extends StatelessWidget {
                     const SizedBox(width: 7),
                     Text(
                       style.label,
+                      maxLines: 1,
+                      softWrap: false,
                       style: TextStyle(
                         color: selected ? ssText : ssText2,
                         fontSize: 13,
@@ -24099,8 +28137,95 @@ class MontageStyleSelector extends StatelessWidget {
                 ),
               ),
             ),
-          );
-        },
+          ),
+        ),
+      );
+    }
+
+    return SizedBox(
+      height: 44,
+      child: Row(
+        children: [
+          for (
+            var index = 0;
+            index < kAvailableMontageStyles.length;
+            index++
+          ) ...[
+            if (index > 0) const SizedBox(width: 8),
+            Expanded(child: buildStyleButton(kAvailableMontageStyles[index])),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _MontageActionButton extends StatelessWidget {
+  final String text;
+  final IconData icon;
+  final VoidCallback? onPressed;
+  final bool emphasized;
+
+  const _MontageActionButton({
+    required this.text,
+    required this.icon,
+    required this.onPressed,
+    this.emphasized = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    Color background;
+    Color foreground;
+    BorderSide side = BorderSide.none;
+
+    if (emphasized) {
+      background = ssOrangeLight;
+      foreground = ssOrangeDark;
+      side = const BorderSide(color: ssOrangeMid, width: 1.5);
+    } else {
+      background = Colors.white;
+      foreground = ssText;
+      side = const BorderSide(color: ssBorder, width: 1.3);
+    }
+
+    return SizedBox(
+      width: double.infinity,
+      height: 48,
+      child: ElevatedButton(
+        onPressed: onPressed,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: background,
+          foregroundColor: foreground,
+          elevation: 0,
+          disabledBackgroundColor: background.withValues(alpha: 0.42),
+          disabledForegroundColor: foreground.withValues(alpha: 0.58),
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+            side: side,
+          ),
+        ),
+        child: FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 17),
+              const SizedBox(width: 5),
+              Text(
+                text,
+                maxLines: 1,
+                softWrap: false,
+                style: const TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -24112,6 +28237,7 @@ class MontagePoster extends StatefulWidget {
   final String weekKey;
   final int shuffleSeed;
   final MontageStyle style;
+  final bool showReactions;
   final bool showEditingControls;
 
   const MontagePoster({
@@ -24121,6 +28247,7 @@ class MontagePoster extends StatefulWidget {
     required this.weekKey,
     required this.shuffleSeed,
     required this.style,
+    this.showReactions = true,
     this.showEditingControls = true,
   });
 
@@ -24217,6 +28344,13 @@ class _MontagePosterState extends State<MontagePoster> {
     if (newIndex == sourceIndex) return;
 
     setState(() {
+      if (widget.style == MontageStyle.polaroid) {
+        final item = orderedPosts[sourceIndex];
+        orderedPosts[sourceIndex] = orderedPosts[newIndex];
+        orderedPosts[newIndex] = item;
+        return;
+      }
+
       final item = orderedPosts.removeAt(sourceIndex);
       final insertIndex = newIndex.clamp(0, orderedPosts.length).toInt();
       orderedPosts.insert(insertIndex, item);
@@ -24283,6 +28417,7 @@ class _MontagePosterState extends State<MontagePoster> {
 
   void _setDraggingPost(String? postId) {
     if (draggingPostId == postId) return;
+    if (postId != null) HapticFeedback.selectionClick();
     setState(() => draggingPostId = postId);
   }
 
@@ -24301,6 +28436,7 @@ class _MontagePosterState extends State<MontagePoster> {
     return _MontageColumn(
       entries: entries,
       style: widget.style,
+      showReactions: widget.showReactions,
       draggingPostId: draggingPostId,
       resizingPostId: resizingPostId,
       activeResizeEdge: activeResizeEdge,
@@ -24348,6 +28484,7 @@ class _MontagePosterState extends State<MontagePoster> {
         index: entry.index,
         height: entry.height,
         style: widget.style,
+        showReactions: widget.showReactions,
         isDragging: draggingPostId == entry.post.id,
         isResizing:
             widget.showEditingControls && resizingPostId == entry.post.id,
@@ -24502,10 +28639,6 @@ class _MontagePosterState extends State<MontagePoster> {
     return switch (widget.style) {
       MontageStyle.classic => _buildClassicLayout(entries),
       MontageStyle.polaroid => _buildMasonryLayout(entries),
-      MontageStyle.stickers => _StickerMontage(
-        entries: entries,
-        style: widget.style,
-      ),
     };
   }
 
@@ -24669,8 +28802,13 @@ const double _stickerOutlineGrow = 6;
 class _StickerMontage extends StatefulWidget {
   final List<_MontageEntry> entries;
   final MontageStyle style;
+  final bool showEditingControls;
 
-  const _StickerMontage({required this.entries, required this.style});
+  const _StickerMontage({
+    required this.entries,
+    required this.style,
+    required this.showEditingControls,
+  });
 
   @override
   State<_StickerMontage> createState() => _StickerMontageState();
@@ -24679,6 +28817,8 @@ class _StickerMontage extends StatefulWidget {
 class _StickerMontageState extends State<_StickerMontage> {
   late Future<List<_StickerSelfieData>> stickersFuture;
   late String entriesSignature;
+  final Map<String, Offset> customStickerPositions = {};
+  String? draggingStickerId;
 
   @override
   void initState() {
@@ -24701,6 +28841,10 @@ class _StickerMontageState extends State<_StickerMontage> {
 
   void _configureFuture() {
     entriesSignature = _signatureFor(widget.entries);
+    final entryIds = widget.entries.map((entry) => entry.post.id).toSet();
+    customStickerPositions.removeWhere(
+      (postId, _) => !entryIds.contains(postId),
+    );
     stickersFuture = _loadStickerSelfies(widget.entries);
   }
 
@@ -25127,6 +29271,84 @@ class _StickerMontageState extends State<_StickerMontage> {
     return (alpha.clamp(0.0, 1.0) * 255).round().clamp(0, 255).toInt();
   }
 
+  Offset _defaultStickerPosition({
+    required int index,
+    required int columns,
+    required double size,
+    required double width,
+  }) {
+    final row = index ~/ columns;
+    final col = index % columns;
+    final singleColumn = columns == 1;
+    final rowStride = size * 0.82;
+    final left = singleColumn
+        ? (width - size) / 2
+        : col == 0
+        ? 12.0
+        : width - size - 12.0;
+    final top = singleColumn
+        ? 18.0
+        : 18.0 + row * rowStride + (col.isOdd ? size * 0.18 : 0.0);
+
+    return Offset(left, top);
+  }
+
+  Offset _clampStickerPosition({
+    required Offset position,
+    required double size,
+    required double stickerHeight,
+    required double width,
+    required double height,
+  }) {
+    final horizontalPeek = size * 0.18;
+    final verticalPeek = stickerHeight * 0.12;
+    final minLeft = -horizontalPeek;
+    final minTop = -verticalPeek;
+    final maxLeft = math.max(minLeft, width - size + horizontalPeek);
+    final maxTop = math.max(minTop, height - stickerHeight + verticalPeek);
+
+    return Offset(
+      position.dx.clamp(minLeft, maxLeft).toDouble(),
+      position.dy.clamp(minTop, maxTop).toDouble(),
+    );
+  }
+
+  void _startStickerDrag(String postId) {
+    if (!widget.showEditingControls) return;
+    HapticFeedback.selectionClick();
+    setState(() => draggingStickerId = postId);
+  }
+
+  void _updateStickerDrag({
+    required String postId,
+    required Offset delta,
+    required Offset fallbackPosition,
+    required double size,
+    required double stickerHeight,
+    required double width,
+    required double height,
+  }) {
+    if (!widget.showEditingControls) return;
+
+    setState(() {
+      final currentPosition =
+          customStickerPositions[postId] ?? fallbackPosition;
+      customStickerPositions[postId] = _clampStickerPosition(
+        position: currentPosition + delta,
+        size: size,
+        stickerHeight: stickerHeight,
+        width: width,
+        height: height,
+      );
+      draggingStickerId = postId;
+    });
+  }
+
+  void _endStickerDrag() {
+    if (draggingStickerId == null) return;
+    setState(() => draggingStickerId = null);
+  }
+
   @override
   Widget build(BuildContext context) {
     final accent = widget.style.accent;
@@ -25191,6 +29413,38 @@ class _StickerMontageState extends State<_StickerMontage> {
             final height = columns == 1
                 ? stickerHeight + 42.0
                 : stickerHeight + math.max(0, rows - 1) * rowStride + 48.0;
+            final indexedStickers = [
+              for (var i = 0; i < stickers.length; i += 1)
+                MapEntry(i, stickers[i]),
+            ];
+
+            if (draggingStickerId != null) {
+              final draggingIndex = indexedStickers.indexWhere(
+                (item) => item.value.entry.post.id == draggingStickerId,
+              );
+              if (draggingIndex >= 0) {
+                indexedStickers.add(indexedStickers.removeAt(draggingIndex));
+              }
+            }
+
+            Offset positionFor(MapEntry<int, _StickerSelfieData> sticker) {
+              final fallbackPosition = _defaultStickerPosition(
+                index: sticker.key,
+                columns: columns,
+                size: size,
+                width: width,
+              );
+              final savedPosition =
+                  customStickerPositions[sticker.value.entry.post.id];
+
+              return _clampStickerPosition(
+                position: savedPosition ?? fallbackPosition,
+                size: size,
+                stickerHeight: stickerHeight,
+                width: width,
+                height: height,
+              );
+            }
 
             return SizedBox(
               height: height,
@@ -25208,13 +29462,32 @@ class _StickerMontageState extends State<_StickerMontage> {
                       ),
                     ),
                   ),
-                  for (var i = 0; i < stickers.length; i += 1)
+                  for (final indexedSticker in indexedStickers)
                     _PositionedStickerSelfie(
-                      sticker: stickers[i],
-                      index: i,
-                      columns: columns,
+                      sticker: indexedSticker.value,
+                      index: indexedSticker.key,
+                      position: positionFor(indexedSticker),
+                      isDragging:
+                          draggingStickerId ==
+                          indexedSticker.value.entry.post.id,
+                      showEditingControls: widget.showEditingControls,
                       size: size,
-                      width: width,
+                      onDragStart: _startStickerDrag,
+                      onDragUpdate:
+                          ({
+                            required String postId,
+                            required Offset delta,
+                            required Offset fallbackPosition,
+                          }) => _updateStickerDrag(
+                            postId: postId,
+                            delta: delta,
+                            fallbackPosition: fallbackPosition,
+                            size: size,
+                            stickerHeight: stickerHeight,
+                            width: width,
+                            height: height,
+                          ),
+                      onDragEnd: _endStickerDrag,
                     ),
                 ],
               ),
@@ -25229,73 +29502,98 @@ class _StickerMontageState extends State<_StickerMontage> {
 class _PositionedStickerSelfie extends StatelessWidget {
   final _StickerSelfieData sticker;
   final int index;
-  final int columns;
+  final Offset position;
+  final bool isDragging;
+  final bool showEditingControls;
   final double size;
-  final double width;
+  final ValueChanged<String> onDragStart;
+  final void Function({
+    required String postId,
+    required Offset delta,
+    required Offset fallbackPosition,
+  })
+  onDragUpdate;
+  final VoidCallback onDragEnd;
 
   const _PositionedStickerSelfie({
     required this.sticker,
     required this.index,
-    required this.columns,
+    required this.position,
+    required this.isDragging,
+    required this.showEditingControls,
     required this.size,
-    required this.width,
+    required this.onDragStart,
+    required this.onDragUpdate,
+    required this.onDragEnd,
   });
 
   @override
   Widget build(BuildContext context) {
-    final row = index ~/ columns;
-    final col = index % columns;
-    final singleColumn = columns == 1;
     final stickerHeight = size * 1.18;
-    final rowStride = size * 0.82;
-    final left = singleColumn
-        ? (width - size) / 2
-        : col == 0
-        ? 12.0
-        : width - size - 12.0;
-    final top = singleColumn
-        ? 18.0
-        : 18.0 + row * rowStride + (col.isOdd ? size * 0.18 : 0.0);
     final rotation = const [-0.12, 0.09, -0.06, 0.11, -0.09, 0.07][index % 6];
+    final postId = sticker.entry.post.id;
 
     return Positioned(
-      left: left,
-      top: top,
-      child: Transform.rotate(
-        angle: rotation,
-        child: SizedBox(
-          width: size,
-          height: stickerHeight,
-          child: Stack(
-            clipBehavior: Clip.none,
-            children: [
-              Positioned(
-                left: 16,
-                right: 16,
-                bottom: 12,
-                child: Container(
-                  height: 24,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF593449).withValues(alpha: 0.18),
-                    borderRadius: BorderRadius.circular(999),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xFF593449).withValues(alpha: 0.18),
-                        blurRadius: 18,
-                        offset: const Offset(0, 8),
+      left: position.dx,
+      top: position.dy,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onPanStart: showEditingControls ? (_) => onDragStart(postId) : null,
+        onPanUpdate: showEditingControls
+            ? (details) => onDragUpdate(
+                postId: postId,
+                delta: details.delta,
+                fallbackPosition: position,
+              )
+            : null,
+        onPanEnd: showEditingControls ? (_) => onDragEnd() : null,
+        onPanCancel: showEditingControls ? onDragEnd : null,
+        child: AnimatedScale(
+          duration: const Duration(milliseconds: 120),
+          curve: Curves.easeOutCubic,
+          scale: isDragging ? 1.04 : 1,
+          child: Transform.rotate(
+            angle: isDragging ? 0 : rotation,
+            child: SizedBox(
+              width: size,
+              height: stickerHeight,
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Positioned(
+                    left: 16,
+                    right: 16,
+                    bottom: 12,
+                    child: AnimatedContainer(
+                      duration: const Duration(milliseconds: 120),
+                      height: 24,
+                      decoration: BoxDecoration(
+                        color: const Color(
+                          0xFF593449,
+                        ).withValues(alpha: isDragging ? 0.24 : 0.18),
+                        borderRadius: BorderRadius.circular(999),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(
+                              0xFF593449,
+                            ).withValues(alpha: isDragging ? 0.24 : 0.18),
+                            blurRadius: isDragging ? 24 : 18,
+                            offset: Offset(0, isDragging ? 10 : 8),
+                          ),
+                        ],
                       ),
-                    ],
+                    ),
                   ),
-                ),
+                  Positioned.fill(
+                    child: Image.file(
+                      sticker.file,
+                      fit: BoxFit.contain,
+                      errorBuilder: (_, _, _) => const _ImageErrorFill(),
+                    ),
+                  ),
+                ],
               ),
-              Positioned.fill(
-                child: Image.file(
-                  sticker.file,
-                  fit: BoxFit.contain,
-                  errorBuilder: (_, _, _) => const _ImageErrorFill(),
-                ),
-              ),
-            ],
+            ),
           ),
         ),
       ),
@@ -25306,6 +29604,7 @@ class _PositionedStickerSelfie extends StatelessWidget {
 class _MontageColumn extends StatelessWidget {
   final List<_MontageEntry> entries;
   final MontageStyle style;
+  final bool showReactions;
   final String? draggingPostId;
   final String? resizingPostId;
   final _MontageResizeEdge? activeResizeEdge;
@@ -25326,6 +29625,7 @@ class _MontageColumn extends StatelessWidget {
   const _MontageColumn({
     required this.entries,
     required this.style,
+    required this.showReactions,
     required this.draggingPostId,
     required this.resizingPostId,
     required this.activeResizeEdge,
@@ -25347,6 +29647,7 @@ class _MontageColumn extends StatelessWidget {
           index: entry.index,
           height: entry.height,
           style: style,
+          showReactions: showReactions,
           isDragging: draggingPostId == entry.post.id,
           isResizing: showEditingControls && resizingPostId == entry.post.id,
           activeResizeEdge:
@@ -25373,6 +29674,7 @@ class _MontageSelfieTile extends StatelessWidget {
   final int index;
   final double height;
   final MontageStyle style;
+  final bool showReactions;
   final bool isDragging;
   final bool isResizing;
   final _MontageResizeEdge? activeResizeEdge;
@@ -25397,6 +29699,7 @@ class _MontageSelfieTile extends StatelessWidget {
     required this.index,
     required this.height,
     required this.style,
+    required this.showReactions,
     required this.isDragging,
     required this.isResizing,
     required this.activeResizeEdge,
@@ -25651,7 +29954,7 @@ class _MontageSelfieTile extends StatelessWidget {
           _buildPhoto(
             highlighted: highlighted,
             lifted: false,
-            showReactions: true,
+            showReactions: showReactions,
           ),
           if (showEditingControls) ...[
             _buildResizeHandle(_MontageResizeEdge.top, resizeWidthBasis),
@@ -25682,7 +29985,9 @@ class _MontageSelfieTile extends StatelessWidget {
 
             return LongPressDraggable<_MontageDragPayload>(
               data: _MontageDragPayload(postId: post.id, fromIndex: index),
-              delay: const Duration(seconds: 1),
+              delay: style == MontageStyle.polaroid
+                  ? const Duration(milliseconds: 380)
+                  : const Duration(seconds: 1),
               rootOverlay: true,
               maxSimultaneousDrags: isResizing || !showEditingControls ? 0 : 1,
               onDragStarted: () => onDragStarted(post.id),
@@ -25729,6 +30034,28 @@ class ProfileScreen extends StatefulWidget {
 }
 
 class _ProfileScreenState extends State<ProfileScreen> {
+  final ScrollController scrollController = ScrollController();
+
+  void scrollToTop() {
+    if (!scrollController.hasClients) return;
+
+    scrollController.jumpTo(0);
+  }
+
+  Future<void> pushAndResetScrollOnReturn(WidgetBuilder builder) async {
+    await Navigator.push(context, MaterialPageRoute(builder: builder));
+
+    if (!mounted) return;
+
+    scrollToTop();
+  }
+
+  @override
+  void dispose() {
+    scrollController.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     SundayClockScope.watch(context);
@@ -25763,9 +30090,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   );
                   final basePhotoUrl = userData?['basePhotoUrl'] as String?;
                   final createdAt = timestampToDate(userData?['createdAt']);
-                  final memberSince = createdAt == null
-                      ? 'Miembro desde ahora'
-                      : 'Miembro desde ${monthName(createdAt.month)} ${createdAt.year}';
+                  final memberSince = localizedMemberSince(context, createdAt);
                   final screenHeight = MediaQuery.sizeOf(context).height;
                   final compactProfile = screenHeight < 780;
                   final profileAvatarSize = compactProfile ? 86.0 : 99.0;
@@ -25774,10 +30099,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   final profileMainGap = compactProfile ? 12.0 : 20.0;
                   final profileMenuGap = compactProfile ? 10.0 : 16.0;
                   void openEditProfile() {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => EditProfileScreen(user: widget.user),
+                    unawaited(
+                      pushAndResetScrollOnReturn(
+                        (_) => EditProfileScreen(user: widget.user),
                       ),
                     );
                   }
@@ -25794,6 +30118,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           final selfiesCount = selfiesSnapshot.data ?? 0;
 
                           return ListView(
+                            controller: scrollController,
                             padding: const EdgeInsets.fromLTRB(20, 0, 20, 10),
                             children: [
                               Padding(
@@ -25845,11 +30170,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                               ProfileSelfiesShortcut(
                                 selfiesCount: selfiesCount,
                                 onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) =>
-                                          MySelfiesScreen(user: widget.user),
+                                  unawaited(
+                                    pushAndResetScrollOnReturn(
+                                      (_) => MySelfiesScreen(user: widget.user),
                                     ),
                                   );
                                 },
@@ -25859,13 +30182,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                 icon: ProfileLineIconKind.notifications,
                                 label: 'Notificaciones',
                                 onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) =>
-                                          NotificationsSettingsScreen(
-                                            user: widget.user,
-                                          ),
+                                  unawaited(
+                                    pushAndResetScrollOnReturn(
+                                      (_) => NotificationsSettingsScreen(
+                                        user: widget.user,
+                                      ),
                                     ),
                                   );
                                 },
@@ -25879,10 +30200,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                 icon: ProfileLineIconKind.suggestions,
                                 label: 'Sugerencias',
                                 onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => SuggestionsScreen(
+                                  unawaited(
+                                    pushAndResetScrollOnReturn(
+                                      (_) => SuggestionsScreen(
                                         user: widget.user,
                                         authorName: baseName,
                                       ),
@@ -25894,11 +30214,23 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                 icon: ProfileLineIconKind.settings,
                                 label: 'Ajustes',
                                 onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) =>
+                                  unawaited(
+                                    pushAndResetScrollOnReturn(
+                                      (_) =>
                                           AppSettingsScreen(user: widget.user),
+                                    ),
+                                  );
+                                },
+                              ),
+                              ProfileMenuRow(
+                                icon: ProfileLineIconKind.language,
+                                label: 'Idioma',
+                                onTap: () {
+                                  unawaited(
+                                    pushAndResetScrollOnReturn(
+                                      (_) => LanguageSettingsScreen(
+                                        user: widget.user,
+                                      ),
                                     ),
                                   );
                                 },
@@ -25933,12 +30265,40 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
   bool saving = false;
   bool saved = false;
   bool nameInitialized = false;
-  XFile? selectedPhoto;
+  ProfilePhotoDraft? selectedPhoto;
 
   @override
   void dispose() {
     nameController.dispose();
     super.dispose();
+  }
+
+  Future<void> _setSelectedProfilePhoto(XFile photo) async {
+    try {
+      final draft = await crearBorradorFotoPerfil(photo);
+      if (!mounted) return;
+      setState(() {
+        selectedPhoto = draft;
+        saved = false;
+      });
+    } on SelfiePhotoValidationException catch (error) {
+      if (!mounted) return;
+      showSundaySnack(context, error.message);
+    } catch (error) {
+      logDebug('No se pudo comprobar la foto de perfil: $error');
+      if (!mounted) return;
+      showSundaySnack(context, kSelfieValidationFailedMessage);
+    }
+  }
+
+  void _updateSelectedPhotoAlignment(Alignment alignment) {
+    final draft = selectedPhoto;
+    if (draft == null) return;
+
+    setState(() {
+      selectedPhoto = draft.copyWith(alignment: alignment);
+      saved = false;
+    });
   }
 
   Future<void> _choosePhotoSource() async {
@@ -25968,13 +30328,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
       );
 
       if (!mounted || photo == null) return;
-      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
-      if (!mounted || !validPhoto) return;
-
-      setState(() {
-        selectedPhoto = photo;
-        saved = false;
-      });
+      await _setSelectedProfilePhoto(photo);
       return;
     }
 
@@ -25987,13 +30341,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
       );
 
       if (!mounted || photo == null) return;
-      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
-      if (!mounted || !validPhoto) return;
-
-      setState(() {
-        selectedPhoto = photo;
-        saved = false;
-      });
+      await _setSelectedProfilePhoto(photo);
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'No se pudo abrir la galería: $error');
@@ -26024,24 +30372,24 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
       return;
     }
 
-    if (photoChanged) {
-      final validPhoto = await validarFotoSelfieParaSubida(context, photo);
-      if (!mounted || !validPhoto) return;
-    }
-
     if (saving) return;
 
     setState(() => saving = true);
 
+    XFile? uploadPhoto;
     try {
       if (nameChanged) {
         await actualizarNombreUsuario(widget.user, newName);
       }
 
       if (photoChanged) {
+        uploadPhoto = await crearArchivoFotoPerfilAjustadaTemporal(
+          draft: photo,
+        );
+
         await actualizarFotoPerfilUsuario(
           user: widget.user,
-          foto: photo,
+          foto: uploadPhoto,
           previousStoragePath: currentPhotoStoragePath,
         );
       }
@@ -26063,6 +30411,13 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
       if (!mounted) return;
       showSundaySnack(context, 'Error: $error');
     } finally {
+      if (uploadPhoto != null) {
+        try {
+          await File(uploadPhoto.path).delete();
+        } catch (error) {
+          logDebug('No se pudo borrar la foto de perfil temporal: $error');
+        }
+      }
       if (mounted) setState(() => saving = false);
     }
   }
@@ -26129,9 +30484,9 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                       return ListView(
                         padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
                         children: [
-                          const Text(
-                            'Editar perfil',
-                            style: TextStyle(
+                          Text(
+                            context.tr('Editar perfil'),
+                            style: const TextStyle(
                               color: ssTitle,
                               fontSize: 22,
                               fontWeight: FontWeight.w800,
@@ -26148,12 +30503,17 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                                   selectedPhoto: selectedPhoto,
                                   canChangePhoto: esDomingo(),
                                   onTap: saving ? null : _choosePhotoSource,
+                                  onAlignmentChanged: saving
+                                      ? null
+                                      : _updateSelectedPhotoAlignment,
                                 ),
                                 const SizedBox(height: 16),
                                 Text(
-                                  esDomingo()
-                                      ? 'Hoy puedes cambiar tu foto de perfil'
-                                      : 'La foto de perfil se puede cambiar cada domingo',
+                                  context.tr(
+                                    esDomingo()
+                                        ? 'Hoy puedes cambiar tu foto de perfil'
+                                        : 'La foto de perfil se puede cambiar cada domingo',
+                                  ),
                                   textAlign: TextAlign.center,
                                   style: const TextStyle(
                                     color: ssText3,
@@ -26165,9 +30525,9 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                             ),
                           ),
                           const SizedBox(height: 24),
-                          const Text(
-                            'NOMBRE',
-                            style: TextStyle(
+                          Text(
+                            context.tr('NOMBRE'),
+                            style: const TextStyle(
                               color: ssText3,
                               fontSize: 12,
                               fontWeight: FontWeight.w900,
@@ -26180,11 +30540,11 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
                             hintText: 'Tu nombre',
                           ),
                           const SizedBox(height: 6),
-                          const Padding(
-                            padding: EdgeInsets.only(left: 4),
+                          Padding(
+                            padding: const EdgeInsets.only(left: 4),
                             child: Text(
-                              'Este es tu nombre en Sunday Selfie',
-                              style: TextStyle(
+                              context.tr('Este es tu nombre en Sunday Selfie'),
+                              style: const TextStyle(
                                 color: ssText3,
                                 fontSize: 12,
                                 fontWeight: FontWeight.w500,
@@ -26309,9 +30669,9 @@ class _SuggestionsScreenState extends State<SuggestionsScreen> {
                   return ListView(
                     padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
                     children: [
-                      const Text(
-                        'Sugerencias',
-                        style: TextStyle(
+                      Text(
+                        context.tr('Sugerencias'),
+                        style: const TextStyle(
                           color: ssTitle,
                           fontSize: 22,
                           fontWeight: FontWeight.w800,
@@ -26339,7 +30699,7 @@ class _SuggestionsScreenState extends State<SuggestionsScreen> {
                             height: 1.35,
                           ),
                           decoration: InputDecoration(
-                            hintText: 'Cuéntanos qué mejorarías',
+                            hintText: context.tr('Cuéntanos qué mejorarías'),
                             hintStyle: const TextStyle(
                               color: ssText3,
                               fontWeight: FontWeight.w500,
@@ -26396,12 +30756,13 @@ class _SuggestionsScreenState extends State<SuggestionsScreen> {
   }
 }
 
-class EditableProfileAvatar extends StatelessWidget {
+class EditableProfileAvatar extends StatefulWidget {
   final String name;
   final String? photoUrl;
-  final XFile? selectedPhoto;
+  final ProfilePhotoDraft? selectedPhoto;
   final bool canChangePhoto;
   final VoidCallback? onTap;
+  final ValueChanged<Alignment>? onAlignmentChanged;
 
   const EditableProfileAvatar({
     super.key,
@@ -26410,37 +30771,103 @@ class EditableProfileAvatar extends StatelessWidget {
     required this.selectedPhoto,
     required this.canChangePhoto,
     required this.onTap,
+    required this.onAlignmentChanged,
   });
 
   @override
+  State<EditableProfileAvatar> createState() => _EditableProfileAvatarState();
+}
+
+class _EditableProfileAvatarState extends State<EditableProfileAvatar> {
+  Alignment? dragStartAlignment;
+  bool dragging = false;
+
+  bool get _canAdjust =>
+      widget.selectedPhoto != null && widget.onAlignmentChanged != null;
+
+  void _startAdjusting() {
+    final draft = widget.selectedPhoto;
+    if (draft == null) return;
+
+    HapticFeedback.selectionClick();
+    setState(() {
+      dragStartAlignment = draft.alignment;
+      dragging = true;
+    });
+  }
+
+  void _movePhoto(LongPressMoveUpdateDetails details) {
+    final draft = widget.selectedPhoto;
+    final onAlignmentChanged = widget.onAlignmentChanged;
+    if (draft == null || onAlignmentChanged == null) return;
+
+    onAlignmentChanged(
+      _profilePhotoAlignmentAfterLongPressDrag(
+        draft: draft,
+        startAlignment: dragStartAlignment ?? draft.alignment,
+        offsetFromOrigin: details.offsetFromOrigin,
+        previewSize: 96,
+      ),
+    );
+  }
+
+  void _stopAdjusting() {
+    if (!dragging) return;
+    setState(() {
+      dragStartAlignment = null;
+      dragging = false;
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final selectedPhoto = widget.selectedPhoto;
+    final photoUrl = widget.photoUrl;
     final hasSelectedPhoto = selectedPhoto != null;
-    final hasRemotePhoto = photoUrl != null && photoUrl!.isNotEmpty;
+    final hasRemotePhoto = photoUrl != null && photoUrl.isNotEmpty;
 
     Widget avatarContent;
 
     if (hasSelectedPhoto) {
-      avatarContent = Image.file(
-        File(selectedPhoto!.path),
-        width: 96,
-        height: 96,
-        fit: BoxFit.cover,
-        alignment: Alignment.center,
-        filterQuality: FilterQuality.high,
-        errorBuilder: (_, _, _) => Center(
-          child: Text(
-            initialsFromName(name),
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 34,
-              fontWeight: FontWeight.w900,
+      avatarContent = Stack(
+        fit: StackFit.expand,
+        children: [
+          Image.file(
+            File(selectedPhoto.photo.path),
+            width: 96,
+            height: 96,
+            fit: BoxFit.cover,
+            alignment: selectedPhoto.alignment,
+            filterQuality: FilterQuality.high,
+            errorBuilder: (_, _, _) => Center(
+              child: Text(
+                initialsFromName(widget.name),
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 34,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
             ),
           ),
-        ),
+          if (dragging)
+            DecoratedBox(
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.12),
+              ),
+              child: const Center(
+                child: Icon(
+                  Icons.open_with_rounded,
+                  color: Colors.white,
+                  size: 23,
+                ),
+              ),
+            ),
+        ],
       );
     } else if (hasRemotePhoto) {
       avatarContent = CachedRemoteImage(
-        imageUrl: photoUrl!,
+        imageUrl: photoUrl,
         cacheVariant: 'avatar',
         width: 96,
         height: 96,
@@ -26449,7 +30876,7 @@ class EditableProfileAvatar extends StatelessWidget {
         filterQuality: FilterQuality.high,
         loadingWidget: Center(
           child: Text(
-            initialsFromName(name),
+            initialsFromName(widget.name),
             style: const TextStyle(
               color: Colors.white,
               fontSize: 34,
@@ -26459,7 +30886,7 @@ class EditableProfileAvatar extends StatelessWidget {
         ),
         errorWidget: Center(
           child: Text(
-            initialsFromName(name),
+            initialsFromName(widget.name),
             style: const TextStyle(
               color: Colors.white,
               fontSize: 34,
@@ -26471,7 +30898,7 @@ class EditableProfileAvatar extends StatelessWidget {
     } else {
       avatarContent = Center(
         child: Text(
-          initialsFromName(name),
+          initialsFromName(widget.name),
           style: const TextStyle(
             color: Colors.white,
             fontSize: 34,
@@ -26482,7 +30909,11 @@ class EditableProfileAvatar extends StatelessWidget {
     }
 
     return GestureDetector(
-      onTap: onTap,
+      onTap: widget.onTap,
+      onLongPressStart: _canAdjust ? (_) => _startAdjusting() : null,
+      onLongPressMoveUpdate: _canAdjust ? _movePhoto : null,
+      onLongPressEnd: _canAdjust ? (_) => _stopAdjusting() : null,
+      onLongPressUp: _canAdjust ? _stopAdjusting : null,
       child: Stack(
         clipBehavior: Clip.none,
         children: [
@@ -26515,16 +30946,16 @@ class EditableProfileAvatar extends StatelessWidget {
               width: 30,
               height: 30,
               decoration: BoxDecoration(
-                color: canChangePhoto ? ssOrange : ssText3,
+                color: widget.canChangePhoto ? ssOrange : ssText3,
                 shape: BoxShape.circle,
                 border: Border.all(color: Colors.white, width: 2.5),
               ),
               child: Icon(
-                canChangePhoto
+                widget.canChangePhoto
                     ? Icons.edit_rounded
                     : Icons.lock_outline_rounded,
                 color: Colors.white,
-                size: canChangePhoto ? 17 : 15,
+                size: widget.canChangePhoto ? 17 : 15,
               ),
             ),
           ),
@@ -26595,6 +31026,119 @@ class ProfileInfoCard extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class LanguageSettingsScreen extends StatefulWidget {
+  final User user;
+
+  const LanguageSettingsScreen({super.key, required this.user});
+
+  @override
+  State<LanguageSettingsScreen> createState() => _LanguageSettingsScreenState();
+}
+
+class _LanguageSettingsScreenState extends State<LanguageSettingsScreen> {
+  bool saving = false;
+  String? pendingLanguageCode;
+
+  DocumentReference<Map<String, dynamic>> get userRef =>
+      FirebaseFirestore.instance.collection('users').doc(widget.user.uid);
+
+  Future<void> _selectLanguage(SundayLanguageOption language) async {
+    if (saving) return;
+
+    final previousLanguageCode = sundayLanguageController.languageCode;
+    if (previousLanguageCode == language.code) return;
+
+    setState(() {
+      saving = true;
+      pendingLanguageCode = language.code;
+    });
+    sundayLanguageController.setLanguageCode(language.code);
+
+    try {
+      await userRef.set({
+        'languageCode': language.code,
+        'languageCodeUpdatedAt': FieldValue.serverTimestamp(),
+        'lastActiveAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      if (!mounted) return;
+      showSundaySnack(context, 'Idioma actualizado');
+    } catch (error) {
+      sundayLanguageController.setLanguageCode(previousLanguageCode);
+      if (!mounted) return;
+      showSundaySnack(context, 'Error guardando idioma: $error');
+    } finally {
+      if (mounted) {
+        setState(() {
+          saving = false;
+          pendingLanguageCode = null;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final activeLanguageCode = SundayLanguageController.normalize(
+      SundayLanguageScope.languageCodeOf(context),
+    );
+    final selectedLanguageCode = pendingLanguageCode ?? activeLanguageCode;
+
+    return Scaffold(
+      backgroundColor: ssBg,
+      body: SafeArea(
+        child: Column(
+          children: [
+            AppHeader(onBack: () => Navigator.pop(context)),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
+                children: [
+                  Text(
+                    context.tr('Idioma'),
+                    style: const TextStyle(
+                      color: ssTitle,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    context.tr('Elige el idioma de Sunday Selfie'),
+                    style: const TextStyle(
+                      color: ssText3,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  const SettingsSectionTitle('IDIOMA'),
+                  SettingsSectionCard(
+                    children: List.generate(
+                      kSundayLanguageOptions.length * 2 - 1,
+                      (index) {
+                        if (index.isOdd) return const SettingsDivider();
+
+                        final language = kSundayLanguageOptions[index ~/ 2];
+                        return LanguageOptionRow(
+                          language: language,
+                          selected: language.code == selectedLanguageCode,
+                          enabled: !saving,
+                          onTap: () => _selectLanguage(language),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -26709,9 +31253,9 @@ class _NotificationsSettingsScreenState
                   return ListView(
                     padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
                     children: [
-                      const Text(
-                        'Notificaciones',
-                        style: TextStyle(
+                      Text(
+                        context.tr('Notificaciones'),
+                        style: const TextStyle(
                           color: ssTitle,
                           fontSize: 22,
                           fontWeight: FontWeight.w800,
@@ -26993,18 +31537,24 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                   ),
                 ),
                 const SizedBox(height: 20),
-                const Text(
-                  '¿Borrar el contenido descargado?',
-                  style: TextStyle(
+                Text(
+                  context.tr('¿Borrar el contenido descargado?'),
+                  style: const TextStyle(
                     color: ssText,
                     fontSize: 17,
                     fontWeight: FontWeight.w900,
                   ),
                 ),
                 const SizedBox(height: 8),
-                const Text(
-                  'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.',
-                  style: TextStyle(color: ssText2, fontSize: 14, height: 1.35),
+                Text(
+                  context.tr(
+                    'No afecta al contenido en la nube. Podrás volver a descargarlo cuando quieras.',
+                  ),
+                  style: const TextStyle(
+                    color: ssText2,
+                    fontSize: 14,
+                    height: 1.35,
+                  ),
                 ),
                 const SizedBox(height: 20),
                 SundayButton(
@@ -27065,24 +31615,28 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(22),
               ),
-              title: const Text('Borrar cuenta definitivamente'),
+              title: Text(context.tr('Borrar cuenta definitivamente')),
               content: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
-                    'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.',
-                    style: TextStyle(color: ssText2, height: 1.35),
+                  Text(
+                    context.tr(
+                      'Se borrarán tu perfil, tus selfies, reacciones, mensajes y acceso a Sunday Selfie. Esta acción no se puede deshacer.',
+                    ),
+                    style: const TextStyle(color: ssText2, height: 1.35),
                   ),
                   const SizedBox(height: 10),
-                  const Text(
-                    'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.',
-                    style: TextStyle(color: ssText2, height: 1.35),
+                  Text(
+                    context.tr(
+                      'Si eres la única persona administradora de un grupo, otro miembro pasará a administrarlo. Los reportes de seguridad pueden conservarse para revisión.',
+                    ),
+                    style: const TextStyle(color: ssText2, height: 1.35),
                   ),
                   const SizedBox(height: 16),
-                  const Text(
-                    'Escribe BORRAR para confirmar:',
-                    style: TextStyle(
+                  Text(
+                    context.tr('Escribe BORRAR para confirmar:'),
+                    style: const TextStyle(
                       color: ssText,
                       fontWeight: FontWeight.w800,
                     ),
@@ -27106,15 +31660,15 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
               actions: [
                 TextButton(
                   onPressed: () => Navigator.pop(dialogContext, false),
-                  child: const Text('Cancelar'),
+                  child: Text(context.tr('Cancelar')),
                 ),
                 TextButton(
                   onPressed: canDelete
                       ? () => Navigator.pop(dialogContext, true)
                       : null,
-                  child: const Text(
-                    'Borrar definitivamente',
-                    style: TextStyle(
+                  child: Text(
+                    context.tr('Borrar definitivamente'),
+                    style: const TextStyle(
                       color: Color(0xFFE74C3C),
                       fontWeight: FontWeight.w800,
                     ),
@@ -27152,20 +31706,20 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(22),
           ),
-          title: const Text('Cerrar sesión'),
-          content: const Text(
-            '¿Quieres salir de Sunday Selfie en este dispositivo?',
+          title: Text(context.tr('Cerrar sesión')),
+          content: Text(
+            context.tr('¿Quieres salir de Sunday Selfie en este dispositivo?'),
           ),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancelar'),
+              child: Text(context.tr('Cancelar')),
             ),
             TextButton(
               onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text(
-                'Salir',
-                style: TextStyle(
+              child: Text(
+                context.tr('Salir'),
+                style: const TextStyle(
                   color: ssOrangeDark,
                   fontWeight: FontWeight.w800,
                 ),
@@ -27195,6 +31749,10 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final currentLanguageLabel = sundayLanguageNativeName(
+      SundayLanguageScope.languageCodeOf(context),
+    );
+
     return Scaffold(
       backgroundColor: ssBg,
       body: SafeArea(
@@ -27205,15 +31763,34 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
               child: ListView(
                 padding: const EdgeInsets.fromLTRB(20, 0, 20, 14),
                 children: [
-                  const Text(
-                    'Ajustes',
-                    style: TextStyle(
+                  Text(
+                    context.tr('Ajustes'),
+                    style: const TextStyle(
                       color: ssText,
                       fontSize: 22,
                       fontWeight: FontWeight.w900,
                     ),
                   ),
                   const SizedBox(height: 20),
+                  const SettingsSectionTitle('IDIOMA'),
+                  SettingsSectionCard(
+                    children: [
+                      SettingsNavigationRow(
+                        title: 'Idioma de la app',
+                        subtitle: currentLanguageLabel,
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) =>
+                                  LanguageSettingsScreen(user: widget.user),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 24),
                   const SettingsSectionTitle('ALMACENAMIENTO'),
                   SettingsSectionCard(
                     children: [
@@ -27235,11 +31812,11 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
                     ],
                   ),
                   const SizedBox(height: 6),
-                  const Padding(
-                    padding: EdgeInsets.only(left: 4),
+                  Padding(
+                    padding: const EdgeInsets.only(left: 4),
                     child: Text(
-                      'Las fotos originales permanecen en la nube',
-                      style: TextStyle(
+                      context.tr('Las fotos originales permanecen en la nube'),
+                      style: const TextStyle(
                         color: ssText3,
                         fontSize: 12,
                         fontWeight: FontWeight.w500,
@@ -27439,7 +32016,7 @@ class LegalTextScreen extends StatelessWidget {
                 padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
                 children: [
                   Text(
-                    title,
+                    context.tr(title),
                     style: const TextStyle(
                       color: ssText,
                       fontSize: 22,
@@ -27487,7 +32064,7 @@ class LegalTextSectionBlock extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            section.title,
+            context.tr(section.title),
             style: const TextStyle(
               color: ssTitle,
               fontSize: 15,
@@ -27496,7 +32073,7 @@ class LegalTextSectionBlock extends StatelessWidget {
           ),
           const SizedBox(height: 5),
           Text(
-            section.body,
+            context.tr(section.body),
             style: const TextStyle(
               color: ssText2,
               fontSize: 13.5,
@@ -27677,7 +32254,7 @@ class ProfileStatsBar extends StatelessWidget {
                   ),
                   const SizedBox(height: 5),
                   Text(
-                    item.$1,
+                    context.tr(item.$1),
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                       color: ssText3,
@@ -27700,6 +32277,7 @@ enum ProfileLineIconKind {
   editProfile,
   suggestions,
   settings,
+  language,
   selfies,
 }
 
@@ -27757,6 +32335,9 @@ class _ProfileLineIconPainter extends CustomPainter {
         break;
       case ProfileLineIconKind.settings:
         _paintSunSettings(canvas, paint);
+        break;
+      case ProfileLineIconKind.language:
+        _paintLanguageGlobe(canvas, paint);
         break;
       case ProfileLineIconKind.selfies:
         _paintSelfiesGrid(canvas, paint);
@@ -27824,6 +32405,26 @@ class _ProfileLineIconPainter extends CustomPainter {
     }
   }
 
+  void _paintLanguageGlobe(Canvas canvas, Paint paint) {
+    canvas.drawCircle(const Offset(50, 50), 31, paint);
+    canvas.drawOval(const Rect.fromLTWH(34, 19, 32, 62), paint);
+    canvas.drawLine(const Offset(19, 50), const Offset(81, 50), paint);
+    canvas.drawArc(
+      const Rect.fromLTWH(23, 31, 54, 38),
+      math.pi,
+      math.pi,
+      false,
+      paint,
+    );
+    canvas.drawArc(
+      const Rect.fromLTWH(23, 31, 54, 38),
+      0,
+      math.pi,
+      false,
+      paint,
+    );
+  }
+
   void _paintSelfiesGrid(Canvas canvas, Paint paint) {
     const radius = Radius.circular(8);
     const rects = [
@@ -27885,9 +32486,9 @@ class ProfileSelfiesShortcut extends StatelessWidget {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Text(
-                    'Mis Sunday Selfies',
-                    style: TextStyle(
+                  Text(
+                    context.tr('Mis Sunday Selfies'),
+                    style: const TextStyle(
                       color: Colors.white,
                       fontSize: 15,
                       fontWeight: FontWeight.w900,
@@ -27895,7 +32496,7 @@ class ProfileSelfiesShortcut extends StatelessWidget {
                   ),
                   const SizedBox(height: 2),
                   Text(
-                    '$selfiesCount selfies publicados',
+                    localizedPublishedSelfies(context, selfiesCount),
                     style: TextStyle(
                       color: Colors.white.withValues(alpha: 0.82),
                       fontSize: 12,
@@ -27959,7 +32560,7 @@ class ProfileMenuRow extends StatelessWidget {
                 const SizedBox(width: 14),
                 Expanded(
                   child: Text(
-                    label,
+                    context.tr(label),
                     style: const TextStyle(
                       color: ssText,
                       fontSize: 15,
@@ -27991,7 +32592,7 @@ class SettingsSectionTitle extends StatelessWidget {
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Text(
-        text,
+        context.tr(text),
         style: const TextStyle(
           color: ssText3,
           fontSize: 12,
@@ -28056,7 +32657,7 @@ class SettingsToggleRow extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  title,
+                  context.tr(title),
                   style: const TextStyle(
                     color: ssText,
                     fontSize: 15,
@@ -28066,7 +32667,7 @@ class SettingsToggleRow extends StatelessWidget {
                 if (subtitle != null) ...[
                   const SizedBox(height: 2),
                   Text(
-                    subtitle!,
+                    context.tr(subtitle!),
                     style: const TextStyle(
                       color: ssText3,
                       fontSize: 12,
@@ -28102,7 +32703,7 @@ class SettingsInfoRow extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            title,
+            context.tr(title),
             style: const TextStyle(
               color: ssText,
               fontSize: 15,
@@ -28111,7 +32712,7 @@ class SettingsInfoRow extends StatelessWidget {
           ),
           const SizedBox(height: 2),
           Text(
-            subtitle,
+            context.tr(subtitle),
             style: const TextStyle(color: ssText3, fontSize: 12, height: 1.35),
           ),
         ],
@@ -28151,7 +32752,7 @@ class SettingsNavigationRow extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      title,
+                      context.tr(title),
                       style: TextStyle(
                         color: titleColor,
                         fontSize: 15,
@@ -28161,7 +32762,7 @@ class SettingsNavigationRow extends StatelessWidget {
                     if (subtitle != null) ...[
                       const SizedBox(height: 2),
                       Text(
-                        subtitle!,
+                        context.tr(subtitle!),
                         style: const TextStyle(
                           color: ssText3,
                           fontSize: 12,
@@ -28178,6 +32779,74 @@ class SettingsNavigationRow extends StatelessWidget {
                   color: ssText3,
                   size: 22,
                 ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class LanguageOptionRow extends StatelessWidget {
+  final SundayLanguageOption language;
+  final bool selected;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  const LanguageOptionRow({
+    super.key,
+    required this.language,
+    required this.selected,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final codeLabel = language.code.toUpperCase();
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: enabled ? onTap : null,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          child: Row(
+            children: [
+              Container(
+                width: 38,
+                height: 38,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: selected ? ssOrangeLight : ssBg,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: selected ? ssOrangeMid : ssBorder,
+                    width: 1.4,
+                  ),
+                ),
+                child: Text(
+                  codeLabel,
+                  style: TextStyle(
+                    color: selected ? ssOrangeDark : ssText3,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w900,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  language.nativeName,
+                  style: TextStyle(
+                    color: enabled ? ssText : ssText3,
+                    fontSize: 15,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ),
+              if (selected)
+                const Icon(Icons.check_rounded, color: ssOrange, size: 22),
             ],
           ),
         ),
@@ -28284,11 +32953,14 @@ class _GroupNotificationRowState extends State<GroupNotificationRow> {
                       fontSize: 12,
                       fontWeight: FontWeight.w700,
                     ),
-                    items: const [
-                      DropdownMenuItem(value: 'on', child: Text('Activadas')),
+                    items: [
+                      DropdownMenuItem(
+                        value: 'on',
+                        child: Text(context.tr('Activadas')),
+                      ),
                       DropdownMenuItem(
                         value: 'off',
-                        child: Text('Desactivadas'),
+                        child: Text(context.tr('Desactivadas')),
                       ),
                     ],
                     onChanged: widget.enabled
@@ -28427,32 +33099,50 @@ Future<int> countUserSelfies(
   String userUid,
   List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
 ) async {
-  final firestore = FirebaseFirestore.instance;
   var count = 0;
 
   for (final groupDoc in groupDocs) {
     final data = groupDoc.data();
-    final groupId = data['groupId'] ?? groupDoc.id;
+    final groupId = (data['groupId'] ?? groupDoc.id).toString();
     try {
-      final weeks = await firestore
-          .collection('groups')
-          .doc(groupId)
-          .collection('weeks')
-          .limit(50)
-          .get();
-      for (final week in weeks.docs) {
-        final post = await week.reference
-            .collection('posts')
-            .doc(userUid)
-            .get();
-        if (post.exists) count += 1;
-      }
+      count += await countUserSelfiesInGroup(
+        userUid: userUid,
+        groupId: groupId,
+        weekLimit: 50,
+      );
     } catch (_) {
       // Ignoramos grupos antiguos o sin permisos para no bloquear la pantalla.
     }
   }
 
   return count;
+}
+
+Future<int> countUserSelfiesInGroup({
+  required String userUid,
+  required String groupId,
+  int? weekLimit,
+}) async {
+  Query<Map<String, dynamic>> weeksQuery = FirebaseFirestore.instance
+      .collection('groups')
+      .doc(groupId)
+      .collection('weeks');
+
+  if (weekLimit != null) {
+    weeksQuery = weeksQuery.limit(weekLimit);
+  }
+
+  final weeks = await weeksQuery.get();
+
+  if (weeks.docs.isEmpty) return 0;
+
+  final posts = await Future.wait(
+    weeks.docs.map((week) {
+      return week.reference.collection('posts').doc(userUid).get();
+    }),
+  );
+
+  return posts.where((post) => post.exists).length;
 }
 
 int activeWeeksFromGroups(
@@ -28516,17 +33206,37 @@ class CameraCaptureScreen extends StatefulWidget {
 
 class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   CameraController? controller;
-  List<CameraDescription> cameras = [];
-  int cameraIndex = 0;
   bool loading = true;
   bool taking = false;
-  bool switching = false;
   String? error;
 
   @override
   void initState() {
     super.initState();
+    volumeButtonsChannel.setMethodCallHandler(_handleVolumeButtonCall);
+    unawaited(_setVolumeButtonCaptureEnabled(true));
     _initCamera();
+  }
+
+  Future<void> _handleVolumeButtonCall(MethodCall call) async {
+    if (call.method == 'volumeButtonPressed') {
+      await _takePicture();
+    }
+  }
+
+  Future<void> _setVolumeButtonCaptureEnabled(bool enabled) async {
+    if (kIsWeb || (!Platform.isAndroid && !Platform.isIOS)) return;
+
+    try {
+      await volumeButtonsChannel.invokeMethod<void>(
+        'setCaptureEnabled',
+        <String, Object?>{'enabled': enabled},
+      );
+    } catch (error) {
+      logDebug(
+        'No se pudo ${enabled ? 'activar' : 'desactivar'} el disparo con volumen: $error',
+      );
+    }
   }
 
   Future<void> _initCamera() async {
@@ -28541,13 +33251,18 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
         return;
       }
 
-      final frontIndex = available.indexWhere(
+      final frontCameraIndex = available.indexWhere(
         (camera) => camera.lensDirection == CameraLensDirection.front,
       );
+      if (frontCameraIndex < 0) {
+        setState(() {
+          error = 'No se ha encontrado cámara frontal disponible.';
+          loading = false;
+        });
+        return;
+      }
 
-      cameras = available;
-      cameraIndex = frontIndex >= 0 ? frontIndex : 0;
-      await _startController(cameras[cameraIndex]);
+      await _startController(available[frontCameraIndex]);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -28579,36 +33294,21 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     setState(() {
       controller = camController;
       loading = false;
-      switching = false;
       error = null;
     });
   }
 
   @override
   void dispose() {
+    volumeButtonsChannel.setMethodCallHandler(null);
+    unawaited(_setVolumeButtonCaptureEnabled(false));
     controller?.dispose();
     super.dispose();
   }
 
-  Future<void> _switchCamera() async {
-    if (cameras.length < 2 || switching || taking) return;
-
-    setState(() => switching = true);
-    try {
-      cameraIndex = (cameraIndex + 1) % cameras.length;
-      await _startController(cameras[cameraIndex]);
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        error = 'Error cambiando cámara: $e';
-        switching = false;
-      });
-    }
-  }
-
   Future<void> _takePicture() async {
     final cam = controller;
-    if (cam == null || !cam.value.isInitialized || taking || switching) return;
+    if (cam == null || !cam.value.isInitialized || taking) return;
 
     setState(() => taking = true);
     try {
@@ -28625,7 +33325,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
   Widget _buildPreview() {
     final cam = controller;
 
-    if (loading || switching) {
+    if (loading) {
       return const Center(child: CircularProgressIndicator(color: ssOrange));
     }
 
@@ -28711,7 +33411,6 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
     final cameraReady =
         error == null &&
         !loading &&
-        !switching &&
         controller != null &&
         controller!.value.isInitialized;
 
@@ -28789,19 +33488,6 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                         ),
                       ),
                     ),
-                    const SizedBox(width: 14),
-                    Opacity(
-                      opacity: cameras.length >= 2 && cameraReady ? 1 : 0.35,
-                      child: CircleIconButton(
-                        icon: Icons.cameraswitch_rounded,
-                        dark: true,
-                        onTap: () {
-                          if (cameras.length >= 2 && cameraReady) {
-                            _switchCamera();
-                          }
-                        },
-                      ),
-                    ),
                   ],
                 ),
               ),
@@ -28841,7 +33527,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                             const SizedBox(width: 10),
                             Expanded(
                               child: Text(
-                                'Solo cámara in-app · sin galería',
+                                context.tr('Solo cámara in-app · sin galería'),
                                 style: TextStyle(
                                   color: Colors.white.withValues(alpha: 0.78),
                                   fontSize: 13,
@@ -28897,37 +33583,7 @@ class _CameraCaptureScreenState extends State<CameraCaptureScreen> {
                           ),
                         ),
                       ),
-                      SizedBox(
-                        width: 76,
-                        child: Align(
-                          alignment: Alignment.centerRight,
-                          child: GestureDetector(
-                            onTap: () {
-                              if (cameras.length >= 2) {
-                                _switchCamera();
-                              }
-                            },
-                            child: Container(
-                              width: 54,
-                              height: 54,
-                              decoration: BoxDecoration(
-                                color: Colors.white.withValues(
-                                  alpha: cameras.length < 2 ? 0.18 : 0.28,
-                                ),
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: Colors.white.withValues(alpha: 0.18),
-                                ),
-                              ),
-                              child: const Icon(
-                                Icons.flip_camera_ios_rounded,
-                                color: Colors.white,
-                                size: 24,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
+                      SizedBox(width: 76, child: Container()),
                     ],
                   ),
                 ],
@@ -29024,7 +33680,7 @@ class AppHeader extends StatelessWidget {
               maxWidth: MediaQuery.sizeOf(context).width * 0.62,
             ),
             child: Text(
-              subtitle!,
+              context.tr(subtitle!),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               textAlign: TextAlign.center,
@@ -29040,6 +33696,7 @@ class AppHeader extends StatelessWidget {
         width: double.infinity,
         height: subtitle == null ? 58 : 74,
         child: Stack(
+          clipBehavior: Clip.none,
           alignment: Alignment.center,
           children: [
             if (onBack != null)
@@ -29206,7 +33863,7 @@ class SundayWindowCountdownCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      obtenerTituloCountdown(window),
+                      context.tr(obtenerTituloCountdown(window)),
                       style: TextStyle(
                         color: isOpen ? ssOrangeDark : ssTitle,
                         fontSize: compact ? 12 : 13,
@@ -29215,7 +33872,7 @@ class SundayWindowCountdownCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 3),
                     Text(
-                      obtenerSubtituloCountdown(window),
+                      localizedCountdownSubtitle(context, window),
                       maxLines: compact ? 1 : 2,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
@@ -29286,21 +33943,23 @@ class SundayBanner extends StatelessWidget {
           'Sábado',
           'Domingo',
         ];
-        final dayName = dayNames[now.weekday - 1];
+        final dayName = context.tr(dayNames[now.weekday - 1]);
         final isSunday = now.weekday == DateTime.sunday;
         final daysUntilSunday = isSunday ? 0 : DateTime.sunday - now.weekday;
         final weekLabel = isSunday
-            ? obtenerEtiquetaSemana(obtenerWeekKeyActual())
+            ? localizedWeekLabel(context, obtenerWeekKeyActual())
             : '';
-        final leftText = isSunday
-            ? '¡Sube tu selfie del domingo!'
-            : '¡Toca esperar!';
+        final leftText = context.tr(
+          isSunday ? '¡Sube tu selfie del domingo!' : '¡Toca esperar!',
+        );
         final rightMain = isSunday
             ? formatSundayCountdownToMidnight(now)
             : '$daysUntilSunday';
-        final rightText = daysUntilSunday == 1
-            ? 'día hasta el domingo'
-            : 'días hasta el domingo';
+        final rightText = context.tr(
+          daysUntilSunday == 1
+              ? 'día hasta el domingo'
+              : 'días hasta el domingo',
+        );
 
         return LayoutBuilder(
           builder: (context, constraints) {
@@ -29325,7 +33984,7 @@ class SundayBanner extends StatelessWidget {
                     left: 20,
                     top: 16,
                     child: Text(
-                      'HOY ES',
+                      context.tr('HOY ES'),
                       style: TextStyle(
                         color: Colors.white.withValues(alpha: 0.86),
                         fontSize: compact ? 11 : 12,
@@ -29508,6 +34167,8 @@ class GroupIcon extends StatelessWidget {
   final String? emoji;
   final Object? colorValue;
   final double size;
+  final Color? borderColor;
+  final double? borderWidth;
 
   const GroupIcon({
     super.key,
@@ -29516,6 +34177,8 @@ class GroupIcon extends StatelessWidget {
     this.emoji,
     this.colorValue,
     this.size = 52,
+    this.borderColor,
+    this.borderWidth,
   });
 
   bool get hasPhoto => photoUrl != null && photoUrl!.trim().isNotEmpty;
@@ -29527,6 +34190,8 @@ class GroupIcon extends StatelessWidget {
         ? emoji!.trim()
         : extractLastEmoji(name) ?? fallbackGroupEmoji(name);
     final radius = size * 0.34;
+    final outlineColor = borderColor ?? ssOrangeMid;
+    final outlineWidth = borderWidth ?? 2;
 
     if (hasPhoto) {
       return Container(
@@ -29535,7 +34200,7 @@ class GroupIcon extends StatelessWidget {
         decoration: BoxDecoration(borderRadius: BorderRadius.circular(radius)),
         foregroundDecoration: BoxDecoration(
           borderRadius: BorderRadius.circular(radius),
-          border: Border.all(color: ssOrangeMid, width: 2),
+          border: Border.all(color: outlineColor, width: outlineWidth),
         ),
         clipBehavior: Clip.antiAlias,
         child: CachedRemoteImage(
@@ -29569,7 +34234,7 @@ class GroupIcon extends StatelessWidget {
       decoration: BoxDecoration(
         color: resolvedColor.withValues(alpha: 0.16),
         borderRadius: BorderRadius.circular(radius),
-        border: Border.all(color: ssOrangeMid, width: 2),
+        border: Border.all(color: outlineColor, width: outlineWidth),
       ),
       clipBehavior: Clip.antiAlias,
       child: _GroupIconFallback(
@@ -30111,7 +34776,7 @@ class GroupStreakStatRow extends StatelessWidget {
           const SizedBox(width: 12),
           Expanded(
             child: Text(
-              label,
+              context.tr(label),
               style: const TextStyle(
                 color: ssText2,
                 fontSize: 13,
@@ -30229,7 +34894,7 @@ class SundayButton extends StatelessWidget {
         ),
         onPressed: onPressed,
         child: Text(
-          text,
+          context.tr(text),
           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
       ),
@@ -30285,7 +34950,7 @@ class SundayActionCard extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      title,
+                      context.tr(title),
                       style: const TextStyle(
                         fontSize: 15,
                         fontWeight: FontWeight.w600,
@@ -30294,7 +34959,7 @@ class SundayActionCard extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      subtitle,
+                      context.tr(subtitle),
                       style: const TextStyle(
                         fontSize: 12.5,
                         height: 1.35,
@@ -30330,7 +34995,7 @@ class SundayInput extends StatelessWidget {
       controller: controller,
       style: const TextStyle(fontSize: 16, color: ssText),
       decoration: InputDecoration(
-        hintText: hintText,
+        hintText: context.tr(hintText),
         hintStyle: const TextStyle(color: ssText3),
         filled: true,
         fillColor: ssBg,
@@ -30593,8 +35258,8 @@ class _DownloadWeeksSheetState extends State<DownloadWeeksSheet> {
     final selectedCount = selectedWeekKeys.length;
     final selectedPhotoCount = _selectedPhotoCount;
     final screenHeight = MediaQuery.sizeOf(context).height;
-    final maxSheetHeight = math.min(screenHeight * 0.91, 780.0);
-    final minSheetHeight = math.min(maxSheetHeight, screenHeight * 0.72);
+    final maxSheetHeight = math.min(screenHeight * 0.86, 680.0);
+    final minSheetHeight = math.min(screenHeight * 0.46, 360.0);
 
     return MediaQuery.withClampedTextScaling(
       maxScaleFactor: 1.12,
@@ -30609,7 +35274,7 @@ class _DownloadWeeksSheetState extends State<DownloadWeeksSheet> {
             ),
             decoration: const BoxDecoration(
               color: ssBg,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(36)),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
             ),
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -30617,90 +35282,67 @@ class _DownloadWeeksSheetState extends State<DownloadWeeksSheet> {
               children: [
                 Center(
                   child: Container(
-                    width: 48,
-                    height: 6,
-                    margin: const EdgeInsets.only(top: 12, bottom: 22),
+                    width: 38,
+                    height: 4,
+                    margin: const EdgeInsets.only(top: 10, bottom: 12),
                     decoration: BoxDecoration(
                       color: ssBorder,
                       borderRadius: BorderRadius.circular(999),
                     ),
                   ),
                 ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(28, 0, 18, 0),
-                  child: Row(
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(18, 0, 18, 10),
+                  child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'Descargar selfies',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: ssTitle,
-                                fontSize: 30,
-                                fontWeight: FontWeight.w900,
-                                height: 1.05,
-                              ),
-                            ),
-                            SizedBox(height: 8),
-                            Text(
-                              'Elige el año y las semanas a guardar',
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: ssText2,
-                                fontSize: 18,
-                                fontWeight: FontWeight.w600,
-                                height: 1.12,
-                              ),
-                            ),
-                          ],
+                      Text(
+                        'Descargar selfies',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: ssTitle,
+                          fontSize: 18,
+                          fontWeight: FontWeight.w900,
+                          height: 1,
                         ),
                       ),
-                      const SizedBox(width: 12),
-                      Material(
-                        color: ssSeparator,
-                        shape: const CircleBorder(),
-                        clipBehavior: Clip.antiAlias,
-                        child: InkWell(
-                          onTap: () => Navigator.pop(context),
-                          child: const SizedBox(
-                            width: 54,
-                            height: 54,
-                            child: Icon(
-                              Icons.close_rounded,
-                              color: ssText2,
-                              size: 31,
-                            ),
-                          ),
+                      SizedBox(height: 4),
+                      Text(
+                        'Elige las semanas que quieres guardar',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: ssText2,
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w700,
+                          height: 1,
                         ),
                       ),
                     ],
                   ),
                 ),
-                const SizedBox(height: 28),
                 SizedBox(
-                  height: 88,
+                  height: 62,
                   child: LayoutBuilder(
                     builder: (context, constraints) {
                       final visibleCards = math.min(years.length, 3);
                       final fittedWidth = visibleCards == 0
-                          ? 112.0
+                          ? 96.0
                           : (constraints.maxWidth -
-                                    56 -
-                                    ((visibleCards - 1) * 12)) /
+                                    36 -
+                                    ((visibleCards - 1) * 9)) /
                                 visibleCards;
-                      final cardWidth = math.max(104.0, fittedWidth);
+                      final cardWidth = math.min(
+                        112.0,
+                        math.max(96.0, fittedWidth),
+                      );
 
                       return ListView.separated(
                         scrollDirection: Axis.horizontal,
-                        padding: const EdgeInsets.symmetric(horizontal: 28),
+                        padding: const EdgeInsets.symmetric(horizontal: 18),
                         itemCount: years.length,
-                        separatorBuilder: (_, _) => const SizedBox(width: 12),
+                        separatorBuilder: (_, _) => const SizedBox(width: 9),
                         itemBuilder: (context, index) {
                           final year = years[index];
                           final selected = year == activeYear;
@@ -30722,7 +35364,7 @@ class _DownloadWeeksSheetState extends State<DownloadWeeksSheet> {
                   ),
                 ),
                 Padding(
-                  padding: const EdgeInsets.fromLTRB(28, 30, 28, 14),
+                  padding: const EdgeInsets.fromLTRB(18, 18, 18, 10),
                   child: Row(
                     children: [
                       Expanded(
@@ -30732,7 +35374,7 @@ class _DownloadWeeksSheetState extends State<DownloadWeeksSheet> {
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
                             color: ssText3,
-                            fontSize: 17,
+                            fontSize: 14,
                             fontWeight: FontWeight.w900,
                             height: 1,
                             letterSpacing: 0,
@@ -30758,7 +35400,7 @@ class _DownloadWeeksSheetState extends State<DownloadWeeksSheet> {
                                   color: _availableWeekCount(yearEntries) == 0
                                       ? ssText3
                                       : ssOrangeDark,
-                                  fontSize: 17,
+                                  fontSize: 14,
                                   fontWeight: FontWeight.w900,
                                   height: 1,
                                   letterSpacing: 0,
@@ -30774,13 +35416,13 @@ class _DownloadWeeksSheetState extends State<DownloadWeeksSheet> {
                 Flexible(
                   child: GridView.builder(
                     shrinkWrap: true,
-                    padding: const EdgeInsets.fromLTRB(28, 0, 28, 22),
+                    padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
                     gridDelegate:
                         const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 3,
-                          mainAxisSpacing: 12,
-                          crossAxisSpacing: 12,
-                          childAspectRatio: 0.92,
+                          crossAxisCount: 4,
+                          mainAxisSpacing: 9,
+                          crossAxisSpacing: 9,
+                          childAspectRatio: 0.84,
                         ),
                     itemCount: yearEntries.length,
                     itemBuilder: (context, index) {
@@ -30794,7 +35436,7 @@ class _DownloadWeeksSheetState extends State<DownloadWeeksSheet> {
                   ),
                 ),
                 Container(
-                  padding: const EdgeInsets.fromLTRB(28, 16, 28, 18),
+                  padding: const EdgeInsets.fromLTRB(18, 12, 18, 14),
                   decoration: const BoxDecoration(
                     color: ssBg,
                     border: Border(top: BorderSide(color: ssSeparator)),
@@ -30839,60 +35481,50 @@ class DownloadYearCard extends StatelessWidget {
 
     return Material(
       color: Colors.transparent,
-      borderRadius: BorderRadius.circular(22),
+      borderRadius: BorderRadius.circular(16),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onTap,
         child: Ink(
           width: width,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           decoration: BoxDecoration(
             color: selected ? ssOrange : Colors.white,
-            borderRadius: BorderRadius.circular(22),
+            borderRadius: BorderRadius.circular(16),
             border: Border.all(
               color: selected ? ssOrange : ssBorder,
-              width: 1.5,
+              width: 1.4,
             ),
-            boxShadow: selected
-                ? [
-                    BoxShadow(
-                      color: ssOrange.withValues(alpha: 0.18),
-                      blurRadius: 24,
-                      offset: const Offset(0, 12),
-                    ),
-                  ]
-                : null,
           ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-            child: FittedBox(
-              fit: BoxFit.scaleDown,
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text(
-                    '$year',
-                    maxLines: 1,
-                    style: TextStyle(
-                      color: fg,
-                      fontSize: 28,
-                      fontWeight: FontWeight.w900,
-                      height: 0.95,
-                      fontFeatures: const [FontFeature.tabularFigures()],
-                    ),
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  '$year',
+                  maxLines: 1,
+                  style: TextStyle(
+                    color: fg,
+                    fontSize: 21,
+                    fontWeight: FontWeight.w900,
+                    height: 1,
+                    fontFeatures: const [FontFeature.tabularFigures()],
                   ),
-                  const SizedBox(height: 9),
-                  Text(
-                    subtitle,
-                    maxLines: 1,
-                    style: TextStyle(
-                      color: muted,
-                      fontSize: 15,
-                      fontWeight: FontWeight.w900,
-                      height: 1,
-                    ),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  subtitle,
+                  maxLines: 1,
+                  style: TextStyle(
+                    color: muted,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w900,
+                    height: 1,
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         ),
@@ -30916,23 +35548,24 @@ class DownloadWeeksBottomButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final enabled = onPressed != null;
-    final weekLabel = selectedWeekCount == 1 ? 'semana' : 'semanas';
-    final photoLabel = selectedPhotoCount == 1 ? 'foto' : 'fotos';
-    final text = enabled
-        ? 'Descargar $selectedWeekCount $weekLabel · $selectedPhotoCount $photoLabel'
-        : 'Selecciona semanas';
+    final text = localizedDownloadWeeksButtonText(
+      context,
+      selectedWeekCount: selectedWeekCount,
+      selectedPhotoCount: selectedPhotoCount,
+      enabled: enabled,
+    );
 
     return Material(
       color: enabled ? ssOrange : ssSeparator,
-      borderRadius: BorderRadius.circular(18),
+      borderRadius: BorderRadius.circular(16),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onPressed,
         child: SizedBox(
-          height: 64,
+          height: 54,
           child: Center(
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 18),
+              padding: const EdgeInsets.symmetric(horizontal: 16),
               child: FittedBox(
                 fit: BoxFit.scaleDown,
                 child: Row(
@@ -30941,15 +35574,15 @@ class DownloadWeeksBottomButton extends StatelessWidget {
                     Icon(
                       Icons.download_rounded,
                       color: enabled ? Colors.white : ssText3,
-                      size: 29,
+                      size: 23,
                     ),
-                    const SizedBox(width: 12),
+                    const SizedBox(width: 10),
                     Text(
                       text,
                       maxLines: 1,
                       style: TextStyle(
                         color: enabled ? Colors.white : ssText3,
-                        fontSize: 19,
+                        fontSize: 15.5,
                         fontWeight: FontWeight.w900,
                         height: 1,
                       ),
@@ -30989,116 +35622,81 @@ class DownloadWeekTile extends StatelessWidget {
       opacity: enabled ? 1 : 0.42,
       child: Material(
         color: Colors.transparent,
-        borderRadius: BorderRadius.circular(22),
+        borderRadius: BorderRadius.circular(16),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
           onTap: enabled ? onTap : null,
           child: Ink(
             decoration: BoxDecoration(
               color: bg,
-              borderRadius: BorderRadius.circular(22),
+              borderRadius: BorderRadius.circular(16),
               border: Border.all(
                 color: borderColor,
-                width: selected ? 2.5 : 1.4,
+                width: selected ? 2.0 : 1.2,
               ),
             ),
-            child: Stack(
-              children: [
-                Positioned(
-                  top: 12,
-                  right: 12,
-                  child: _DownloadWeekSelectionDot(selected: selected),
-                ),
-                Center(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(8, 14, 8, 10),
-                    child: FittedBox(
-                      fit: BoxFit.scaleDown,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(
-                            'SEM',
-                            maxLines: 1,
-                            style: TextStyle(
-                              color: secondaryColor,
-                              fontSize: 14,
-                              fontWeight: FontWeight.w900,
-                              height: 1,
-                              letterSpacing: 0,
-                            ),
-                          ),
-                          const SizedBox(height: 6),
-                          Text(
-                            '${entry.isoWeek}',
-                            maxLines: 1,
-                            style: TextStyle(
-                              color: accentColor,
-                              fontSize: 38,
-                              fontWeight: FontWeight.w900,
-                              height: 0.9,
-                              fontFeatures: const [
-                                FontFeature.tabularFigures(),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            entry.progressLabel,
-                            maxLines: 1,
-                            style: TextStyle(
-                              color: secondaryColor,
-                              fontSize: 14,
-                              fontWeight: FontWeight.w900,
-                              height: 1,
-                              fontFeatures: const [
-                                FontFeature.tabularFigures(),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 5),
-                          Text(
-                            entry.monthLabel,
-                            maxLines: 1,
-                            style: TextStyle(
-                              color: secondaryColor,
-                              fontSize: 13.5,
-                              fontWeight: FontWeight.w600,
-                              height: 1,
-                            ),
-                          ),
-                        ],
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(7, 10, 7, 8),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        'SEM',
+                        maxLines: 1,
+                        style: TextStyle(
+                          color: secondaryColor,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w900,
+                          height: 1,
+                          letterSpacing: 0,
+                        ),
                       ),
-                    ),
+                      const SizedBox(height: 5),
+                      Text(
+                        '${entry.isoWeek}',
+                        maxLines: 1,
+                        style: TextStyle(
+                          color: accentColor,
+                          fontSize: 34,
+                          fontWeight: FontWeight.w900,
+                          height: 0.9,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                      const SizedBox(height: 7),
+                      Text(
+                        entry.progressLabel,
+                        maxLines: 1,
+                        style: TextStyle(
+                          color: secondaryColor,
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w900,
+                          height: 1,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        entry.monthLabel,
+                        maxLines: 1,
+                        style: TextStyle(
+                          color: secondaryColor,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          height: 1,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              ],
+              ),
             ),
           ),
         ),
       ),
-    );
-  }
-}
-
-class _DownloadWeekSelectionDot extends StatelessWidget {
-  final bool selected;
-
-  const _DownloadWeekSelectionDot({required this.selected});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 28,
-      height: 28,
-      decoration: BoxDecoration(
-        color: selected ? ssOrange : Colors.white,
-        shape: BoxShape.circle,
-        border: selected ? null : Border.all(color: ssBorder, width: 1.6),
-      ),
-      child: selected
-          ? const Icon(Icons.check_rounded, color: Colors.white, size: 20)
-          : null,
     );
   }
 }
@@ -31891,11 +36489,13 @@ void showSundaySnack(BuildContext context, String message) {
   if (overlay == null) return;
 
   _dismissActiveSundaySnack();
+  final localizedMessage = _localizedSundaySnackMessage(context, message);
 
   final entry = OverlayEntry(
     builder: (context) => _SundaySnackNotice(
-      message: _cleanSundaySnackMessage(message),
-      isError: _isSundaySnackError(message),
+      message: _cleanSundaySnackMessage(localizedMessage),
+      isError:
+          _isSundaySnackError(message) || _isSundaySnackError(localizedMessage),
     ),
   );
 
@@ -31905,6 +36505,80 @@ void showSundaySnack(BuildContext context, String message) {
     const Duration(seconds: 3),
     _dismissActiveSundaySnack,
   );
+}
+
+String _localizedSundaySnackMessage(BuildContext _, String message) {
+  final trimmed = message.trim();
+  final translated = sundayTranslate(trimmed);
+  if (translated != trimmed) return translated;
+
+  const translatablePrefixes = [
+    'Error guardando idioma: ',
+    'Error guardando notificaciones: ',
+    'Error enviando sugerencia: ',
+    'Error borrando la cuenta: ',
+    'Error abandonando grupo: ',
+    'Error actualizando foto: ',
+    'Error actualizando nombre: ',
+    'Error al reaccionar: ',
+    'Error borrando la selfie: ',
+    'Error enviando el reporte: ',
+    'Error haciendo foto: ',
+    'Error regenerando invitación: ',
+    'Error resolviendo reporte: ',
+    'No se pudo borrar la caché local: ',
+    'No se pudo abrir la galería: ',
+    'No se pudo eliminar el grupo: ',
+    'No se pudo iniciar sesión con Apple: ',
+    'No se pudo iniciar sesión con Google: ',
+    'No se pudo completar el anuncio: ',
+    'Error guardando perfil: ',
+    'Error: ',
+  ];
+
+  for (final prefix in translatablePrefixes) {
+    if (trimmed.startsWith(prefix)) {
+      return '${sundayTranslate(prefix)}${trimmed.substring(prefix.length)}';
+    }
+  }
+
+  final memberAdminMatch = RegExp(
+    r'^(.+) ahora es administrador$',
+  ).firstMatch(trimmed);
+  if (memberAdminMatch != null) {
+    return sundayTranslate(
+      '{name} ahora es administrador',
+    ).replaceAll('{name}', memberAdminMatch.group(1)!);
+  }
+
+  final memberRemovedMatch = RegExp(
+    r'^(.+) expulsado del grupo$',
+  ).firstMatch(trimmed);
+  if (memberRemovedMatch != null) {
+    return sundayTranslate(
+      '{name} expulsado del grupo',
+    ).replaceAll('{name}', memberRemovedMatch.group(1)!);
+  }
+
+  final memberAllowedMatch = RegExp(
+    r'^(.+) puede volver a solicitar entrada$',
+  ).firstMatch(trimmed);
+  if (memberAllowedMatch != null) {
+    return sundayTranslate(
+      '{name} puede volver a solicitar entrada',
+    ).replaceAll('{name}', memberAllowedMatch.group(1)!);
+  }
+
+  final savedSelfiesMatch = RegExp(
+    r'^(\d+) selfies guardadas en el teléfono$',
+  ).firstMatch(trimmed);
+  if (savedSelfiesMatch != null) {
+    return sundayTranslate(
+      '{count} selfies guardadas en el teléfono',
+    ).replaceAll('{count}', savedSelfiesMatch.group(1)!);
+  }
+
+  return trimmed;
 }
 
 void _dismissActiveSundaySnack() {
@@ -31937,6 +36611,9 @@ bool _isSundaySnackError(String message) {
   return lower.startsWith('error:') ||
       lower.startsWith('exception:') ||
       lower.contains('no se pudo') ||
+      lower.contains('could not') ||
+      lower.contains('impossible') ||
+      lower.contains('nicht') && lower.contains('konnte') ||
       lower.contains('fall');
 }
 
@@ -31946,7 +36623,10 @@ IconData _sundaySnackIconForMessage(String message, bool isError) {
   final lower = message.toLowerCase();
   if (lower.contains('cargando') ||
       lower.contains('guardando') ||
-      lower.contains('actualizando')) {
+      lower.contains('actualizando') ||
+      lower.contains('saving') ||
+      lower.contains('speichern') ||
+      lower.contains('salvataggio')) {
     return Icons.hourglass_top_rounded;
   }
 
@@ -31954,7 +36634,10 @@ IconData _sundaySnackIconForMessage(String message, bool isError) {
       lower.contains('actualizado') ||
       lower.contains('copiado') ||
       lower.contains('completado') ||
-      lower.contains('publicado')) {
+      lower.contains('publicado') ||
+      lower.contains('sent') ||
+      lower.contains('updated') ||
+      lower.contains('saved')) {
     return Icons.check_rounded;
   }
 

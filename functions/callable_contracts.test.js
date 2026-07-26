@@ -1,12 +1,14 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const admin = require("firebase-admin");
+const functions = require("firebase-functions");
 
 const callableFunctions = require("./index.js");
 
 const callableNames = [
   "buscarGifsTenor",
   "crearGrupo",
+  "resolverInvitacionGrupo",
   "registrarSelfie",
   "solicitarEntradaGrupo",
   "reaccionarASelfie",
@@ -80,6 +82,51 @@ test("join requests validate basic arguments before accessing Firestore", async 
     }),
     (error) => error && error.code === "invalid-argument"
   );
+});
+
+test("invite preview returns only minimal group metadata", async () => {
+  const fakeFirestore = new FakeFirestore({
+    "inviteCodes/ABCDEFGHJK": {
+      groupId: "group-id",
+      active: true,
+    },
+    "groups/group-id": {
+      name: "Familia",
+      deleted: false,
+      memberCount: 12,
+      emoji: "📸",
+      colorValue: 0xFF64B5F6,
+      inviteCode: "ABCDEFGHJK",
+      inviteLink: "https://sundayselfie.app/j/ABCDEFGHJK",
+      photoUrl: "https://firebasestorage.googleapis.com/private-token",
+      photoStoragePath: "groups/group-id/profile/group_123.jpg",
+      createdByUid: "admin-user",
+    },
+    "groups/group-id/joinRequests/visitor-user": {
+      status: "pending",
+    },
+  });
+
+  const result = await withFakeFirestore(fakeFirestore, () => {
+    return callableFunctions.resolverInvitacionGrupo.run({
+      auth: {uid: "visitor-user", token: {}},
+      data: {inviteCode: "ABCDEFGHJK"},
+    });
+  });
+
+  assert.deepEqual(result, {
+    groupId: "group-id",
+    name: "Familia",
+    memberCount: 12,
+    emoji: "📸",
+    colorValue: 0xFF64B5F6,
+    isMember: false,
+    hasRequest: true,
+  });
+  assert.equal(Object.hasOwn(result, "photoUrl"), false);
+  assert.equal(Object.hasOwn(result, "photoStoragePath"), false);
+  assert.equal(Object.hasOwn(result, "inviteLink"), false);
+  assert.equal(Object.hasOwn(result, "createdByUid"), false);
 });
 
 test("group creation rejects text mixed with emoji before accessing Firestore", async () => {
@@ -209,6 +256,43 @@ test("GIF search validates arguments before calling Tenor", async () => {
     }),
     (error) => error && error.code === "invalid-argument"
   );
+});
+
+test("GIF search reports missing Tenor config instead of internal errors", async () => {
+  const previousKey = process.env.TENOR_API_KEY;
+  const previousSundayKey = process.env.SUNDAY_TENOR_API_KEY;
+  const originalConfig = functions.config;
+  delete process.env.TENOR_API_KEY;
+  delete process.env.SUNDAY_TENOR_API_KEY;
+  functions.config = () => {
+    throw new Error("config unavailable");
+  };
+
+  try {
+    await assert.rejects(
+      () => callableFunctions.buscarGifsTenor.run({
+        auth: {uid: "member-user", token: {}},
+        data: {query: "hola"},
+      }),
+      (error) => {
+        assert.equal(error.code, "failed-precondition");
+        assert.match(error.message, /Tenor no está configurado/);
+        return true;
+      }
+    );
+  } finally {
+    functions.config = originalConfig;
+    if (previousKey === undefined) {
+      delete process.env.TENOR_API_KEY;
+    } else {
+      process.env.TENOR_API_KEY = previousKey;
+    }
+    if (previousSundayKey === undefined) {
+      delete process.env.SUNDAY_TENOR_API_KEY;
+    } else {
+      process.env.SUNDAY_TENOR_API_KEY = previousSundayKey;
+    }
+  }
 });
 
 class FakeDocumentSnapshot {
@@ -447,6 +531,121 @@ async function withFakeFirestore(fakeFirestore, callback) {
   }
 }
 
+test("GIF search proxies Tenor for authenticated users and rate limits calls", async (t) => {
+  const previousKey = process.env.TENOR_API_KEY;
+  process.env.TENOR_API_KEY = "test-tenor-key";
+  let fetchCalls = 0;
+
+  t.mock.method(global, "fetch", async (url) => {
+    fetchCalls += 1;
+    const parsed = new URL(url);
+
+    assert.equal(parsed.origin, "https://tenor.googleapis.com");
+    assert.equal(parsed.pathname, "/v2/search");
+    assert.equal(parsed.searchParams.get("key"), "test-tenor-key");
+    assert.equal(parsed.searchParams.get("q"), "hola");
+    assert.equal(parsed.searchParams.get("limit"), "12");
+
+    return {
+      status: 200,
+      json: async () => ({
+        results: [
+          {
+            id: "gif-1",
+            content_description: "saludo",
+            tags: ["hola", "saludo"],
+            media_formats: {
+              tinygif: {
+                url: "https://media.tenor.com/example/tenor.gif",
+              },
+            },
+          },
+        ],
+        next: "next-page",
+      }),
+    };
+  });
+
+  try {
+    const fakeFirestore = new FakeFirestore();
+    const result = await withFakeFirestore(fakeFirestore, () => {
+      return callableFunctions.buscarGifsTenor.run({
+        auth: {uid: "member-user", token: {}},
+        data: {query: " hola ", limit: 12},
+      });
+    });
+
+    assert.equal(fetchCalls, 1);
+    assert.deepEqual(result, {
+      gifs: [
+        {
+          id: "gif-1",
+          label: "saludo",
+          url: "https://media.tenor.com/example/tenor.gif",
+          keywords: ["hola", "saludo"],
+        },
+      ],
+      next: "next-page",
+      source: "tenor",
+    });
+
+    const rateLimitDocs = fakeFirestore.documentsUnder(
+      "users/member-user/rateLimits"
+    );
+    assert.equal(rateLimitDocs.length, 1);
+    assert.equal(rateLimitDocs[0].data.bucket, "tenorGifSearches");
+    assert.equal(rateLimitDocs[0].data.count, 1);
+    assert.equal(rateLimitDocs[0].data.limit, 240);
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.TENOR_API_KEY;
+    } else {
+      process.env.TENOR_API_KEY = previousKey;
+    }
+  }
+});
+
+test("GIF search stops before Tenor when the hourly limit is exhausted", async (t) => {
+  t.mock.timers.enable({
+    apis: ["Date"],
+    now: new Date("2026-06-14T12:34:00.000Z"),
+  });
+
+  const previousKey = process.env.TENOR_API_KEY;
+  process.env.TENOR_API_KEY = "test-tenor-key";
+  t.mock.method(global, "fetch", async () => {
+    assert.fail("Tenor should not be called after the GIF rate limit");
+  });
+
+  try {
+    const fakeFirestore = new FakeFirestore({
+      "users/member-user/rateLimits/tenorGifSearches_2026-06-14-12": {
+        count: 240,
+      },
+    });
+
+    await assert.rejects(
+      () => withFakeFirestore(fakeFirestore, () => {
+        return callableFunctions.buscarGifsTenor.run({
+          auth: {uid: "member-user", token: {}},
+          data: {query: "hola"},
+        });
+      }),
+      (error) => {
+        assert.equal(error.code, "resource-exhausted");
+        assert.match(error.message, /muchos GIFs/);
+        return true;
+      }
+    );
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.TENOR_API_KEY;
+    } else {
+      process.env.TENOR_API_KEY = previousKey;
+    }
+  }
+});
+
 test("suggestions are stored and queue an email for the CEO", async () => {
   const previousRecipient = process.env.SUNDAY_SELFIE_CEO_EMAIL;
   process.env.SUNDAY_SELFIE_CEO_EMAIL = "ceo@example.com";
@@ -479,7 +678,9 @@ test("suggestions are stored and queue an email for the CEO", async () => {
 
     const mails = fakeFirestore.documentsUnder("mail");
     assert.equal(mails.length, 1);
+    assert.equal(mails[0].data.from, "sundayselfie2026@gmail.com");
     assert.deepEqual(mails[0].data.to, ["ceo@example.com"]);
+    assert.equal(mails[0].data.replyTo, "member@example.com");
     assert.equal(mails[0].data.message.subject, "Nueva sugerencia en Sunday Selfie");
     assert.match(mails[0].data.message.text, /ordenar los grupos/);
   } finally {
@@ -530,7 +731,7 @@ test("suggestions default to the project email when no recipient is configured",
   }
 });
 
-test("suggestions fail visibly when email cannot be queued", async () => {
+test("suggestions still succeed when email cannot be queued", async () => {
   const fakeFirestore = new FakeFirestore();
   const originalSetDoc = fakeFirestore.setDoc.bind(fakeFirestore);
   fakeFirestore.setDoc = (ref, data, options) => {
@@ -541,22 +742,18 @@ test("suggestions fail visibly when email cannot be queued", async () => {
     originalSetDoc(ref, data, options);
   };
 
-  await assert.rejects(
-    () => withFakeFirestore(fakeFirestore, () => {
-      return callableFunctions.enviarSugerencia.run({
-        auth: {uid: "member-user", token: {email: "member@example.com"}},
-        data: {
-          authorName: "Miembro",
-          text: "Me gustaría saber si falla el correo.",
-        },
-      });
-    }),
-    (error) => {
-      assert.equal(error.code, "internal");
-      assert.match(error.message, /no se pudo preparar el correo/);
-      return true;
-    }
-  );
+  const result = await withFakeFirestore(fakeFirestore, () => {
+    return callableFunctions.enviarSugerencia.run({
+      auth: {uid: "member-user", token: {email: "member@example.com"}},
+      data: {
+        authorName: "Miembro",
+        text: "Me gustaría saber si falla el correo.",
+      },
+    });
+  });
+
+  assert.equal(result.success, true);
+  assert.equal(result.emailStatus, "failed");
 
   const suggestions = fakeFirestore.documentsUnder("suggestions");
   assert.equal(suggestions.length, 1);

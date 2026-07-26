@@ -17,10 +17,7 @@ import 'package:flutter/foundation.dart'
 class DefaultFirebaseOptions {
   static FirebaseOptions get currentPlatform {
     if (kIsWeb) {
-      throw UnsupportedError(
-        'DefaultFirebaseOptions have not been configured for web - '
-        'you can reconfigure this by running the FlutterFire CLI again.',
-      );
+      return web;
     }
     switch (defaultTargetPlatform) {
       case TargetPlatform.android:
@@ -49,9 +46,18 @@ class DefaultFirebaseOptions {
     }
   }
 
+  static const FirebaseOptions web = FirebaseOptions(
+    apiKey: 'AIzaSyBf_ftOf-sUz5YrDqP6Dt1vU3M1nD5RAtI',
+    appId: '1:1034344193488:web:8133864032418a64fa6dd5',
+    messagingSenderId: '1034344193488',
+    projectId: 'sundayselfie-8cd4a',
+    authDomain: 'sundayselfie-8cd4a.firebaseapp.com',
+    storageBucket: 'sundayselfie-8cd4a.firebasestorage.app',
+  );
+
   static const FirebaseOptions android = FirebaseOptions(
     apiKey: 'AIzaSyBwHk4Xlou0Uld5yYYahWxAIDNR12ElEyg',
-    appId: '1:1034344193488:android:88a2f23670e552f1fa6dd5',
+    appId: '1:1034344193488:android:6bae04914dcd86e6fa6dd5',
     messagingSenderId: '1034344193488',
     projectId: 'sundayselfie-8cd4a',
     storageBucket: 'sundayselfie-8cd4a.firebasestorage.app',
@@ -59,11 +65,12 @@ class DefaultFirebaseOptions {
 
   static const FirebaseOptions ios = FirebaseOptions(
     apiKey: 'AIzaSyDARsrSPf2E8-JVWG3NR44XMc1v_ksUycw',
-    appId: '1:1034344193488:ios:acfa9ad36329e8e0fa6dd5',
+    appId: '1:1034344193488:ios:a01b81054315c817fa6dd5',
     messagingSenderId: '1034344193488',
     projectId: 'sundayselfie-8cd4a',
     storageBucket: 'sundayselfie-8cd4a.firebasestorage.app',
-    iosClientId: '1034344193488-uv03ghs316rhe1dujdtftdqalunbvprk.apps.googleusercontent.com',
-    iosBundleId: 'com.example.sundaySelfie',
+    iosClientId:
+        '1034344193488-8emnuhos864bnirt4263p1984sp9cm36.apps.googleusercontent.com',
+    iosBundleId: 'app.sundayselfie',
   );
 }

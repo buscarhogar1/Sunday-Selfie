@@ -4,14 +4,14 @@
       "android": {
         "default": {
           "projectId": "sundayselfie-8cd4a",
-          "appId": "1:1034344193488:android:88a2f23670e552f1fa6dd5",
+          "appId": "1:1034344193488:android:6bae04914dcd86e6fa6dd5",
           "fileOutput": "android/app/google-services.json"
         }
       },
       "ios": {
         "default": {
           "projectId": "sundayselfie-8cd4a",
-          "appId": "1:1034344193488:ios:acfa9ad36329e8e0fa6dd5",
+          "appId": "1:1034344193488:ios:a01b81054315c817fa6dd5",
           "uploadDebugSymbols": false,
           "fileOutput": "ios/Runner/GoogleService-Info.plist"
         }
@@ -20,8 +20,8 @@
         "lib/firebase_options.dart": {
           "projectId": "sundayselfie-8cd4a",
           "configurations": {
-            "android": "1:1034344193488:android:88a2f23670e552f1fa6dd5",
-            "ios": "1:1034344193488:ios:acfa9ad36329e8e0fa6dd5"
+            "android": "1:1034344193488:android:6bae04914dcd86e6fa6dd5",
+            "ios": "1:1034344193488:ios:a01b81054315c817fa6dd5"
           }
         }
       }

@@ -149,6 +149,16 @@ test("members can read protected group content and outsiders cannot", async () =
   await assertFails(getDoc(outsiderPost));
 });
 
+test("group documents are private but active invite codes can be resolved", async () => {
+  const memberGroup = doc(firestoreFor(memberUid), "groups", groupId);
+  const outsiderGroup = doc(firestoreFor(outsiderUid), "groups", groupId);
+  const outsiderInvite = doc(firestoreFor(outsiderUid), "inviteCodes", inviteCode);
+
+  await assertSucceeds(getDoc(memberGroup));
+  await assertFails(getDoc(outsiderGroup));
+  await assertSucceeds(getDoc(outsiderInvite));
+});
+
 test("direct clients cannot perform server-only Firestore writes", async () => {
   const db = firestoreFor(memberUid);
 
@@ -325,6 +335,29 @@ test("direct clients cannot replace or delete a stored selfie", async () => {
     }
   ));
   await assertFails(deleteObject(selfieRef));
+});
+
+test("members can upload a rewarded selfie replacement to a unique path", async () => {
+  const replacementUploadId = "123456789";
+  const objectPath =
+    `groups/${groupId}/weeks/${weekKey}/replacements/${authorUid}_${replacementUploadId}.jpg`;
+  const selfieRef = ref(storageFor(authorUid), objectPath);
+
+  await assertSucceeds(uploadBytes(
+    selfieRef,
+    new Uint8Array([4, 5, 6]),
+    {
+      contentType: "image/jpeg",
+      customMetadata: {
+        groupId,
+        weekKey,
+        uid: authorUid,
+        replacement: "true",
+        rewardedAdWatched: "true",
+        replacementUploadId,
+      },
+    }
+  ));
 });
 
 test("users can upload only their own profile photo", async () => {

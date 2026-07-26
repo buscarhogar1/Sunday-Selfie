@@ -1,4 +1,4 @@
-package com.example.sunday_selfie
+package app.sundayselfie
 
 import android.Manifest
 import android.app.Notification
@@ -13,20 +13,26 @@ import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import android.view.KeyEvent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 class MainActivity : FlutterActivity() {
     private val methodChannelName = "sunday_selfie/foreground_notifications"
     private val mediaSaverChannelName = "sunday_selfie/media_saver"
+    private val volumeButtonsChannelName = "sunday_selfie/volume_buttons"
     private val extraForegroundNotification = "foreground_notification"
     private val extraPayload = "payload"
     private var methodChannel: MethodChannel? = null
     private var mediaSaverChannel: MethodChannel? = null
+    private var volumeButtonsChannel: MethodChannel? = null
     private var pendingLaunchPayload: String? = null
+    private var volumeButtonCaptureEnabled = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -38,6 +44,10 @@ class MainActivity : FlutterActivity() {
         mediaSaverChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             mediaSaverChannelName
+        )
+        volumeButtonsChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            volumeButtonsChannelName
         )
 
         methodChannel?.setMethodCallHandler { call, result ->
@@ -105,7 +115,29 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        volumeButtonsChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "setCaptureEnabled" -> {
+                    val args = call.arguments as? Map<*, *>
+                    volumeButtonCaptureEnabled = args?.get("enabled") as? Boolean ?: false
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         handleForegroundNotificationIntent(intent)
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (volumeButtonCaptureEnabled && isVolumeKey(event.keyCode)) {
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                volumeButtonsChannel?.invokeMethod("volumeButtonPressed", null)
+            }
+            return true
+        }
+
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -247,6 +279,11 @@ class MainActivity : FlutterActivity() {
         return payload
     }
 
+    private fun isVolumeKey(keyCode: Int): Boolean {
+        return keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+            keyCode == KeyEvent.KEYCODE_VOLUME_DOWN
+    }
+
     private fun stableNotificationId(value: String): Int {
         val hash = value.hashCode()
         return if (hash == Int.MIN_VALUE) 0 else abs(hash)
@@ -264,6 +301,7 @@ class MainActivity : FlutterActivity() {
             if (!source.exists()) continue
 
             val fileName = (fileData["name"] as? String)
+                ?.let { File(it).name }
                 ?.takeIf { it.isNotBlank() }
                 ?: source.name
             val mimeType = (fileData["mimeType"] as? String)
@@ -295,13 +333,16 @@ class MainActivity : FlutterActivity() {
         fileName: String,
         mimeType: String,
     ): Boolean {
+        val nowMillis = System.currentTimeMillis()
+        val nowSeconds = nowMillis / 1000
+        val relativePath = "${Environment.DIRECTORY_PICTURES}/Sunday Selfie"
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
             put(MediaStore.Images.Media.MIME_TYPE, mimeType)
-            put(
-                MediaStore.Images.Media.RELATIVE_PATH,
-                "${Environment.DIRECTORY_PICTURES}/Sunday Selfie"
-            )
+            put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
+            put(MediaStore.Images.Media.DATE_ADDED, nowSeconds)
+            put(MediaStore.Images.Media.DATE_MODIFIED, nowSeconds)
+            put(MediaStore.Images.Media.DATE_TAKEN, nowMillis)
             put(MediaStore.Images.Media.IS_PENDING, 1)
         }
 
@@ -322,7 +363,17 @@ class MainActivity : FlutterActivity() {
 
             values.clear()
             values.put(MediaStore.Images.Media.IS_PENDING, 0)
+            values.put(MediaStore.Images.Media.DATE_MODIFIED, nowSeconds)
             resolver.update(uri, values, null, null)
+            scanSavedImage(
+                File(
+                    Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_PICTURES
+                    ),
+                    "Sunday Selfie/$fileName"
+                ).absolutePath,
+                mimeType
+            )
             saved = true
             return true
         } finally {
@@ -351,14 +402,26 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        MediaScannerConnection.scanFile(
-            this,
-            arrayOf(destination.absolutePath),
-            arrayOf(mimeType),
-            null
-        )
+        scanSavedImage(destination.absolutePath, mimeType)
 
         return true
+    }
+
+    private fun scanSavedImage(path: String, mimeType: String) {
+        val latch = CountDownLatch(1)
+        MediaScannerConnection.scanFile(
+            this,
+            arrayOf(path),
+            arrayOf(mimeType)
+        ) { _, _ ->
+            latch.countDown()
+        }
+
+        try {
+            latch.await(2, TimeUnit.SECONDS)
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     private fun uniqueDestinationFile(directory: File, fileName: String): File {

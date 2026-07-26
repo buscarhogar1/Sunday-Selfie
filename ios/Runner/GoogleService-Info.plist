@@ -3,9 +3,11 @@
 <plist version="1.0">
 <dict>
 	<key>CLIENT_ID</key>
-	<string>1034344193488-uv03ghs316rhe1dujdtftdqalunbvprk.apps.googleusercontent.com</string>
+	<string>1034344193488-8emnuhos864bnirt4263p1984sp9cm36.apps.googleusercontent.com</string>
 	<key>REVERSED_CLIENT_ID</key>
-	<string>com.googleusercontent.apps.1034344193488-uv03ghs316rhe1dujdtftdqalunbvprk</string>
+	<string>com.googleusercontent.apps.1034344193488-8emnuhos864bnirt4263p1984sp9cm36</string>
+	<key>ANDROID_CLIENT_ID</key>
+	<string>1034344193488-3rkq8ag1c3qp4r5e1kselbbh11hn5fls.apps.googleusercontent.com</string>
 	<key>API_KEY</key>
 	<string>AIzaSyDARsrSPf2E8-JVWG3NR44XMc1v_ksUycw</string>
 	<key>GCM_SENDER_ID</key>
@@ -13,7 +15,7 @@
 	<key>PLIST_VERSION</key>
 	<string>1</string>
 	<key>BUNDLE_ID</key>
-	<string>com.example.sundaySelfie</string>
+	<string>app.sundayselfie</string>
 	<key>PROJECT_ID</key>
 	<string>sundayselfie-8cd4a</string>
 	<key>STORAGE_BUCKET</key>
@@ -29,6 +31,6 @@
 	<key>IS_SIGNIN_ENABLED</key>
 	<true></true>
 	<key>GOOGLE_APP_ID</key>
-	<string>1:1034344193488:ios:acfa9ad36329e8e0fa6dd5</string>
+	<string>1:1034344193488:ios:a01b81054315c817fa6dd5</string>
 </dict>
 </plist>

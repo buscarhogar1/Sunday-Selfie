@@ -7,6 +7,66 @@
   "client": [
     {
       "client_info": {
+        "mobilesdk_app_id": "1:1034344193488:android:6bae04914dcd86e6fa6dd5",
+        "android_client_info": {
+          "package_name": "app.sundayselfie"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1034344193488-gb19c88p1noq7q88nrotb80f1g1tmfr7.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "app.sundayselfie",
+            "certificate_hash": "026060843971767a2293e605d376852fbb54225a"
+          }
+        },
+        {
+          "client_id": "1034344193488-uf0e2qaktclmk4g80g3kil16492h6k62.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "app.sundayselfie",
+            "certificate_hash": "f9f6fe0fd9fe5dbe4df8f11f430b94a41b27112c"
+          }
+        },
+        {
+          "client_id": "1034344193488-v6tml4e5bopkt12rdfge75bnckudevf3.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "app.sundayselfie",
+            "certificate_hash": "65c3052dcb32ae1c8adaee096b4c574d11061183"
+          }
+        },
+        {
+          "client_id": "1034344193488-b1ahotfvo55t8br81e03m6fp1a9i4hq6.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBwHk4Xlou0Uld5yYYahWxAIDNR12ElEyg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1034344193488-b1ahotfvo55t8br81e03m6fp1a9i4hq6.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "1034344193488-uv03ghs316rhe1dujdtftdqalunbvprk.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.example.sundaySelfie"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
         "mobilesdk_app_id": "1:1034344193488:android:88a2f23670e552f1fa6dd5",
         "android_client_info": {
           "package_name": "com.example.sunday_selfie"
@@ -19,6 +79,14 @@
           "android_info": {
             "package_name": "com.example.sunday_selfie",
             "certificate_hash": "026060843971767a2293e605d376852fbb54225a"
+          }
+        },
+        {
+          "client_id": "1034344193488-a2niladm07unhjjq62pca52k351phb8j.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.sunday_selfie",
+            "certificate_hash": "f9f6fe0fd9fe5dbe4df8f11f430b94a41b27112c"
           }
         },
         {

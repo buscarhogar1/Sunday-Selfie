@@ -32,6 +32,45 @@ void main() {
     }
   });
 
+  test('agrupa variantes de tono de piel en una sola opcion', () {
+    final groups = agruparEmojisReaccion(['👍', '👍🏻', '👍🏿', '🔥']);
+    final thumbGroup = groups.firstWhere((group) => group.key == '👍');
+
+    expect(groups.length, 2);
+    expect(thumbGroup.displayEmoji, '👍');
+    expect(thumbGroup.variants, ['👍', '👍🏻', '👍🏿']);
+  });
+
+  test('agrupa variantes estilo WhatsApp de genero y apariencia', () {
+    final groups = agruparEmojisReaccion([
+      '🧑‍🍳',
+      '🧑🏽‍🍳',
+      '👨‍🍳',
+      '👨🏻‍🍳',
+      '👩🏿‍🍳',
+      '🙋',
+      '🙋‍♂️',
+      '🙋🏽‍♀️',
+      '👨‍🦰',
+      '👩🏿‍🦰',
+      '🧑‍🦰',
+      '🔥',
+    ]);
+    final cookGroup = groups.firstWhere((group) => group.key == '🧑‍🍳');
+    final raisingHandGroup = groups.firstWhere((group) => group.key == '🙋');
+    final redHairGroup = groups.firstWhere((group) => group.key == '🧑‍🦰');
+
+    expect(groups.length, 4);
+    expect(cookGroup.displayEmoji, '🧑‍🍳');
+    expect(
+      cookGroup.variants,
+      containsAll(['🧑‍🍳', '🧑🏽‍🍳', '👨‍🍳', '👨🏻‍🍳', '👩🏿‍🍳']),
+    );
+    expect(raisingHandGroup.variants, ['🙋', '🙋‍♂️', '🙋🏽‍♀️']);
+    expect(redHairGroup.displayEmoji, '🧑‍🦰');
+    expect(redHairGroup.variants, containsAll(['👨‍🦰', '👩🏿‍🦰', '🧑‍🦰']));
+  });
+
   test('los grupos pueden usar el catalogo completo de emoji', () {
     expect(kGroupEmojiSections.first.label, 'Todos');
     expect(kGroupEmojiSections.first.emojis, kGroupEmojiOptions);
@@ -40,6 +79,19 @@ void main() {
     expect(kGroupEmojiOptions.contains('👩‍💻'), isTrue);
     expect(kGroupEmojiOptions.contains('🏖️'), isTrue);
     expect(kGroupEmojiOptions.contains(englandFlag), isTrue);
+
+    final groupedEmojiOptions = agruparEmojisReaccion(
+      kGroupEmojiSections.first.emojis,
+    );
+    final wavingGroup = groupedEmojiOptions.firstWhere(
+      (group) => group.key == '👋',
+    );
+    expect(groupedEmojiOptions.length, lessThan(kGroupEmojiOptions.length));
+    expect(wavingGroup.variants, containsAll(['👋', '👋🏻', '👋🏿']));
+    expect(
+      groupedEmojiOptions.firstWhere((group) => group.key == '🧑‍🍳').variants,
+      containsAll(['🧑‍🍳', '👨‍🍳', '👩‍🍳']),
+    );
   });
 
   test('calcula correctamente una semana ISO conocida', () {
@@ -56,6 +108,17 @@ void main() {
       proximoRefrescoCambioDeDia(sundayNight),
       DateTime(2026, 6, 15, 0, 0, 0, 250),
     );
+  });
+
+  test('limita los pixeles exportados en montajes largos', () {
+    expect(
+      calcularPixelRatioCapturaMontaje(const Size(360, 900)),
+      kMontageCaptureMaxPixelRatio,
+    );
+
+    final longRatio = calcularPixelRatioCapturaMontaje(const Size(390, 18000));
+    expect(longRatio, lessThan(kMontageCaptureMaxPixelRatio));
+    expect(longRatio, greaterThanOrEqualTo(kMontageCaptureMinPixelRatio));
   });
 
   test('oculta la semana actual cuando todavia no es domingo', () {
@@ -107,6 +170,35 @@ void main() {
       isFalse,
     );
   });
+
+  test(
+    'permite usar una selfie como foto de perfil solo domingo o lunes posterior',
+    () {
+      final sunday = DateTime(2026, 6, 28, 10);
+      final sundayWeekKey = obtenerWeekKeyActual(now: sunday);
+      final previousWeekKey = obtenerWeekKeyAnterior(sundayWeekKey);
+      final monday = DateTime(2026, 6, 29, 10);
+      final saturday = DateTime(2026, 7, 4, 10);
+
+      expect(puedeUsarSelfieComoFotoPerfil(sundayWeekKey, now: sunday), isTrue);
+      expect(
+        puedeUsarSelfieComoFotoPerfil(previousWeekKey, now: sunday),
+        isFalse,
+      );
+      expect(puedeUsarSelfieComoFotoPerfil(sundayWeekKey, now: monday), isTrue);
+      expect(
+        puedeUsarSelfieComoFotoPerfil(
+          obtenerWeekKeyActual(now: monday),
+          now: monday,
+        ),
+        isFalse,
+      );
+      expect(
+        puedeUsarSelfieComoFotoPerfil(sundayWeekKey, now: saturday),
+        isFalse,
+      );
+    },
+  );
 
   test('etiqueta como pendiente solo domingo actual o lunes posterior', () {
     final sunday = DateTime(2026, 6, 14, 10);
@@ -251,6 +343,36 @@ void main() {
     expect(entries.map((entry) => entry.postUid), ['bea', 'carlos', 'ana']);
   });
 
+  test('ordena grupos por actividad de selfie o chat', () {
+    final groups = <Map<String, dynamic>>[
+      {
+        'id': 'actividad_general_reciente',
+        'lastActivityAt': DateTime(2026, 7, 4, 12),
+        'joinedAt': DateTime(2026, 2, 1),
+      },
+      {'id': 'sin_contenido_reciente', 'joinedAt': DateTime(2026, 7, 1)},
+      {
+        'id': 'selfie_o_chat_antiguo',
+        'lastSelfieOrChatActivityAt': DateTime(2026, 6, 12, 18),
+        'joinedAt': DateTime(2026, 1, 1),
+      },
+      {
+        'id': 'selfie_o_chat_reciente',
+        'lastSelfieOrChatActivityAt': DateTime(2026, 6, 14, 20),
+        'joinedAt': DateTime(2026, 1, 1),
+      },
+    ];
+
+    groups.sort(compareUserGroupsBySelfieOrChatActivity);
+
+    expect(groups.map((group) => group['id']), [
+      'selfie_o_chat_reciente',
+      'selfie_o_chat_antiguo',
+      'sin_contenido_reciente',
+      'actividad_general_reciente',
+    ]);
+  });
+
   test('la racha completa del grupo calcula actual y record', () {
     final stats = calcularEstadisticasRachaCompletaGrupo(
       weekKeys: const [
@@ -285,6 +407,41 @@ void main() {
 
     expect(stats.current, 0);
     expect(stats.record, 2);
+  });
+
+  test('traduce errores de callable protegida a mensajes de usuario', () {
+    expect(
+      mensajeErrorCallableProtegida(
+        code: 'unauthenticated',
+        message: 'Unauthenticated',
+        fallback: 'No se pudo enviar el zumbido',
+      ),
+      kProtectedCallableUnauthenticatedMessage,
+    );
+    expect(
+      mensajeErrorCallableProtegida(
+        code: 'failed-precondition',
+        message: 'Los zumbidos solo están disponibles los domingos',
+        fallback: 'No se pudo enviar el zumbido',
+      ),
+      'Los zumbidos solo están disponibles los domingos',
+    );
+    expect(
+      mensajeErrorCallableProtegida(
+        code: 'internal',
+        message: '',
+        fallback: 'No se pudo enviar el zumbido',
+      ),
+      'No se pudo enviar el zumbido',
+    );
+    expect(
+      mensajeErrorCallableProtegida(
+        code: 'internal',
+        message: 'internal',
+        fallback: 'No se pudo cargar la biblioteca de GIFs',
+      ),
+      'No se pudo cargar la biblioteca de GIFs',
+    );
   });
 
   testWidgets('el calendario de semanas cabe con texto grande en movil', (
@@ -380,7 +537,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Descargar selfies'), findsOneWidget);
-    expect(find.text('Elige el año y las semanas a guardar'), findsOneWidget);
+    expect(find.text('Elige las semanas que quieres guardar'), findsOneWidget);
     expect(find.text('2026 · SEMANAS'), findsOneWidget);
     expect(find.text('Seleccionar todas'), findsOneWidget);
     expect(find.text('1 semana'), findsOneWidget);
@@ -405,32 +562,31 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets(
-    'el chat reemplaza la cuadricula cuando el teclado esta abierto',
-    (tester) async {
-      await tester.pumpWidget(
-        const MaterialApp(
-          home: Scaffold(
-            body: SizedBox(
-              height: 240,
-              child: GroupWeeklyContentLayout(
-                keyboardVisible: true,
-                chatExpanded: true,
-                weekSelector: SizedBox(height: 33, child: Text('selector')),
-                postsGrid: Text('grid'),
-                chatPanel: Text('chat'),
-              ),
+  testWidgets('el chat conserva la cuadricula cuando el teclado esta abierto', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 240,
+            child: GroupWeeklyContentLayout(
+              keyboardVisible: true,
+              chatExpanded: true,
+              weekSelector: SizedBox(height: 33, child: Text('selector')),
+              postsGrid: Text('grid'),
+              chatPanel: Text('chat'),
             ),
           ),
         ),
-      );
+      ),
+    );
 
-      expect(find.text('selector'), findsOneWidget);
-      expect(find.text('chat'), findsOneWidget);
-      expect(find.text('grid'), findsNothing);
-      expect(tester.takeException(), isNull);
-    },
-  );
+    expect(find.text('selector'), findsOneWidget);
+    expect(find.text('chat'), findsOneWidget);
+    expect(find.text('grid'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('abrir el chat conserva la cuadricula semanal', (tester) async {
     var gridMountCount = 0;
@@ -504,6 +660,97 @@ void main() {
     expect(gridHeight, 272);
     expect(tester.takeException(), isNull);
   });
+
+  testWidgets('la cabecera del chat tambien permite arrastrar hacia abajo', (
+    tester,
+  ) async {
+    var dragStarted = false;
+    double? updatedDistance;
+    double? endedDistance;
+    double? endedVelocity;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.topCenter,
+            child: SizedBox(
+              width: 360,
+              child: WeeklyChatDragArea(
+                onDragStart: () => dragStarted = true,
+                onDragUpdate: (distance) => updatedDistance = distance,
+                onDragEnd: (distance, velocity) {
+                  endedDistance = distance;
+                  endedVelocity = velocity;
+                },
+                child: const WeeklyChatHeader(weekLabel: 'SEMANA 26 / 2026'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.drag(
+      find.text('CHAT · SEMANA 26 / 2026'),
+      const Offset(0, 36),
+    );
+    await tester.pump();
+
+    expect(dragStarted, isTrue);
+    expect(updatedDistance, isNotNull);
+    expect(updatedDistance!, greaterThan(0));
+    expect(endedDistance, isNotNull);
+    expect(endedDistance!, greaterThan(kWeeklyChatDragDismissDistance));
+    expect(endedVelocity, isNotNull);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+    'el chat abierto tiene una zona amplia para arrastrar hacia abajo',
+    (tester) async {
+      var dragStarted = false;
+      double? updatedDistance;
+      double? endedDistance;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: Align(
+              alignment: Alignment.topCenter,
+              child: SizedBox(
+                width: 360,
+                child: WeeklyChatExpandedDragZone(
+                  weekLabel: 'SEMANA 26 / 2026',
+                  onDismiss: () {},
+                  onDragStart: () => dragStarted = true,
+                  onDragUpdate: (distance) => updatedDistance = distance,
+                  onDragEnd: (distance, _) => endedDistance = distance,
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      final zoneTopLeft = tester.getTopLeft(
+        find.byType(WeeklyChatExpandedDragZone),
+      );
+      await tester.dragFrom(
+        zoneTopLeft +
+            const Offset(180, kWeeklyChatExpandedDragInfluenceHeight - 8),
+        const Offset(0, 36),
+      );
+      await tester.pump();
+
+      expect(dragStarted, isTrue);
+      expect(updatedDistance, isNotNull);
+      expect(updatedDistance!, greaterThan(0));
+      expect(endedDistance, isNotNull);
+      expect(endedDistance!, greaterThan(kWeeklyChatDragDismissDistance));
+      expect(tester.takeException(), isNull);
+    },
+  );
 
   testWidgets('el chat finalizado no muestra flecha ni mueve el candado', (
     tester,
@@ -640,6 +887,57 @@ void main() {
       TextAlignVertical.center,
     );
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('el boton de enviar chat se activa cuando hay texto', (
+    tester,
+  ) async {
+    final controller = TextEditingController();
+    addTearDown(controller.dispose);
+
+    var sends = 0;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.bottomCenter,
+            child: SizedBox(
+              width: 360,
+              height: kWeeklyChatCollapsedSlotHeight,
+              child: WeeklyChatInputBar(
+                canWrite: true,
+                sending: false,
+                controller: controller,
+                onSend: () => sends += 1,
+                onGif: () {},
+                onToggle: () {},
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final sendButton = find.byKey(const ValueKey('weekly-chat-send-button'));
+
+    expect(tester.widget<Material>(sendButton).color, ssOrangeMid);
+    await tester.tap(sendButton);
+    await tester.pump();
+    expect(sends, 0);
+
+    await tester.enterText(find.byType(TextField), 'hola');
+    await tester.pump();
+
+    expect(tester.widget<Material>(sendButton).color, ssOrange);
+    await tester.tap(sendButton);
+    await tester.pump();
+    expect(sends, 1);
+
+    await tester.enterText(find.byType(TextField), '   ');
+    await tester.pump();
+
+    expect(tester.widget<Material>(sendButton).color, ssOrangeMid);
   });
 
   test('la subida tardia exige pertenecer al grupo el domingo anterior', () {

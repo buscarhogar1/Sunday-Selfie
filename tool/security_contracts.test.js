@@ -113,11 +113,20 @@ test("sensitive Firestore writes stay closed to direct clients", () => {
   );
 });
 
+test("Firestore and Storage Sunday windows open together at Madrid midnight", () => {
+  const madridMidnightWindow =
+    /request\.time\.dayOfWeek\(\) == 6[\s\S]*?request\.time\.time\(\) >= duration\.time\(22, 0, 0, 0\)[\s\S]*?\|\| request\.time\.dayOfWeek\(\) == 7/;
+
+  assert.match(firestoreRules, madridMidnightWindow);
+  assert.match(storageRules, madridMidnightWindow);
+});
+
 test("sensitive Storage writes cannot replace or delete selfies", () => {
   assert.match(
     storageRules,
     /match \/groups\/\{groupId\}\/weeks\/\{weekKey\}\/\{fileName\} \{[\s\S]*?allow create: if isValidSelfieUpload[\s\S]*?allow update, delete: if false;/
   );
+  assert.match(storageRules, /&& resource == null/);
   assert.match(storageRules, /request\.resource\.contentType == "image\/jpeg"/);
   assert.doesNotMatch(storageRules, /contentType\.matches\("image\/\.\*"\)/);
   assert.match(storageRules, /request\.resource\.metadata\.kind == "profilePhoto"/);
@@ -127,11 +136,18 @@ test("sensitive Storage writes cannot replace or delete selfies", () => {
     storageRules,
     /match \/groups\/\{groupId\}\/weeks\/\{weekKey\}\/thumbs\/\{fileName\}/
   );
+  assert.match(
+    storageRules,
+    /match \/groups\/\{groupId\}\/weeks\/\{weekKey\}\/replacements\/\{fileName\}/
+  );
+  assert.match(storageRules, /request\.resource\.metadata\.replacement == "true"/);
+  assert.match(storageRules, /request\.resource\.metadata\.replacementUploadId/);
 });
 
 test("Flutter delegates sensitive actions to Cloud Functions", () => {
   const callables = [
     "crearGrupo",
+    "resolverInvitacionGrupo",
     "aceptarSolicitud",
     "solicitarEntradaGrupo",
     "rechazarSolicitud",
@@ -154,7 +170,12 @@ test("Flutter delegates sensitive actions to Cloud Functions", () => {
 
   for (const callable of callables) {
     assert.match(functionsSource, new RegExp(`exports\\.${callable}\\s*=`));
-    assert.match(flutterSource, new RegExp(`httpsCallable\\(\\s*'${callable}'`));
+    assert.match(
+      flutterSource,
+      new RegExp(
+        `(?:httpsCallable\\(\\s*'${callable}'|llamarCallableAutenticadoConReintento\\(\\s*name:\\s*'${callable}')`
+      )
+    );
   }
 });
 
@@ -164,6 +185,31 @@ test("Flutter has no direct post, reaction, or reminder transaction writes", () 
   assert.doesNotMatch(flutterSource, /transaction\.(set|update|delete)\(reminderRef/);
   assert.doesNotMatch(flutterSource, /collection\('joinRequests'\)\.doc\([^)]*\)\.set\(/);
   assert.doesNotMatch(flutterSource, /currentUser\?*\.delete\(\)/);
+});
+
+test("private group metadata is not exposed by direct reads", () => {
+  assert.match(
+    firestoreRules,
+    /match \/groups\/\{groupId\} \{[\s\S]*?allow get: if isSignedIn\(\)[\s\S]*?&& isMember\(groupId, uid\(\)\);/
+  );
+  assert.doesNotMatch(firestoreRules, /resource\.data\.deleted != true/);
+
+  const previewStart = functionsSource.indexOf("exports.resolverInvitacionGrupo");
+  const previewEnd = functionsSource.indexOf("exports.solicitarEntradaGrupo");
+  assert.ok(previewStart >= 0, "resolverInvitacionGrupo exists");
+  assert.ok(previewEnd > previewStart, "preview function is before join function");
+
+  const previewSource = functionsSource.slice(previewStart, previewEnd);
+  assert.doesNotMatch(previewSource, /photoUrl|photoStoragePath|inviteLink/);
+  assert.match(flutterSource, /httpsCallable\(\s*'resolverInvitacionGrupo'/);
+
+  const previewCardStart = flutterSource.indexOf("class JoinGroupPreviewCard");
+  const previewCardEnd = flutterSource.indexOf("class JoinPreviewMessageCard");
+  assert.ok(previewCardStart >= 0, "JoinGroupPreviewCard exists");
+  assert.ok(previewCardEnd > previewCardStart, "preview card block is bounded");
+  const previewCardSource = flutterSource.slice(previewCardStart, previewCardEnd);
+  assert.doesNotMatch(previewCardSource, /collection\('groups'\)/);
+  assert.doesNotMatch(previewCardSource, /photoUrl:\s*data/);
 });
 
 test("chat GIF messages are constrained to Tenor media URLs", () => {
@@ -238,6 +284,8 @@ test("abuse protection is configured in backend and Flutter", () => {
   assert.match(flutterSource, /FirebaseAppCheck\.instance\.activate/);
   assert.match(flutterSource, /AndroidPlayIntegrityProvider\(\)/);
   assert.match(flutterSource, /AppleAppAttestWithDeviceCheckFallbackProvider\(\)/);
+  assert.match(flutterSource, /FirebaseAppCheck\.instance\.getToken\(true\)/);
+  assert.match(flutterSource, /prepararReintentoCallableProtegida/);
   assert.match(androidManifest, /android:allowBackup="false"/);
   assert.match(androidManifest, /android:usesCleartextTraffic="false"/);
   assert.match(flutterSource, /httpsCallable\(\s*'solicitarEntradaGrupo'/);
@@ -264,7 +312,7 @@ test("invitation links are wired for app links", () => {
     JSON.stringify(firebaseConfig.hosting.rewrites),
     /\/j\/\*\*/
   );
-  assert.match(hostingIndex, /Invitacion a Sunday Selfie/);
+  assert.match(hostingIndex, /Invitaci\u00f3n a un grupo privado/);
   assert.match(hostingIndex, /PLAY_STORE_URL/);
   assert.match(hostingIndex, /APP_STORE_URL/);
 });

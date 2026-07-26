@@ -47,6 +47,15 @@ service firebase.storage {
         && request.resource.metadata.rewardedAdWatched == "true";
     }
 
+    function isRewardedReplacement() {
+      return "replacement" in request.resource.metadata
+        && "rewardedAdWatched" in request.resource.metadata
+        && "replacementUploadId" in request.resource.metadata
+        && request.resource.metadata.replacement == "true"
+        && request.resource.metadata.rewardedAdWatched == "true"
+        && request.resource.metadata.replacementUploadId.matches("[0-9]+");
+    }
+
     function isJpegUpload() {
       return request.resource.contentType == "image/jpeg";
     }
@@ -69,9 +78,11 @@ service firebase.storage {
           )
         )
         && request.resource != null
+        && resource == null
         && fileName == request.auth.uid + ".jpg"
         && request.resource.size < 10 * 1024 * 1024
         && isJpegUpload()
+        && !("replacement" in request.resource.metadata)
         && request.resource.metadata.groupId == groupId
         && request.resource.metadata.weekKey == weekKey
         && request.resource.metadata.uid == request.auth.uid;
@@ -87,7 +98,40 @@ service firebase.storage {
           )
         )
         && request.resource != null
+        && resource == null
         && fileName == request.auth.uid + ".jpg"
+        && request.resource.size < 2 * 1024 * 1024
+        && isJpegUpload()
+        && !("replacement" in request.resource.metadata)
+        && request.resource.metadata.groupId == groupId
+        && request.resource.metadata.weekKey == weekKey
+        && request.resource.metadata.uid == request.auth.uid
+        && request.resource.metadata.kind == "selfieThumb";
+    }
+
+    function isValidReplacementSelfieUpload(groupId, weekKey, fileName) {
+      return isMember(groupId)
+        && isSundayUploadWindowOpen()
+        && request.resource != null
+        && resource == null
+        && isRewardedReplacement()
+        && fileName == request.auth.uid + "_"
+          + request.resource.metadata.replacementUploadId + ".jpg"
+        && request.resource.size < 10 * 1024 * 1024
+        && isJpegUpload()
+        && request.resource.metadata.groupId == groupId
+        && request.resource.metadata.weekKey == weekKey
+        && request.resource.metadata.uid == request.auth.uid;
+    }
+
+    function isValidReplacementSelfieThumbnailUpload(groupId, weekKey, fileName) {
+      return isMember(groupId)
+        && isSundayUploadWindowOpen()
+        && request.resource != null
+        && resource == null
+        && isRewardedReplacement()
+        && fileName == request.auth.uid + "_"
+          + request.resource.metadata.replacementUploadId + ".jpg"
         && request.resource.size < 2 * 1024 * 1024
         && isJpegUpload()
         && request.resource.metadata.groupId == groupId
@@ -130,6 +174,22 @@ service firebase.storage {
       allow read: if isMember(groupId);
 
       allow create: if isValidSelfieThumbnailUpload(groupId, weekKey, fileName);
+
+      allow update, delete: if false;
+    }
+
+    match /groups/{groupId}/weeks/{weekKey}/replacements/{fileName} {
+      allow read: if isMember(groupId);
+
+      allow create: if isValidReplacementSelfieUpload(groupId, weekKey, fileName);
+
+      allow update, delete: if false;
+    }
+
+    match /groups/{groupId}/weeks/{weekKey}/replacements/thumbs/{fileName} {
+      allow read: if isMember(groupId);
+
+      allow create: if isValidReplacementSelfieThumbnailUpload(groupId, weekKey, fileName);
 
       allow update, delete: if false;
     }

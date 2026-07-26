@@ -99,6 +99,38 @@ function configuredSuggestionRecipientEmail() {
   return defaultProjectEmail;
 }
 
+function configuredSuggestionSenderEmail() {
+  const defaultProjectEmail = "sundayselfie2026@gmail.com";
+  const envEmail = cleanOptionalEmail(
+    process.env.SUNDAY_SELFIE_FROM_EMAIL || process.env.SUGGESTIONS_FROM_EMAIL
+  );
+  if (envEmail) return envEmail;
+
+  let firebaseConfig = {};
+  try {
+    firebaseConfig = functions.config ? functions.config() : {};
+  } catch (_) {
+    firebaseConfig = {};
+  }
+  const candidates = [
+    firebaseConfig
+      && firebaseConfig.sunday_selfie
+      && firebaseConfig.sunday_selfie.from_email,
+    firebaseConfig && firebaseConfig.sunday && firebaseConfig.sunday.from_email,
+    firebaseConfig
+      && firebaseConfig.suggestions
+      && firebaseConfig.suggestions.from_email,
+    firebaseConfig && firebaseConfig.email && firebaseConfig.email.suggestions_from,
+  ];
+
+  for (const candidate of candidates) {
+    const clean = cleanOptionalEmail(candidate);
+    if (clean) return clean;
+  }
+
+  return defaultProjectEmail;
+}
+
 function escapeHtml(value) {
   return String(value)
     .replace(/&/g, "&amp;")
@@ -152,6 +184,18 @@ function createInviteCode() {
 
 function createInviteLink(inviteCode) {
   return `https://sundayselfie.app/j/${inviteCode}`;
+}
+
+function cleanInviteCode(value) {
+  return cleanString(value, "").toUpperCase();
+}
+
+function isValidInviteCode(value) {
+  return typeof value === "string" && /^[A-Z2-9]{10}$/.test(value);
+}
+
+function isValidInviteCodeForGroup(inviteCode, groupId) {
+  return isValidInviteCode(inviteCode) || inviteCode === `TEMP-${groupId}`;
 }
 
 function madridDateParts(date = new Date()) {
@@ -390,6 +434,7 @@ const TENOR_DEFAULT_LIMIT = 24;
 const TENOR_MAX_LIMIT = 36;
 const TENOR_MAX_QUERY_LENGTH = 80;
 const TENOR_MAX_POSITION_LENGTH = 180;
+const TENOR_SEARCHES_PER_HOUR_LIMIT = 240;
 
 function configuredTenorApiKey() {
   const envKey = process.env.TENOR_API_KEY || process.env.SUNDAY_TENOR_API_KEY;
@@ -397,7 +442,12 @@ function configuredTenorApiKey() {
     return envKey.trim();
   }
 
-  const firebaseConfig = functions.config ? functions.config() : {};
+  let firebaseConfig = {};
+  try {
+    firebaseConfig = functions.config ? functions.config() : {};
+  } catch (_) {
+    firebaseConfig = {};
+  }
   const configKey = firebaseConfig
     && firebaseConfig.tenor
     && firebaseConfig.tenor.key;
@@ -506,45 +556,89 @@ async function fetchTenorGifs({apiKey, query, pos, limit}) {
 }
 const RECENT_AUTH_MAX_AGE_SECONDS = 15 * 60;
 
-exports.buscarGifsTenor = callable(async (data, context) => {
-  if (!context.auth) {
-    throw new functions.https.HttpsError(
-      "unauthenticated",
-      "Usuario no autenticado"
+function formatUtcHourKey(date) {
+  return [
+    date.getUTCFullYear(),
+    String(date.getUTCMonth() + 1).padStart(2, "0"),
+    String(date.getUTCDate()).padStart(2, "0"),
+    String(date.getUTCHours()).padStart(2, "0"),
+  ].join("-");
+}
+
+async function assertTenorSearchRateLimit(firestore, uid) {
+  const hourKey = formatUtcHourKey(new Date());
+  const rateLimitRef = userRateLimitRef(
+    firestore,
+    uid,
+    "tenorGifSearches",
+    hourKey
+  );
+
+  await firestore.runTransaction(async (transaction) => {
+    const rateLimitDoc = await transaction.get(rateLimitRef);
+    assertRateLimitAvailable(
+      rateLimitDoc,
+      TENOR_SEARCHES_PER_HOUR_LIMIT,
+      "Has buscado muchos GIFs en poco tiempo. Prueba otra vez en unos minutos"
     );
-  }
+    writeRateLimitIncrement(transaction, rateLimitRef, rateLimitDoc, {
+      bucket: "tenorGifSearches",
+      hourKey,
+      limit: TENOR_SEARCHES_PER_HOUR_LIMIT,
+    });
+  });
+}
 
-  const query = cleanTenorString(data && data.query, TENOR_MAX_QUERY_LENGTH + 1);
-  if (query.length > TENOR_MAX_QUERY_LENGTH) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "La búsqueda es demasiado larga"
+exports.buscarGifsTenor = callable(
+  {enforceAppCheck: false},
+  async (data, context) => {
+    if (!context.auth) {
+      throw new functions.https.HttpsError(
+        "unauthenticated",
+        "Usuario no autenticado"
+      );
+    }
+
+    const query = cleanTenorString(
+      data && data.query,
+      TENOR_MAX_QUERY_LENGTH + 1
     );
-  }
+    if (query.length > TENOR_MAX_QUERY_LENGTH) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "La búsqueda es demasiado larga"
+      );
+    }
 
-  const pos = cleanTenorString(data && data.pos, TENOR_MAX_POSITION_LENGTH + 1);
-  if (pos.length > TENOR_MAX_POSITION_LENGTH) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "La paginación de GIFs no es válida"
+    const pos = cleanTenorString(
+      data && data.pos,
+      TENOR_MAX_POSITION_LENGTH + 1
     );
+    if (pos.length > TENOR_MAX_POSITION_LENGTH) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "La paginación de GIFs no es válida"
+      );
+    }
+
+    const rawLimit = data && data.limit;
+    const limit = Number.isInteger(rawLimit)
+      ? Math.min(Math.max(rawLimit, 1), TENOR_MAX_LIMIT)
+      : TENOR_DEFAULT_LIMIT;
+    const apiKey = configuredTenorApiKey();
+
+    if (!apiKey) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Tenor no está configurado"
+      );
+    }
+
+    await assertTenorSearchRateLimit(admin.firestore(), context.auth.uid);
+
+    return fetchTenorGifs({apiKey, query, pos, limit});
   }
-
-  const rawLimit = data && data.limit;
-  const limit = Number.isInteger(rawLimit)
-    ? Math.min(Math.max(rawLimit, 1), TENOR_MAX_LIMIT)
-    : TENOR_DEFAULT_LIMIT;
-  const apiKey = configuredTenorApiKey();
-
-  if (!apiKey) {
-    throw new functions.https.HttpsError(
-      "failed-precondition",
-      "Tenor no está configurado"
-    );
-  }
-
-  return fetchTenorGifs({apiKey, query, pos, limit});
-});
+);
 
 exports.crearGrupo = callable(async (data, context) => {
   if (!context.auth) {
@@ -710,10 +804,14 @@ exports.registrarSelfie = callable(async (data, context) => {
   const groupId = data && data.groupId;
   const requestedWeekKey = cleanString(data && data.weekKey, "");
   const rewardedAdWatched = data && data.rewardedAdWatched === true;
+  const replaceExisting = data && data.replaceExisting === true;
+  const replacementUploadId = cleanString(data && data.replacementUploadId, "");
 
   if (
     !isValidDocumentId(groupId)
     || (requestedWeekKey && !isValidWeekKey(requestedWeekKey))
+    || (replaceExisting && !/^[0-9]+$/.test(replacementUploadId))
+    || (!replaceExisting && replacementUploadId)
   ) {
     throw new functions.https.HttpsError(
       "invalid-argument",
@@ -727,6 +825,9 @@ exports.registrarSelfie = callable(async (data, context) => {
   const isLateMondayUpload = weekInfo.isMonday
     && rewardedAdWatched
     && requestedWeekKey === weekInfo.previousWeekKey;
+  const isRewardedReplacement = isRegularSundayUpload
+    && replaceExisting
+    && rewardedAdWatched;
 
   if (!isRegularSundayUpload && !isLateMondayUpload) {
     throw new functions.https.HttpsError(
@@ -735,11 +836,22 @@ exports.registrarSelfie = callable(async (data, context) => {
     );
   }
 
+  if (replaceExisting && !isRewardedReplacement) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Completa el anuncio para reemplazar tu selfie"
+    );
+  }
+
   const authorUid = context.auth.uid;
   const weekKey = isLateMondayUpload ? requestedWeekKey : weekInfo.weekKey;
-  const storagePath = `groups/${groupId}/weeks/${weekKey}/${authorUid}.jpg`;
-  const thumbStoragePath =
-    `groups/${groupId}/weeks/${weekKey}/thumbs/${authorUid}.jpg`;
+  const replacementFileName = `${authorUid}_${replacementUploadId}.jpg`;
+  const storagePath = isRewardedReplacement
+    ? `groups/${groupId}/weeks/${weekKey}/replacements/${replacementFileName}`
+    : `groups/${groupId}/weeks/${weekKey}/${authorUid}.jpg`;
+  const thumbStoragePath = isRewardedReplacement
+    ? `groups/${groupId}/weeks/${weekKey}/replacements/thumbs/${replacementFileName}`
+    : `groups/${groupId}/weeks/${weekKey}/thumbs/${authorUid}.jpg`;
   const bucket = admin.storage().bucket();
   const file = bucket.file(storagePath);
   const [fileExists] = await file.exists();
@@ -755,6 +867,12 @@ exports.registrarSelfie = callable(async (data, context) => {
   const customMetadata = fileMetadata.metadata || {};
   const fileSize = Number(fileMetadata.size || 0);
   const contentType = cleanString(fileMetadata.contentType, "");
+  const validReplacementMetadata = !isRewardedReplacement
+    || (
+      customMetadata.replacement === "true"
+      && customMetadata.rewardedAdWatched === "true"
+      && customMetadata.replacementUploadId === replacementUploadId
+    );
 
   if (
     !contentType.startsWith("image/")
@@ -770,6 +888,7 @@ exports.registrarSelfie = callable(async (data, context) => {
         || customMetadata.rewardedAdWatched !== "true"
       )
     )
+    || !validReplacementMetadata
   ) {
     throw new functions.https.HttpsError(
       "failed-precondition",
@@ -811,6 +930,12 @@ exports.registrarSelfie = callable(async (data, context) => {
           thumbCustomMetadata.lateUpload === "true"
           && thumbCustomMetadata.rewardedAdWatched === "true"
         );
+      const validReplacementThumbMetadata = !isRewardedReplacement
+        || (
+          thumbCustomMetadata.replacement === "true"
+          && thumbCustomMetadata.rewardedAdWatched === "true"
+          && thumbCustomMetadata.replacementUploadId === replacementUploadId
+        );
 
       if (
         thumbContentType === "image/jpeg"
@@ -821,6 +946,7 @@ exports.registrarSelfie = callable(async (data, context) => {
         && thumbCustomMetadata.uid === authorUid
         && thumbCustomMetadata.kind === "selfieThumb"
         && validLateMetadata
+        && validReplacementThumbMetadata
       ) {
         thumbUrl = await getDownloadURL(thumbFile);
         storagePathThumb = thumbStoragePath;
@@ -845,14 +971,11 @@ exports.registrarSelfie = callable(async (data, context) => {
   const firestore = admin.firestore();
   const groupRef = firestore.collection("groups").doc(groupId);
   const memberRef = groupRef.collection("members").doc(authorUid);
+  const membersRef = groupRef.collection("members");
   const weekRef = groupRef.collection("weeks").doc(weekKey);
   const postsRef = weekRef.collection("posts");
   const postRef = postsRef.doc(authorUid);
-  const userGroupRef = firestore
-    .collection("users")
-    .doc(authorUid)
-    .collection("groups")
-    .doc(groupId);
+  let oldStoragePathsToDelete = [];
 
   await firestore.runTransaction(async (transaction) => {
     const [
@@ -860,11 +983,13 @@ exports.registrarSelfie = callable(async (data, context) => {
       memberDoc,
       weekDoc,
       postsSnapshot,
+      membersSnapshot,
     ] = await Promise.all([
       transaction.get(groupRef),
       transaction.get(memberRef),
       transaction.get(weekRef),
       transaction.get(postsRef),
+      transaction.get(membersRef),
     ]);
 
     if (!groupDoc.exists || groupDoc.data().deleted === true) {
@@ -881,7 +1006,11 @@ exports.registrarSelfie = callable(async (data, context) => {
       );
     }
 
-    if (postsSnapshot.docs.some((postDoc) => postDoc.id === authorUid)) {
+    const existingPostDoc = postsSnapshot.docs.find((postDoc) => {
+      return postDoc.id === authorUid;
+    });
+
+    if (existingPostDoc && !isRewardedReplacement) {
       throw new functions.https.HttpsError(
         "already-exists",
         "Ya has publicado tu selfie de esta semana"
@@ -889,6 +1018,25 @@ exports.registrarSelfie = callable(async (data, context) => {
     }
 
     const memberData = memberDoc.data() || {};
+    const existingPostData = existingPostDoc ? existingPostDoc.data() || {} : null;
+
+    if (isRewardedReplacement && !existingPostData) {
+      throw new functions.https.HttpsError(
+        "not-found",
+        "No se encontró una selfie para reemplazar"
+      );
+    }
+
+    if (
+      existingPostData
+      && existingPostData.uid
+      && existingPostData.uid !== authorUid
+    ) {
+      throw new functions.https.HttpsError(
+        "permission-denied",
+        "Solo puedes reemplazar tu propia selfie"
+      );
+    }
 
     if (
       isLateMondayUpload
@@ -903,7 +1051,17 @@ exports.registrarSelfie = callable(async (data, context) => {
     const authorName = cleanString(memberData.effectiveName, "Usuario");
     const authorPhotoUrl = cleanString(memberData.effectivePhotoUrl, null);
     const now = admin.firestore.FieldValue.serverTimestamp();
-    const postCount = postsSnapshot.size + 1;
+    const postCount = isRewardedReplacement
+      ? postsSnapshot.size
+      : postsSnapshot.size + 1;
+
+    if (isRewardedReplacement && existingPostData) {
+      oldStoragePathsToDelete = [
+        `groups/${groupId}/weeks/${weekKey}/${authorUid}.jpg`,
+        cleanString(existingPostData.storagePathFull, null),
+        cleanString(existingPostData.storagePathThumb, null),
+      ].filter((path) => path !== storagePath && path !== storagePathThumb);
+    }
 
     if (weekDoc.exists) {
       transaction.update(weekRef, {
@@ -919,38 +1077,187 @@ exports.registrarSelfie = callable(async (data, context) => {
       });
     }
 
-    transaction.create(postRef, {
-      uid: authorUid,
-      authorName,
-      authorPhotoUrl,
-      createdAt: now,
-      updatedAt: now,
-      imageUrl,
-      thumbUrl,
-      storagePathFull: storagePath,
-      storagePathThumb,
-      hasAnyReactions: false,
-      selfReactionEmoji: null,
-    });
+    if (isRewardedReplacement) {
+      transaction.update(postRef, {
+        uid: authorUid,
+        authorName,
+        authorPhotoUrl,
+        updatedAt: now,
+        replacedAt: now,
+        replacementCount: admin.firestore.FieldValue.increment(1),
+        rewardedReplacementUsed: true,
+        imageUrl,
+        thumbUrl,
+        storagePathFull: storagePath,
+        storagePathThumb,
+      });
+    } else {
+      transaction.create(postRef, {
+        uid: authorUid,
+        authorName,
+        authorPhotoUrl,
+        createdAt: now,
+        updatedAt: now,
+        imageUrl,
+        thumbUrl,
+        storagePathFull: storagePath,
+        storagePathThumb,
+        hasAnyReactions: false,
+        selfReactionEmoji: null,
+      });
+    }
 
-    transaction.set(
-      userGroupRef,
-      {
-        groupId,
-        lastActivityAt: now,
-      },
-      {merge: true}
-    );
+    for (const groupMemberDoc of membersSnapshot.docs) {
+      const memberUserGroupRef = firestore
+        .collection("users")
+        .doc(groupMemberDoc.id)
+        .collection("groups")
+        .doc(groupId);
+
+      transaction.set(
+        memberUserGroupRef,
+        {
+          groupId,
+          lastActivityAt: now,
+          lastSelfieOrChatActivityAt: now,
+        },
+        {merge: true}
+      );
+    }
 
     transaction.update(groupRef, {
       lastActivityAt: now,
+      lastSelfieOrChatActivityAt: now,
     });
   });
+
+  if (oldStoragePathsToDelete.length > 0) {
+    try {
+      await deleteStoragePaths(bucket, oldStoragePathsToDelete);
+    } catch (error) {
+      logger.warn("No se pudieron borrar rutas antiguas de selfie reemplazada", {
+        groupId,
+        weekKey,
+        authorUid,
+        oldStoragePathsToDelete,
+        error,
+      });
+    }
+  }
 
   return {
     success: true,
     groupId,
     weekKey,
+    replaced: isRewardedReplacement,
+  };
+});
+
+exports.resolverInvitacionGrupo = callable(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError(
+      "unauthenticated",
+      "Usuario no autenticado"
+    );
+  }
+
+  const inviteCodeUsed = cleanInviteCode(
+    (data && data.inviteCode) || (data && data.inviteCodeUsed)
+  );
+
+  if (
+    !isValidInviteCode(inviteCodeUsed)
+    && !inviteCodeUsed.startsWith("TEMP-")
+  ) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "Invitación no válida"
+    );
+  }
+
+  const uid = context.auth.uid;
+  const firestore = admin.firestore();
+  let groupId = null;
+  let inviteCodeDoc = null;
+
+  if (isValidInviteCode(inviteCodeUsed)) {
+    inviteCodeDoc = await firestore
+      .collection("inviteCodes")
+      .doc(inviteCodeUsed)
+      .get();
+
+    if (
+      !inviteCodeDoc.exists
+      || inviteCodeDoc.data().active !== true
+      || !isValidDocumentId(inviteCodeDoc.data().groupId)
+    ) {
+      throw new functions.https.HttpsError(
+        "not-found",
+        "Invitación no válida"
+      );
+    }
+
+    groupId = inviteCodeDoc.data().groupId;
+  } else {
+    groupId = inviteCodeUsed.slice("TEMP-".length);
+
+    if (!isValidDocumentId(groupId)) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Invitación no válida"
+      );
+    }
+  }
+
+  const groupRef = firestore.collection("groups").doc(groupId);
+  const memberRef = groupRef.collection("members").doc(uid);
+  const joinRequestRef = groupRef.collection("joinRequests").doc(uid);
+  const [
+    groupDoc,
+    memberDoc,
+    joinRequestDoc,
+  ] = await Promise.all([
+    groupRef.get(),
+    memberRef.get(),
+    joinRequestRef.get(),
+  ]);
+
+  if (!groupDoc.exists || groupDoc.data().deleted === true) {
+    throw new functions.https.HttpsError(
+      "not-found",
+      "El grupo ya no está disponible"
+    );
+  }
+
+  const groupData = groupDoc.data() || {};
+  const activeModernInvite = inviteCodeDoc
+    && inviteCodeDoc.exists
+    && inviteCodeDoc.data().active === true
+    && inviteCodeDoc.data().groupId === groupId;
+  const activeLegacyInvite = inviteCodeUsed === `TEMP-${groupId}`
+    && groupData.inviteCode === inviteCodeUsed;
+
+  if (!activeModernInvite && !activeLegacyInvite) {
+    throw new functions.https.HttpsError(
+      "permission-denied",
+      "Invitación no válida"
+    );
+  }
+
+  const memberCount = Number.isInteger(groupData.memberCount)
+    ? groupData.memberCount
+    : 0;
+
+  return {
+    groupId,
+    name: cleanString(groupData.name, "Grupo").slice(0, 80),
+    memberCount,
+    emoji: cleanString(groupData.emoji, null),
+    colorValue: Number.isInteger(groupData.colorValue)
+      ? groupData.colorValue
+      : DEFAULT_GROUP_COLOR_VALUE,
+    isMember: memberDoc.exists,
+    hasRequest: joinRequestDoc.exists,
   };
 });
 
@@ -963,15 +1270,11 @@ exports.solicitarEntradaGrupo = callable(async (data, context) => {
   }
 
   const groupId = data && data.groupId;
-  const inviteCodeUsed = cleanString(data && data.inviteCodeUsed, "")
-    .toUpperCase();
+  const inviteCodeUsed = cleanInviteCode(data && data.inviteCodeUsed);
 
   if (
     !isValidDocumentId(groupId)
-    || !(
-      /^[A-Z2-9]{10}$/.test(inviteCodeUsed)
-      || inviteCodeUsed === `TEMP-${groupId}`
-    )
+    || !isValidInviteCodeForGroup(inviteCodeUsed, groupId)
   ) {
     throw new functions.https.HttpsError(
       "invalid-argument",
@@ -3424,6 +3727,7 @@ const SUGGESTION_MAIL_COLLECTION = "mail";
 
 async function queueSuggestionEmail(firestore, suggestion) {
   const recipientEmail = configuredSuggestionRecipientEmail();
+  const senderEmail = configuredSuggestionSenderEmail();
 
   if (!recipientEmail) {
     logger.warn("Sugerencia guardada sin correo de CEO configurado", {
@@ -3457,7 +3761,9 @@ async function queueSuggestionEmail(firestore, suggestion) {
     .collection(SUGGESTION_MAIL_COLLECTION)
     .doc(`suggestion_${suggestion.suggestionId}`)
     .set({
+      from: senderEmail,
       to: [recipientEmail],
+      replyTo: suggestion.authorEmail || senderEmail,
       message: {
         subject,
         text: textBody,
@@ -3474,91 +3780,95 @@ async function queueSuggestionEmail(firestore, suggestion) {
   return true;
 }
 
-exports.enviarSugerencia = callable(async (data, context) => {
-  if (!context.auth) {
-    throw new functions.https.HttpsError(
-      "unauthenticated",
-      "Usuario no autenticado"
+exports.enviarSugerencia = callable(
+  {enforceAppCheck: false},
+  async (data, context) => {
+    if (!context.auth) {
+      throw new functions.https.HttpsError(
+        "unauthenticated",
+        "Usuario no autenticado"
+      );
+    }
+
+    const text = cleanString(data && data.text, "");
+    if (text.length < SUGGESTION_MIN_LENGTH) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "Escribe un poco más para enviar la sugerencia"
+      );
+    }
+
+    if (text.length > SUGGESTION_MAX_LENGTH) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "La sugerencia no puede superar 1000 caracteres"
+      );
+    }
+
+    const uid = context.auth.uid;
+    const authorName = truncateString(
+      cleanString(data && data.authorName, "Usuario"),
+      80
+    ) || "Usuario";
+    const tokenEmail = cleanOptionalEmail(
+      context.auth.token && context.auth.token.email
     );
-  }
-
-  const text = cleanString(data && data.text, "");
-  if (text.length < SUGGESTION_MIN_LENGTH) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "Escribe un poco más para enviar la sugerencia"
-    );
-  }
-
-  if (text.length > SUGGESTION_MAX_LENGTH) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "La sugerencia no puede superar 1000 caracteres"
-    );
-  }
-
-  const uid = context.auth.uid;
-  const authorName = truncateString(
-    cleanString(data && data.authorName, "Usuario"),
-    80
-  ) || "Usuario";
-  const tokenEmail = cleanOptionalEmail(
-    context.auth.token && context.auth.token.email
-  );
-  const clientEmail = cleanOptionalEmail(data && data.authorEmail);
-  const authorEmail = tokenEmail || clientEmail;
-  const firestore = admin.firestore();
-  const suggestionRef = firestore.collection("suggestions").doc();
-  const suggestionData = {
-    uid,
-    authorName,
-    authorEmail: authorEmail || null,
-    text,
-    status: "new",
-    source: "profile",
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  };
-
-  await suggestionRef.set(suggestionData);
-
-  let emailStatus = "not_configured";
-  try {
-    const emailQueued = await queueSuggestionEmail(firestore, {
-      suggestionId: suggestionRef.id,
+    const clientEmail = cleanOptionalEmail(data && data.authorEmail);
+    const authorEmail = tokenEmail || clientEmail;
+    const firestore = admin.firestore();
+    const suggestionRef = firestore.collection("suggestions").doc();
+    const suggestionData = {
       uid,
       authorName,
-      authorEmail,
+      authorEmail: authorEmail || null,
       text,
-    });
-    emailStatus = emailQueued ? "queued" : "not_configured";
-  } catch (error) {
-    emailStatus = "failed";
-    logger.error("No se pudo poner en cola el correo de sugerencia", {
+      status: "new",
+      source: "profile",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await suggestionRef.set(suggestionData);
+
+    let emailStatus = "not_configured";
+    try {
+      const emailQueued = await queueSuggestionEmail(firestore, {
+        suggestionId: suggestionRef.id,
+        uid,
+        authorName,
+        authorEmail,
+        text,
+      });
+      emailStatus = emailQueued ? "queued" : "not_configured";
+    } catch (error) {
+      emailStatus = "failed";
+      logger.error("No se pudo poner en cola el correo de sugerencia", {
+        suggestionId: suggestionRef.id,
+        uid,
+        error,
+      });
+    }
+
+    await suggestionRef.set({
+      emailQueued: emailStatus === "queued",
+      emailStatus,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+
+    if (emailStatus !== "queued") {
+      logger.warn("Sugerencia guardada sin correo en cola", {
+        suggestionId: suggestionRef.id,
+        uid,
+        emailStatus,
+      });
+    }
+
+    return {
+      success: true,
       suggestionId: suggestionRef.id,
-      uid,
-      error,
-    });
+      emailStatus,
+    };
   }
-
-  await suggestionRef.set({
-    emailQueued: emailStatus === "queued",
-    emailStatus,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  }, {merge: true});
-
-  if (emailStatus !== "queued") {
-    throw new functions.https.HttpsError(
-      "internal",
-      "La sugerencia se guardó, pero no se pudo preparar el correo"
-    );
-  }
-
-  return {
-    success: true,
-    suggestionId: suggestionRef.id,
-    emailStatus,
-  };
-});
+);
 
 const SUNDAY_TIME_REGION = "europe-west1";
 const SUNDAY_TIME_ZONE = "Europe/Madrid";
@@ -4188,6 +4498,42 @@ exports.sundayTimeReminder = onSchedule(
 
 
 const NEW_SELFIE_REGION = "europe-southwest1";
+
+async function markSelfieOrChatActivityForGroup(firestore, groupId) {
+  const groupRef = firestore.collection("groups").doc(groupId);
+  const membersSnapshot = await groupRef.collection("members").get();
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const batch = firestore.batch();
+
+  batch.set(
+    groupRef,
+    {
+      lastActivityAt: now,
+      lastSelfieOrChatActivityAt: now,
+    },
+    {merge: true}
+  );
+
+  for (const memberDoc of membersSnapshot.docs) {
+    const userGroupRef = firestore
+      .collection("users")
+      .doc(memberDoc.id)
+      .collection("groups")
+      .doc(groupId);
+
+    batch.set(
+      userGroupRef,
+      {
+        groupId,
+        lastActivityAt: now,
+        lastSelfieOrChatActivityAt: now,
+      },
+      {merge: true}
+    );
+  }
+
+  await batch.commit();
+}
 
 async function loadGroupRecipientTokens(
   groupId,
@@ -4824,6 +5170,17 @@ exports.notifyChatMessage = onDocumentCreated(
 
     if (groupData.deleted === true) {
       return;
+    }
+
+    try {
+      await markSelfieOrChatActivityForGroup(admin.firestore(), groupId);
+    } catch (error) {
+      logger.error("No se pudo marcar actividad de chat del grupo", {
+        groupId,
+        weekKey,
+        messageId,
+        error,
+      });
     }
 
     await sendChatMessageNotification({

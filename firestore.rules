@@ -39,9 +39,11 @@ service cloud.firestore {
     }
 
     function isSundayUploadWindowOpen() {
-      return request.time.dayOfWeek() == 7
-        && request.time.time() >= duration.time(0, 0, 0, 0)
-        && request.time.time() <= duration.time(23, 59, 59, 999000000);
+      return (
+          request.time.dayOfWeek() == 6
+          && request.time.time() >= duration.time(22, 0, 0, 0)
+        )
+        || request.time.dayOfWeek() == 7;
     }
 
     function validWeekDocument(groupId, weekKey) {
@@ -270,10 +272,7 @@ service cloud.firestore {
     match /groups/{groupId} {
 
       allow get: if isSignedIn()
-        && (
-          isMember(groupId, uid())
-          || resource.data.deleted != true
-        );
+        && isMember(groupId, uid());
 
       allow list: if false;
 

@@ -34,6 +34,17 @@ Analisis de Flutter:
 ~/development/flutter_clean/bin/flutter analyze
 ```
 
+Ejecucion en Flutter Web para el navegador integrado de Codex:
+
+```bash
+flutter pub get
+flutter run -d web-server --web-hostname 0.0.0.0 --web-port 8080
+```
+
+Despues abre http://localhost:8080 en el navegador integrado de Codex. No uses
+Android Studio, emulador Android ni dispositivo movil para esta forma de
+ejecucion salvo que se pida explicitamente.
+
 Pruebas de Flutter:
 
 ```bash
