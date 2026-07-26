@@ -27,3 +27,13 @@ flutter pub get
 echo "Installing iOS pods..."
 cd "$REPO_ROOT/ios"
 pod install --repo-update
+
+echo "Adding compatibility header for Swift-only camera plugin..."
+mkdir -p "$REPO_ROOT/ios/Pods/Headers/Public/camera_avfoundation"
+cat > "$REPO_ROOT/ios/Pods/Headers/Public/camera_avfoundation/CameraPlugin.h" <<'EOF'
+#import <Flutter/Flutter.h>
+
+@interface CameraPlugin : NSObject <FlutterPlugin>
++ (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar>*)registrar;
+@end
+EOF
