@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+echo "Preparing Flutter project for Xcode Cloud..."
+
+REPO_ROOT="${CI_PRIMARY_REPOSITORY_PATH:-$(cd "$(dirname "$0")/../.." && pwd)}"
+cd "$REPO_ROOT"
+
+if [ ! -d "$HOME/flutter" ]; then
+  echo "Installing Flutter stable..."
+  git clone https://github.com/flutter/flutter.git --depth 1 -b stable "$HOME/flutter"
+fi
+
+export PATH="$HOME/flutter/bin:$PATH"
+
+flutter --version
+flutter precache --ios
+flutter pub get
+
+echo "Installing iOS pods..."
+cd "$REPO_ROOT/ios"
+pod install --repo-update
