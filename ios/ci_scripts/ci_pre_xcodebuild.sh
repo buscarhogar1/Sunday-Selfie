@@ -13,13 +13,4 @@ fi
 echo "Patching Flutter xcconfig files with explicit Pods build settings..."
 REPO_ROOT="$REPO_ROOT" ruby "$REPO_ROOT/ios/ci_scripts/patch_runner_pods_settings.rb"
 
-echo "Prebuilding CocoaPods targets so Swift plugin modules are available..."
-cd "$REPO_ROOT/ios"
-xcodebuild \
-  -project Pods/Pods.xcodeproj \
-  -target Pods-Runner \
-  -configuration Release \
-  -sdk iphoneos \
-  -destination "generic/platform=iOS" \
-  CODE_SIGNING_ALLOWED=NO \
-  build
+echo "Skipping manual Pods prebuild; Xcode will build Pods during archive."
