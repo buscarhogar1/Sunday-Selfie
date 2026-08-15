@@ -21,10 +21,14 @@ fi
 export PATH="$HOME/flutter/bin:$PATH"
 
 flutter --version
+echo "Disabling Flutter Swift Package Manager integration for Xcode Cloud..."
+flutter config --no-enable-swift-package-manager
+rm -rf ios/Runner.xcodeproj/project.xcworkspace/xcshareddata/swiftpm
+
 flutter precache --ios
 flutter pub get
 
-echo "Generating Flutter iOS build configuration..."
+echo "Generating Flutter iOS build configuration with CocoaPods..."
 flutter build ios --release --config-only --no-codesign
 
 echo "Installing iOS pods..."
