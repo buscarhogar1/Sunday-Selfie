@@ -34,6 +34,11 @@ add_flutter_plugin_header() {
   class_name="$3"
   header_path="$REPO_ROOT/ios/Pods/Headers/Public/$module_name/$header_name"
 
+  if [ -f "$header_path" ]; then
+    echo "Keeping existing public header for $module_name/$header_name"
+    return 0
+  fi
+
   mkdir -p "$(dirname "$header_path")"
   cat > "$header_path" <<EOF
 #import <Flutter/Flutter.h>
@@ -53,8 +58,6 @@ add_flutter_plugin_header "firebase_auth" "FLTFirebaseAuthPlugin.h" "FLTFirebase
 add_flutter_plugin_header "firebase_core" "FLTFirebaseCorePlugin.h" "FLTFirebaseCorePlugin"
 add_flutter_plugin_header "firebase_messaging" "FLTFirebaseMessagingPlugin.h" "FLTFirebaseMessagingPlugin"
 add_flutter_plugin_header "firebase_storage" "FLTFirebaseStoragePlugin.h" "FLTFirebaseStoragePlugin"
-add_flutter_plugin_header "google_mlkit_commons" "GoogleMlKitCommonsPlugin.h" "GoogleMlKitCommonsPlugin"
-add_flutter_plugin_header "google_mlkit_face_detection" "GoogleMlKitFaceDetectionPlugin.h" "GoogleMlKitFaceDetectionPlugin"
 add_flutter_plugin_header "google_mobile_ads" "FLTGoogleMobileAdsPlugin.h" "FLTGoogleMobileAdsPlugin"
 add_flutter_plugin_header "google_sign_in_ios" "FLTGoogleSignInPlugin.h" "FLTGoogleSignInPlugin"
 add_flutter_plugin_header "image_picker_ios" "FLTImagePickerPlugin.h" "FLTImagePickerPlugin"
