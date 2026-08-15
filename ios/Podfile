@@ -48,6 +48,7 @@ post_install do |installer|
       config.build_settings['OTHER_SWIFT_FLAGS'] = flags
       config.build_settings['SWIFT_ENABLE_EXPLICIT_MODULES'] = 'NO'
       config.build_settings['_EXPERIMENTAL_SWIFT_EXPLICIT_MODULES'] = 'NO'
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.5'
     end
   end
 end

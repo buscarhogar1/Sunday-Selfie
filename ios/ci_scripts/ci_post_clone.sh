@@ -31,6 +31,19 @@ flutter pub get
 echo "Generating Flutter iOS build configuration with CocoaPods..."
 flutter build ios --release --config-only --no-codesign
 
+echo "Forcing iOS deployment target to 15.5..."
+for xcconfig in \
+  ios/Flutter/Debug.xcconfig \
+  ios/Flutter/Release.xcconfig \
+  ios/Flutter/Profile.xcconfig
+do
+  if [ -f "$xcconfig" ]; then
+    grep -v '^IPHONEOS_DEPLOYMENT_TARGET=' "$xcconfig" > "$xcconfig.tmp" || true
+    printf '\nIPHONEOS_DEPLOYMENT_TARGET=15.5\n' >> "$xcconfig.tmp"
+    mv "$xcconfig.tmp" "$xcconfig"
+  fi
+done
+
 echo "Installing iOS pods..."
 cd "$REPO_ROOT/ios"
 pod install --repo-update
