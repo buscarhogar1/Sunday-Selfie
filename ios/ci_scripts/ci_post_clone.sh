@@ -24,6 +24,9 @@ flutter --version
 flutter precache --ios
 flutter pub get
 
+echo "Generating Flutter iOS build configuration..."
+flutter build ios --release --config-only --no-codesign
+
 echo "Installing iOS pods..."
 cd "$REPO_ROOT/ios"
 pod install --repo-update

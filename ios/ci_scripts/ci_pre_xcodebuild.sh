@@ -3,7 +3,8 @@ set -e
 
 REPO_ROOT="${CI_PRIMARY_REPOSITORY_PATH:-$(cd "$(dirname "$0")/../.." && pwd)}"
 
-if [ ! -f "$REPO_ROOT/ios/Flutter/Generated.xcconfig" ] || [ ! -d "$REPO_ROOT/ios/Pods" ]; then
+if [ ! -f "$REPO_ROOT/ios/Flutter/Generated.xcconfig" ] || \
+  [ ! -f "$REPO_ROOT/ios/Pods/Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig" ]; then
   echo "Flutter or Pods files are missing. Preparing project before xcodebuild..."
   "$REPO_ROOT/ios/ci_scripts/ci_post_clone.sh"
 else
