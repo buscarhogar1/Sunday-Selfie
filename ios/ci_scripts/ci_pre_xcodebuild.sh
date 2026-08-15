@@ -7,10 +7,5 @@ if [ ! -f "$REPO_ROOT/ios/Flutter/Generated.xcconfig" ] || [ ! -d "$REPO_ROOT/io
   echo "Flutter or Pods files are missing. Preparing project before xcodebuild..."
   "$REPO_ROOT/ios/ci_scripts/ci_post_clone.sh"
 else
-  echo "Flutter and Pods files are ready."
+  echo "Flutter and Pods files are ready for Xcode."
 fi
-
-echo "Patching CocoaPods xcconfig files with Flutter build settings..."
-REPO_ROOT="$REPO_ROOT" ruby "$REPO_ROOT/ios/ci_scripts/patch_runner_pods_settings.rb"
-
-echo "Skipping manual Pods prebuild; Xcode will build Pods during archive."
