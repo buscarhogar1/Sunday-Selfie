@@ -2,6 +2,7 @@ const functions = require("firebase-functions");
 const {setGlobalOptions} = require("firebase-functions/v2");
 const {onSchedule} = require("firebase-functions/v2/scheduler");
 const {onDocumentCreated} = require("firebase-functions/v2/firestore");
+const {defineSecret} = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const admin = require("firebase-admin");
 const {getDownloadURL} = require("firebase-admin/storage");
@@ -429,15 +430,17 @@ function writeRateLimitIncrement(transaction, rateLimitRef, rateLimitDoc, data) 
   );
 }
 
-const TENOR_CLIENT_KEY = "sunday_selfie_chat";
-const TENOR_DEFAULT_LIMIT = 24;
-const TENOR_MAX_LIMIT = 36;
-const TENOR_MAX_QUERY_LENGTH = 80;
-const TENOR_MAX_POSITION_LENGTH = 180;
-const TENOR_SEARCHES_PER_HOUR_LIMIT = 240;
+const GIPHY_DEFAULT_LIMIT = 24;
+const GIPHY_MAX_LIMIT = 36;
+const GIPHY_MAX_QUERY_LENGTH = 50;
+const GIPHY_MAX_OFFSET = 4999;
+const GIPHY_SEARCHES_PER_HOUR_LIMIT = 100;
+const GIPHY_API_KEY_SECRET = defineSecret("GIPHY_API_KEY");
 
-function configuredTenorApiKey() {
-  const envKey = process.env.TENOR_API_KEY || process.env.SUNDAY_TENOR_API_KEY;
+function configuredGiphyApiKey() {
+  const envKey = GIPHY_API_KEY_SECRET.value()
+    || process.env.GIPHY_API_KEY
+    || process.env.SUNDAY_GIPHY_API_KEY;
   if (typeof envKey === "string" && envKey.trim().length > 0) {
     return envKey.trim();
   }
@@ -449,79 +452,126 @@ function configuredTenorApiKey() {
     firebaseConfig = {};
   }
   const configKey = firebaseConfig
-    && firebaseConfig.tenor
-    && firebaseConfig.tenor.key;
+    && firebaseConfig.giphy
+    && firebaseConfig.giphy.key;
   return typeof configKey === "string" && configKey.trim().length > 0
     ? configKey.trim()
     : null;
 }
 
-function cleanTenorString(value, maxLength) {
+function cleanGifString(value, maxLength) {
   if (typeof value !== "string") return "";
   return value.trim().slice(0, maxLength);
 }
 
-function tenorMediaUrl(mediaFormats) {
-  if (!mediaFormats || typeof mediaFormats !== "object") return null;
+function isValidGiphyMediaUrl(value) {
+  if (typeof value !== "string") return false;
 
-  for (const format of ["tinygif", "mediumgif", "gif"]) {
-    const media = mediaFormats[format];
-    if (media && typeof media.url === "string" && media.url.trim()) {
-      return media.url.trim();
-    }
+  let uri;
+  try {
+    uri = new URL(value);
+  } catch (_) {
+    return false;
+  }
+
+  return uri.protocol === "https:"
+    && /^media\d*\.giphy\.com$/.test(uri.hostname)
+    && uri.pathname.length > 1;
+}
+
+function giphyMediaUrl(images) {
+  if (!images || typeof images !== "object") return null;
+
+  for (const format of [
+    "fixed_width_downsampled",
+    "fixed_width",
+    "fixed_height_downsampled",
+    "fixed_height",
+    "downsized",
+    "original",
+  ]) {
+    const image = images[format];
+    const url = image && typeof image.url === "string" ? image.url.trim() : "";
+    if (url && isValidGiphyMediaUrl(url)) return url;
   }
 
   return null;
 }
 
-function tenorGifFromResponse(responseObject) {
+function giphyGifFromResponse(responseObject) {
   if (!responseObject || typeof responseObject !== "object") return null;
 
-  const url = tenorMediaUrl(responseObject.media_formats);
+  const url = giphyMediaUrl(responseObject.images);
   if (!url) return null;
 
-  const rawTags = Array.isArray(responseObject.tags) ? responseObject.tags : [];
-  const keywords = rawTags
-    .map((tag) => (typeof tag === "string" ? tag.trim().toLowerCase() : ""))
+  const title = cleanGifString(responseObject.title, 80);
+  const slug = cleanGifString(responseObject.slug, 120);
+  const keywords = `${title} ${slug}`
+    .split(/[\s_-]+/)
+    .map((keyword) => keyword.trim().toLowerCase())
     .filter(Boolean)
     .slice(0, 8);
-  const label = cleanTenorString(
-    responseObject.content_description || responseObject.title || keywords[0] || "GIF",
-    80
-  ) || "GIF";
+  const label = title || keywords[0] || "GIF";
 
   return {
-    id: cleanTenorString(responseObject.id, 80),
+    id: cleanGifString(responseObject.id, 80),
     label,
     url,
     keywords,
   };
 }
 
-async function fetchTenorGifs({apiKey, query, pos, limit}) {
-  const endpoint = query ? "/v2/search" : "/v2/featured";
+function cleanGiphyOffset(value) {
+  const clean = cleanGifString(value, 8);
+  if (clean.length === 0) return 0;
+  if (!/^\d+$/.test(clean)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "La paginación de GIFs no es válida"
+    );
+  }
+
+  return Math.min(Number(clean), GIPHY_MAX_OFFSET);
+}
+
+function nextGiphyOffset(pagination) {
+  if (!pagination || typeof pagination !== "object") return "";
+
+  const offset = Number(pagination.offset);
+  const count = Number(pagination.count);
+  const totalCount = Number(pagination.total_count);
+  if (!Number.isFinite(offset) || !Number.isFinite(count) || count <= 0) {
+    return "";
+  }
+
+  const next = offset + count;
+  if (Number.isFinite(totalCount) && next >= totalCount) return "";
+  if (next > GIPHY_MAX_OFFSET) return "";
+
+  return String(next);
+}
+
+async function fetchGiphyGifs({apiKey, query, offset, limit}) {
+  const endpoint = "/v1/gifs/search";
   const params = new URLSearchParams({
-    key: apiKey,
-    client_key: TENOR_CLIENT_KEY,
+    api_key: apiKey,
+    q: query || "reacciones",
     limit: String(limit),
-    media_filter: "tinygif,mediumgif,gif",
-    contentfilter: "high",
-    locale: "es_ES",
-    country: "ES",
-    ar_range: "all",
+    offset: String(offset),
+    rating: "pg-13",
+    lang: "es",
+    bundle: "messaging_non_clips",
+    country_code: "ES",
   });
 
-  if (query) params.set("q", query);
-  if (pos) params.set("pos", pos);
-
-  const url = `https://tenor.googleapis.com${endpoint}?${params.toString()}`;
+  const url = `https://api.giphy.com${endpoint}?${params.toString()}`;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
 
   try {
     const response = await fetch(url, {signal: controller.signal});
-    if (response.status !== 200 && response.status !== 202) {
-      logger.warn("Tenor respondió con estado no exitoso", {
+    if (response.status !== 200) {
+      logger.warn("GIPHY respondió con estado no exitoso", {
         status: response.status,
       });
       throw new functions.https.HttpsError(
@@ -531,21 +581,21 @@ async function fetchTenorGifs({apiKey, query, pos, limit}) {
     }
 
     const payload = await response.json();
-    const rawResults = Array.isArray(payload.results) ? payload.results : [];
+    const rawResults = Array.isArray(payload.data) ? payload.data : [];
     const seenUrls = new Set();
     const gifs = rawResults
-      .map(tenorGifFromResponse)
+      .map(giphyGifFromResponse)
       .filter((gif) => gif && !seenUrls.has(gif.url) && seenUrls.add(gif.url));
 
     return {
       gifs,
-      next: cleanTenorString(payload.next, TENOR_MAX_POSITION_LENGTH),
-      source: "tenor",
+      next: nextGiphyOffset(payload.pagination),
+      source: "giphy",
     };
   } catch (error) {
     if (error instanceof functions.https.HttpsError) throw error;
 
-    logger.error("Error consultando Tenor", {message: error.message});
+    logger.error("Error consultando GIPHY", {message: error.message});
     throw new functions.https.HttpsError(
       "unavailable",
       "No se pudo cargar la biblioteca de GIFs"
@@ -565,12 +615,12 @@ function formatUtcHourKey(date) {
   ].join("-");
 }
 
-async function assertTenorSearchRateLimit(firestore, uid) {
+async function assertGiphySearchRateLimit(firestore, uid) {
   const hourKey = formatUtcHourKey(new Date());
   const rateLimitRef = userRateLimitRef(
     firestore,
     uid,
-    "tenorGifSearches",
+    "giphyGifSearches",
     hourKey
   );
 
@@ -578,19 +628,19 @@ async function assertTenorSearchRateLimit(firestore, uid) {
     const rateLimitDoc = await transaction.get(rateLimitRef);
     assertRateLimitAvailable(
       rateLimitDoc,
-      TENOR_SEARCHES_PER_HOUR_LIMIT,
+      GIPHY_SEARCHES_PER_HOUR_LIMIT,
       "Has buscado muchos GIFs en poco tiempo. Prueba otra vez en unos minutos"
     );
     writeRateLimitIncrement(transaction, rateLimitRef, rateLimitDoc, {
-      bucket: "tenorGifSearches",
+      bucket: "giphyGifSearches",
       hourKey,
-      limit: TENOR_SEARCHES_PER_HOUR_LIMIT,
+      limit: GIPHY_SEARCHES_PER_HOUR_LIMIT,
     });
   });
 }
 
 exports.buscarGifsTenor = callable(
-  {enforceAppCheck: false},
+  {enforceAppCheck: false, secrets: [GIPHY_API_KEY_SECRET]},
   async (data, context) => {
     if (!context.auth) {
       throw new functions.https.HttpsError(
@@ -599,44 +649,35 @@ exports.buscarGifsTenor = callable(
       );
     }
 
-    const query = cleanTenorString(
+    const query = cleanGifString(
       data && data.query,
-      TENOR_MAX_QUERY_LENGTH + 1
+      GIPHY_MAX_QUERY_LENGTH + 1
     );
-    if (query.length > TENOR_MAX_QUERY_LENGTH) {
+    if (query.length > GIPHY_MAX_QUERY_LENGTH) {
       throw new functions.https.HttpsError(
         "invalid-argument",
         "La búsqueda es demasiado larga"
       );
     }
 
-    const pos = cleanTenorString(
-      data && data.pos,
-      TENOR_MAX_POSITION_LENGTH + 1
-    );
-    if (pos.length > TENOR_MAX_POSITION_LENGTH) {
-      throw new functions.https.HttpsError(
-        "invalid-argument",
-        "La paginación de GIFs no es válida"
-      );
-    }
+    const offset = cleanGiphyOffset(data && data.pos);
 
     const rawLimit = data && data.limit;
     const limit = Number.isInteger(rawLimit)
-      ? Math.min(Math.max(rawLimit, 1), TENOR_MAX_LIMIT)
-      : TENOR_DEFAULT_LIMIT;
-    const apiKey = configuredTenorApiKey();
+      ? Math.min(Math.max(rawLimit, 1), GIPHY_MAX_LIMIT)
+      : GIPHY_DEFAULT_LIMIT;
+    const apiKey = configuredGiphyApiKey();
 
     if (!apiKey) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        "Tenor no está configurado"
+        "GIPHY no está configurado"
       );
     }
 
-    await assertTenorSearchRateLimit(admin.firestore(), context.auth.uid);
+    await assertGiphySearchRateLimit(admin.firestore(), context.auth.uid);
 
-    return fetchTenorGifs({apiKey, query, pos, limit});
+    return fetchGiphyGifs({apiKey, query, offset, limit});
   }
 );
 
@@ -793,7 +834,10 @@ exports.crearGrupo = callable(async (data, context) => {
   return result;
 });
 
-exports.registrarSelfie = callable(async (data, context) => {
+exports.registrarSelfie = callable({enforceAppCheck: false}, async (
+  data,
+  context
+) => {
   if (!context.auth) {
     throw new functions.https.HttpsError(
       "unauthenticated",

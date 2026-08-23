@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "app.sundayselfie",
+      "sha256_cert_fingerprints": [
+        "C2:7E:F9:03:CF:6D:C6:8C:03:BF:74:7E:30:A0:BA:F9:82:DF:F2:7D:F3:36:8D:86:58:F0:24:0E:00:AA:F6:C3"
+      ]
+    }
+  }
+]

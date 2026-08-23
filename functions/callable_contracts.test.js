@@ -240,7 +240,7 @@ test("suggestions validate text before accessing Firestore", async () => {
   );
 });
 
-test("GIF search validates arguments before calling Tenor", async () => {
+test("GIF search validates arguments before calling the GIF provider", async () => {
   await assert.rejects(
     () => callableFunctions.buscarGifsTenor.run({
       auth: {uid: "member-user", token: {}},
@@ -252,18 +252,18 @@ test("GIF search validates arguments before calling Tenor", async () => {
   await assert.rejects(
     () => callableFunctions.buscarGifsTenor.run({
       auth: {uid: "member-user", token: {}},
-      data: {pos: "p".repeat(181)},
+      data: {pos: "not-a-number"},
     }),
     (error) => error && error.code === "invalid-argument"
   );
 });
 
-test("GIF search reports missing Tenor config instead of internal errors", async () => {
-  const previousKey = process.env.TENOR_API_KEY;
-  const previousSundayKey = process.env.SUNDAY_TENOR_API_KEY;
+test("GIF search reports missing GIPHY config instead of internal errors", async () => {
+  const previousKey = process.env.GIPHY_API_KEY;
+  const previousSundayKey = process.env.SUNDAY_GIPHY_API_KEY;
   const originalConfig = functions.config;
-  delete process.env.TENOR_API_KEY;
-  delete process.env.SUNDAY_TENOR_API_KEY;
+  delete process.env.GIPHY_API_KEY;
+  delete process.env.SUNDAY_GIPHY_API_KEY;
   functions.config = () => {
     throw new Error("config unavailable");
   };
@@ -276,23 +276,32 @@ test("GIF search reports missing Tenor config instead of internal errors", async
       }),
       (error) => {
         assert.equal(error.code, "failed-precondition");
-        assert.match(error.message, /Tenor no está configurado/);
+        assert.match(error.message, /GIPHY no está configurado/);
         return true;
       }
     );
   } finally {
     functions.config = originalConfig;
     if (previousKey === undefined) {
-      delete process.env.TENOR_API_KEY;
+      delete process.env.GIPHY_API_KEY;
     } else {
-      process.env.TENOR_API_KEY = previousKey;
+      process.env.GIPHY_API_KEY = previousKey;
     }
     if (previousSundayKey === undefined) {
-      delete process.env.SUNDAY_TENOR_API_KEY;
+      delete process.env.SUNDAY_GIPHY_API_KEY;
     } else {
-      process.env.SUNDAY_TENOR_API_KEY = previousSundayKey;
+      process.env.SUNDAY_GIPHY_API_KEY = previousSundayKey;
     }
   }
+});
+
+test("GIF search declares the GIPHY API key secret for deployment", () => {
+  const secrets =
+    callableFunctions.buscarGifsTenor.__endpoint.secretEnvironmentVariables;
+
+  assert.ok(
+    secrets.some((secret) => secret && secret.key === "GIPHY_API_KEY")
+  );
 });
 
 class FakeDocumentSnapshot {
@@ -531,37 +540,42 @@ async function withFakeFirestore(fakeFirestore, callback) {
   }
 }
 
-test("GIF search proxies Tenor for authenticated users and rate limits calls", async (t) => {
-  const previousKey = process.env.TENOR_API_KEY;
-  process.env.TENOR_API_KEY = "test-tenor-key";
+test("GIF search proxies GIPHY for authenticated users and rate limits calls", async (t) => {
+  const previousKey = process.env.GIPHY_API_KEY;
+  process.env.GIPHY_API_KEY = "test-giphy-key";
   let fetchCalls = 0;
 
   t.mock.method(global, "fetch", async (url) => {
     fetchCalls += 1;
     const parsed = new URL(url);
 
-    assert.equal(parsed.origin, "https://tenor.googleapis.com");
-    assert.equal(parsed.pathname, "/v2/search");
-    assert.equal(parsed.searchParams.get("key"), "test-tenor-key");
+    assert.equal(parsed.origin, "https://api.giphy.com");
+    assert.equal(parsed.pathname, "/v1/gifs/search");
+    assert.equal(parsed.searchParams.get("api_key"), "test-giphy-key");
     assert.equal(parsed.searchParams.get("q"), "hola");
     assert.equal(parsed.searchParams.get("limit"), "12");
+    assert.equal(parsed.searchParams.get("offset"), "0");
 
     return {
       status: 200,
       json: async () => ({
-        results: [
+        data: [
           {
             id: "gif-1",
-            content_description: "saludo",
-            tags: ["hola", "saludo"],
-            media_formats: {
-              tinygif: {
-                url: "https://media.tenor.com/example/tenor.gif",
+            title: "Saludo feliz GIF",
+            slug: "saludo-feliz-gif-1",
+            images: {
+              fixed_width: {
+                url: "https://media1.giphy.com/media/example/giphy.gif",
               },
             },
           },
         ],
-        next: "next-page",
+        pagination: {
+          count: 1,
+          offset: 0,
+          total_count: 3,
+        },
       }),
     };
   });
@@ -580,47 +594,95 @@ test("GIF search proxies Tenor for authenticated users and rate limits calls", a
       gifs: [
         {
           id: "gif-1",
-          label: "saludo",
-          url: "https://media.tenor.com/example/tenor.gif",
-          keywords: ["hola", "saludo"],
+          label: "Saludo feliz GIF",
+          url: "https://media1.giphy.com/media/example/giphy.gif",
+          keywords: ["saludo", "feliz", "gif", "saludo", "feliz", "gif", "1"],
         },
       ],
-      next: "next-page",
-      source: "tenor",
+      next: "1",
+      source: "giphy",
     });
 
     const rateLimitDocs = fakeFirestore.documentsUnder(
       "users/member-user/rateLimits"
     );
     assert.equal(rateLimitDocs.length, 1);
-    assert.equal(rateLimitDocs[0].data.bucket, "tenorGifSearches");
+    assert.equal(rateLimitDocs[0].data.bucket, "giphyGifSearches");
     assert.equal(rateLimitDocs[0].data.count, 1);
-    assert.equal(rateLimitDocs[0].data.limit, 240);
+    assert.equal(rateLimitDocs[0].data.limit, 100);
   } finally {
     if (previousKey === undefined) {
-      delete process.env.TENOR_API_KEY;
+      delete process.env.GIPHY_API_KEY;
     } else {
-      process.env.TENOR_API_KEY = previousKey;
+      process.env.GIPHY_API_KEY = previousKey;
     }
   }
 });
 
-test("GIF search stops before Tenor when the hourly limit is exhausted", async (t) => {
+test("GIF search uses search results for the initial empty query", async (t) => {
+  const previousKey = process.env.GIPHY_API_KEY;
+  process.env.GIPHY_API_KEY = "test-giphy-key";
+
+  t.mock.method(global, "fetch", async (url) => {
+    const parsed = new URL(url);
+
+    assert.equal(parsed.origin, "https://api.giphy.com");
+    assert.equal(parsed.pathname, "/v1/gifs/search");
+    assert.equal(parsed.searchParams.get("q"), "reacciones");
+    assert.equal(parsed.searchParams.get("country_code"), "ES");
+
+    return {
+      status: 200,
+      json: async () => ({
+        data: [],
+        pagination: {
+          count: 0,
+          offset: 0,
+          total_count: 0,
+        },
+      }),
+    };
+  });
+
+  try {
+    const fakeFirestore = new FakeFirestore();
+    const result = await withFakeFirestore(fakeFirestore, () => {
+      return callableFunctions.buscarGifsTenor.run({
+        auth: {uid: "member-user", token: {}},
+        data: {query: ""},
+      });
+    });
+
+    assert.deepEqual(result, {
+      gifs: [],
+      next: "",
+      source: "giphy",
+    });
+  } finally {
+    if (previousKey === undefined) {
+      delete process.env.GIPHY_API_KEY;
+    } else {
+      process.env.GIPHY_API_KEY = previousKey;
+    }
+  }
+});
+
+test("GIF search stops before GIPHY when the hourly limit is exhausted", async (t) => {
   t.mock.timers.enable({
     apis: ["Date"],
     now: new Date("2026-06-14T12:34:00.000Z"),
   });
 
-  const previousKey = process.env.TENOR_API_KEY;
-  process.env.TENOR_API_KEY = "test-tenor-key";
+  const previousKey = process.env.GIPHY_API_KEY;
+  process.env.GIPHY_API_KEY = "test-giphy-key";
   t.mock.method(global, "fetch", async () => {
-    assert.fail("Tenor should not be called after the GIF rate limit");
+    assert.fail("GIPHY should not be called after the GIF rate limit");
   });
 
   try {
     const fakeFirestore = new FakeFirestore({
-      "users/member-user/rateLimits/tenorGifSearches_2026-06-14-12": {
-        count: 240,
+      "users/member-user/rateLimits/giphyGifSearches_2026-06-14-12": {
+        count: 100,
       },
     });
 
@@ -639,9 +701,9 @@ test("GIF search stops before Tenor when the hourly limit is exhausted", async (
     );
   } finally {
     if (previousKey === undefined) {
-      delete process.env.TENOR_API_KEY;
+      delete process.env.GIPHY_API_KEY;
     } else {
-      process.env.TENOR_API_KEY = previousKey;
+      process.env.GIPHY_API_KEY = previousKey;
     }
   }
 });

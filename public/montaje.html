@@ -1,0 +1,1671 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sunday Selfie - Montaje</title>
+    <meta name="description" content="Pagina visual de montaje de Sunday Selfie.">
+    <link rel="icon" href="favicon.png" type="image/png">
+    <style>
+      :root {
+        color-scheme: light;
+        --orange: #f4a261;
+        --orange-dark: #e8884a;
+        --orange-light: #fef3e8;
+        --orange-mid: #fad9b8;
+        --paper: #fffdf9;
+        --surface: #ffffff;
+        --title: #545a60;
+        --text: #6b6b70;
+        --muted: #8b8f94;
+        --border: #f0ebe3;
+        --separator: #f5f0eb;
+        --green: #5f9f80;
+        --teal: #4e9f9a;
+        --blue: #5f83c7;
+        --shadow: rgba(84, 90, 96, 0.13);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--paper);
+        color: var(--text);
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      button {
+        border: 0;
+        cursor: pointer;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.62;
+      }
+
+      img {
+        display: block;
+        max-width: 100%;
+      }
+
+      .montage-app {
+        width: min(100%, 1180px);
+        margin: 0 auto;
+        padding: 18px 16px 30px;
+      }
+
+      .top-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        min-height: 58px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        min-width: 0;
+        gap: 12px;
+      }
+
+      .brand-mark {
+        width: 48px;
+        height: 48px;
+        flex: 0 0 auto;
+        object-fit: contain;
+        border-radius: 15px;
+        background: var(--surface);
+        box-shadow: 0 10px 24px rgba(84, 90, 96, 0.12);
+      }
+
+      .brand-text {
+        min-width: 0;
+      }
+
+      .brand-title,
+      .brand-caption {
+        margin: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .brand-title {
+        color: var(--title);
+        font-size: 18px;
+        font-weight: 900;
+        line-height: 1.05;
+        letter-spacing: 0;
+      }
+
+      .brand-caption {
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .icon-button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        min-width: 44px;
+        min-height: 44px;
+        padding: 0 14px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background: var(--surface);
+        color: var(--title);
+        font-size: 13px;
+        font-weight: 900;
+        letter-spacing: 0;
+        box-shadow: 0 10px 24px rgba(84, 90, 96, 0.08);
+      }
+
+      .icon-button.primary {
+        border-color: var(--orange);
+        background: var(--orange);
+        color: #ffffff;
+        box-shadow: 0 12px 26px rgba(244, 162, 97, 0.26);
+      }
+
+      .icon-button.soft {
+        border-color: var(--orange-mid);
+        background: var(--orange-light);
+        color: var(--orange-dark);
+      }
+
+      .icon {
+        width: 18px;
+        height: 18px;
+        flex: 0 0 auto;
+        stroke: currentColor;
+        stroke-width: 2.2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        fill: none;
+      }
+
+      .group-strip {
+        display: flex;
+        gap: 9px;
+        margin: 13px -16px 0;
+        padding: 3px 16px;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+
+      .group-strip::-webkit-scrollbar,
+      .week-list::-webkit-scrollbar {
+        display: none;
+      }
+
+      .group-button {
+        position: relative;
+        display: grid;
+        place-items: center;
+        width: 56px;
+        height: 56px;
+        flex: 0 0 auto;
+        border-radius: 18px;
+        background: transparent;
+      }
+
+      .group-avatar {
+        display: grid;
+        place-items: center;
+        width: 47px;
+        height: 47px;
+        overflow: hidden;
+        border: 1.6px solid var(--orange-mid);
+        border-radius: 17px;
+        background: var(--avatar-bg, var(--orange-light));
+        color: #ffffff;
+        font-size: 22px;
+        font-weight: 900;
+        letter-spacing: 0;
+        transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+      }
+
+      .group-button[aria-pressed="true"] .group-avatar {
+        border-color: var(--orange-dark);
+        border-width: 2px;
+        transform: scale(1.04);
+        box-shadow: 0 10px 22px rgba(232, 136, 74, 0.22);
+      }
+
+      .week-strip {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 8px -16px 0;
+        padding: 0 16px;
+      }
+
+      .calendar-button {
+        display: grid;
+        place-items: center;
+        width: 38px;
+        height: 32px;
+        flex: 0 0 auto;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: var(--surface);
+        color: var(--orange-dark);
+      }
+
+      .week-list {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+        overflow-x: auto;
+        padding: 4px 0;
+      }
+
+      .week-chip {
+        min-width: max-content;
+        height: 28px;
+        padding: 0 15px;
+        border: 1.2px solid var(--border);
+        border-radius: 999px;
+        background: var(--surface);
+        color: var(--text);
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .week-chip[aria-pressed="true"] {
+        border-color: var(--orange);
+        background: var(--orange);
+        color: #ffffff;
+      }
+
+      .workbench {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 312px;
+        align-items: start;
+        gap: 18px;
+        margin-top: 14px;
+      }
+
+      .poster-shell {
+        display: flex;
+        justify-content: center;
+        min-width: 0;
+      }
+
+      .poster {
+        width: min(100%, 560px);
+        padding: 14px;
+        border: 1px solid rgba(244, 162, 97, 0.18);
+        border-radius: 22px;
+        background: var(--orange-light);
+        box-shadow: 0 18px 50px rgba(120, 80, 30, 0.13);
+      }
+
+      .poster.polaroid {
+        padding: 16px;
+        background: #fff8ed;
+      }
+
+      .poster-head {
+        display: grid;
+        justify-items: center;
+        text-align: center;
+        padding: 2px 8px 8px;
+      }
+
+      .poster-logo {
+        width: 32px;
+        height: 32px;
+        object-fit: contain;
+      }
+
+      .poster-title {
+        max-width: 100%;
+        margin: 9px 0 0;
+        overflow: hidden;
+        color: var(--title);
+        font-size: 21px;
+        font-weight: 900;
+        line-height: 1.08;
+        letter-spacing: 0;
+        text-overflow: ellipsis;
+      }
+
+      .poster-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        max-width: 100%;
+        min-height: 28px;
+        margin-top: 8px;
+        padding: 0 12px;
+        border: 1px solid rgba(244, 162, 97, 0.22);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.78);
+        color: var(--orange-dark);
+        font-size: 11px;
+        font-weight: 900;
+        line-height: 1;
+        letter-spacing: 0;
+        box-shadow: 0 6px 12px rgba(120, 80, 30, 0.06);
+      }
+
+      .poster-rule {
+        width: 46px;
+        height: 2px;
+        margin-top: 10px;
+        border-radius: 999px;
+        background: rgba(244, 162, 97, 0.24);
+      }
+
+      .photo-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        padding-top: 8px;
+      }
+
+      .photo-card {
+        position: relative;
+        min-width: 0;
+        height: var(--tile-height, 176px);
+        overflow: hidden;
+        border-radius: 14px;
+        background: var(--orange-light);
+        touch-action: manipulation;
+        transition: opacity 140ms ease, transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease;
+      }
+
+      .photo-card.is-wide {
+        grid-column: 1 / -1;
+      }
+
+      .photo-card.dragging {
+        opacity: 0.38;
+        transform: scale(0.98);
+      }
+
+      .photo-card.drag-over {
+        outline: 2px solid var(--orange);
+        outline-offset: 2px;
+      }
+
+      .photo-image-wrap {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        border-radius: inherit;
+      }
+
+      .photo-image {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+      }
+
+      .photo-shade {
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(
+          180deg,
+          rgba(35, 35, 35, 0) 48%,
+          rgba(35, 35, 35, 0.52) 100%
+        );
+        pointer-events: none;
+      }
+
+      .photo-name {
+        position: absolute;
+        left: 9px;
+        right: 9px;
+        bottom: 34px;
+        overflow: hidden;
+        color: #ffffff;
+        font-size: 12px;
+        font-weight: 900;
+        letter-spacing: 0;
+        text-shadow: 0 1px 6px rgba(0, 0, 0, 0.24);
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .reactions {
+        position: absolute;
+        right: 7px;
+        bottom: 7px;
+        left: 7px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        min-height: 22px;
+        pointer-events: none;
+      }
+
+      .reaction-pill {
+        display: inline-flex;
+        align-items: center;
+        height: 22px;
+        padding: 0 7px;
+        border: 1px solid rgba(255, 255, 255, 0.34);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.78);
+        color: #564b43;
+        font-size: 11px;
+        font-weight: 900;
+        line-height: 1;
+        letter-spacing: 0;
+        box-shadow: 0 4px 10px rgba(33, 33, 33, 0.08);
+      }
+
+      .tile-tool {
+        position: absolute;
+        top: 7px;
+        right: 7px;
+        display: grid;
+        place-items: center;
+        width: 31px;
+        height: 31px;
+        border: 1px solid rgba(255, 255, 255, 0.52);
+        border-radius: 11px;
+        background: rgba(255, 255, 255, 0.72);
+        color: var(--title);
+        opacity: 0;
+        transition: opacity 120ms ease, transform 120ms ease;
+      }
+
+      .photo-card:hover .tile-tool,
+      .photo-card:focus-within .tile-tool {
+        opacity: 1;
+      }
+
+      .tile-tool:active {
+        transform: scale(0.96);
+      }
+
+      .poster.polaroid .photo-grid {
+        align-items: start;
+        gap: 10px;
+      }
+
+      .poster.polaroid .photo-card {
+        height: auto;
+        min-height: 228px;
+        overflow: visible;
+        padding: 7px 7px 32px;
+        border: 1px solid #f2ece4;
+        border-radius: 8px;
+        background: #ffffff;
+        box-shadow: 0 10px 22px rgba(107, 74, 46, 0.09);
+        transform: rotate(var(--rotation, 0deg));
+      }
+
+      .poster.polaroid .photo-card.dragging {
+        transform: rotate(0deg) scale(0.98);
+      }
+
+      .poster.polaroid .photo-card.is-wide {
+        grid-column: auto;
+      }
+
+      .poster.polaroid .photo-image-wrap {
+        position: relative;
+        inset: auto;
+        height: var(--tile-height, 166px);
+        overflow: hidden;
+        border-radius: 6px;
+        background: var(--orange-light);
+      }
+
+      .poster.polaroid .photo-image {
+        height: 100%;
+      }
+
+      .poster.polaroid .photo-name {
+        bottom: 36px;
+      }
+
+      .poster.polaroid .reactions {
+        right: 7px;
+        bottom: 7px;
+        left: 7px;
+        justify-content: center;
+      }
+
+      .poster.polaroid .reaction-pill {
+        background: #fff8ed;
+        color: var(--title);
+      }
+
+      .poster.polaroid .tile-tool {
+        display: none;
+      }
+
+      .controls {
+        position: sticky;
+        top: 14px;
+        display: grid;
+        gap: 10px;
+        min-width: 0;
+        padding: 12px;
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.88);
+        box-shadow: 0 16px 42px var(--shadow);
+      }
+
+      .control-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+
+      .style-button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        min-width: 0;
+        min-height: 44px;
+        padding: 0 10px;
+        border: 1.1px solid var(--border);
+        border-radius: 999px;
+        background: var(--surface);
+        color: var(--text);
+        font-size: 13px;
+        font-weight: 900;
+        letter-spacing: 0;
+      }
+
+      .style-button[aria-pressed="true"] {
+        border-color: var(--orange);
+        background: rgba(244, 162, 97, 0.12);
+        color: var(--title);
+      }
+
+      .wide-button {
+        width: 100%;
+      }
+
+      .status {
+        min-height: 17px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+        line-height: 1.35;
+        text-align: center;
+      }
+
+      .mobile-actions {
+        display: none;
+      }
+
+      .desktop-text {
+        display: inline;
+      }
+
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      @media (max-width: 860px) {
+        .montage-app {
+          padding-right: 14px;
+          padding-left: 14px;
+        }
+
+        .workbench {
+          grid-template-columns: 1fr;
+        }
+
+        .controls {
+          position: static;
+          order: -1;
+          grid-template-columns: 1fr;
+          border-radius: 16px;
+        }
+
+        .poster {
+          width: min(100%, 520px);
+        }
+      }
+
+      @media (max-width: 520px) {
+        .montage-app {
+          padding: 12px 10px 22px;
+        }
+
+        .brand-mark {
+          width: 42px;
+          height: 42px;
+          border-radius: 13px;
+        }
+
+        .brand-title {
+          font-size: 16px;
+        }
+
+        .brand-caption {
+          font-size: 11px;
+        }
+
+        .desktop-text {
+          display: none;
+        }
+
+        .icon-button {
+          padding: 0 12px;
+        }
+
+        .group-strip,
+        .week-strip {
+          margin-right: -10px;
+          margin-left: -10px;
+          padding-right: 10px;
+          padding-left: 10px;
+        }
+
+        .controls {
+          padding: 10px;
+        }
+
+        .poster {
+          padding: 11px;
+          border-radius: 20px;
+        }
+
+        .poster.polaroid {
+          padding: 12px;
+        }
+
+        .poster-title {
+          font-size: 19px;
+        }
+
+        .photo-grid {
+          gap: 7px;
+        }
+
+        .photo-card {
+          height: var(--tile-height-mobile, 152px);
+        }
+
+        .photo-name {
+          font-size: 11px;
+          bottom: 32px;
+        }
+
+        .reaction-pill {
+          height: 20px;
+          padding: 0 6px;
+          font-size: 10px;
+        }
+
+        .poster.polaroid .photo-card {
+          min-height: 204px;
+          padding: 6px 6px 30px;
+        }
+
+        .poster.polaroid .photo-image-wrap {
+          height: var(--tile-height-mobile, 148px);
+        }
+
+        .mobile-actions {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 8px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="montage-app">
+      <header class="top-bar">
+        <div class="brand" aria-label="Sunday Selfie">
+          <img class="brand-mark" src="assets/sunday-selfie-icon.png" alt="">
+          <div class="brand-text">
+            <p class="brand-title">Montaje</p>
+            <p class="brand-caption">Sunday Selfie</p>
+          </div>
+        </div>
+        <button class="icon-button soft" id="shuffleButton" type="button">
+          <svg class="icon" aria-hidden="true"><use href="#icon-shuffle"></use></svg>
+          <span class="desktop-text">Mezclar</span>
+          <span class="sr-only">Mezclar fotos</span>
+        </button>
+      </header>
+
+      <nav class="group-strip" id="groupStrip" aria-label="Grupos"></nav>
+
+      <section class="week-strip" aria-label="Semanas">
+        <button class="calendar-button" id="calendarButton" type="button" aria-label="Seleccionar semana">
+          <svg class="icon" aria-hidden="true"><use href="#icon-calendar"></use></svg>
+        </button>
+        <div class="week-list" id="weekList"></div>
+      </section>
+
+      <section class="workbench">
+        <div class="poster-shell">
+          <article class="poster classic" id="poster" aria-label="Montaje Sunday Selfie">
+            <header class="poster-head">
+              <img class="poster-logo" src="assets/sunday-selfie-mark.png" alt="">
+              <h1 class="poster-title" id="posterTitle">Familia</h1>
+              <div class="poster-badge">
+                <svg class="icon" aria-hidden="true"><use href="#icon-calendar"></use></svg>
+                <span id="posterWeek">Domingo 12 julio</span>
+              </div>
+              <div class="poster-rule"></div>
+            </header>
+            <div class="photo-grid" id="photoGrid"></div>
+          </article>
+        </div>
+
+        <aside class="controls" aria-label="Controles del montaje">
+          <div class="control-row">
+            <button class="style-button" id="classicButton" type="button" aria-pressed="true">
+              <svg class="icon" aria-hidden="true"><use href="#icon-grid"></use></svg>
+              <span>Clásico</span>
+            </button>
+            <button class="style-button" id="polaroidButton" type="button" aria-pressed="false">
+              <svg class="icon" aria-hidden="true"><use href="#icon-polaroid"></use></svg>
+              <span>Polaroid</span>
+            </button>
+          </div>
+
+          <button class="icon-button wide-button" id="reactionsButton" type="button">
+            <svg class="icon" aria-hidden="true"><use href="#icon-eye-off"></use></svg>
+            <span>Sin reacciones</span>
+          </button>
+
+          <div class="control-row">
+            <button class="icon-button wide-button" id="addPhotosButton" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#icon-plus-image"></use></svg>
+              <span>Fotos</span>
+            </button>
+            <button class="icon-button primary wide-button" id="downloadButton" type="button">
+              <svg class="icon" aria-hidden="true"><use href="#icon-download"></use></svg>
+              <span>PNG</span>
+            </button>
+          </div>
+
+          <p class="status" id="status" role="status" aria-live="polite"></p>
+        </aside>
+      </section>
+
+      <input class="sr-only" id="photoInput" type="file" accept="image/*" multiple>
+    </main>
+
+    <svg aria-hidden="true" width="0" height="0" style="position:absolute">
+      <symbol id="icon-calendar" viewBox="0 0 24 24">
+        <path d="M8 2v4"></path>
+        <path d="M16 2v4"></path>
+        <rect x="3" y="4" width="18" height="18" rx="4"></rect>
+        <path d="M3 10h18"></path>
+      </symbol>
+      <symbol id="icon-shuffle" viewBox="0 0 24 24">
+        <path d="M16 3h5v5"></path>
+        <path d="M4 20 21 3"></path>
+        <path d="M21 16v5h-5"></path>
+        <path d="M15 15l6 6"></path>
+        <path d="M4 4l5 5"></path>
+      </symbol>
+      <symbol id="icon-grid" viewBox="0 0 24 24">
+        <rect x="3" y="3" width="7" height="8" rx="2"></rect>
+        <rect x="14" y="3" width="7" height="5" rx="2"></rect>
+        <rect x="14" y="12" width="7" height="9" rx="2"></rect>
+        <rect x="3" y="15" width="7" height="6" rx="2"></rect>
+      </symbol>
+      <symbol id="icon-polaroid" viewBox="0 0 24 24">
+        <rect x="5" y="3" width="14" height="18" rx="2"></rect>
+        <rect x="8" y="6" width="8" height="8" rx="1.5"></rect>
+        <path d="M8 17h8"></path>
+      </symbol>
+      <symbol id="icon-eye" viewBox="0 0 24 24">
+        <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"></path>
+        <circle cx="12" cy="12" r="3"></circle>
+      </symbol>
+      <symbol id="icon-eye-off" viewBox="0 0 24 24">
+        <path d="M3 3l18 18"></path>
+        <path d="M10.7 5.1A10.6 10.6 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-2.2 3.2"></path>
+        <path d="M6.2 6.7C3.5 8.6 2 12 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5-1.4"></path>
+        <path d="M9.9 9.9A3 3 0 0 0 14.1 14"></path>
+      </symbol>
+      <symbol id="icon-download" viewBox="0 0 24 24">
+        <path d="M12 3v12"></path>
+        <path d="m7 10 5 5 5-5"></path>
+        <path d="M5 21h14"></path>
+      </symbol>
+      <symbol id="icon-plus-image" viewBox="0 0 24 24">
+        <rect x="3" y="5" width="13" height="14" rx="3"></rect>
+        <path d="m6 15 3-3 2 2 2-3 3 4"></path>
+        <path d="M18 4v6"></path>
+        <path d="M15 7h6"></path>
+      </symbol>
+      <symbol id="icon-expand" viewBox="0 0 24 24">
+        <path d="M8 3H3v5"></path>
+        <path d="M3 3l7 7"></path>
+        <path d="M16 21h5v-5"></path>
+        <path d="M21 21l-7-7"></path>
+      </symbol>
+    </svg>
+
+    <script>
+      const svgToDataUri = (svg) =>
+        `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+
+      const makePortrait = ({
+        name,
+        bgA,
+        bgB,
+        skin,
+        hair,
+        shirt,
+        accent,
+        pattern,
+      }) => {
+        const initials = name
+          .split(" ")
+          .map((part) => part[0])
+          .join("")
+          .slice(0, 2)
+          .toUpperCase();
+
+        const patternMarkup =
+          pattern === "lines"
+            ? `<path d="M-60 330 C 170 235 310 410 540 300 S 880 280 980 130" stroke="${accent}" stroke-width="42" opacity=".20" fill="none"/><path d="M-80 930 C 180 760 380 1010 620 820 S 930 700 1020 840" stroke="#ffffff" stroke-width="54" opacity=".24" fill="none"/>`
+            : pattern === "dots"
+              ? `<circle cx="160" cy="210" r="58" fill="#ffffff" opacity=".26"/><circle cx="730" cy="315" r="86" fill="${accent}" opacity=".20"/><circle cx="185" cy="815" r="96" fill="${accent}" opacity=".18"/><circle cx="770" cy="910" r="54" fill="#ffffff" opacity=".24"/>`
+              : `<path d="M110 230h680v710H110z" fill="#ffffff" opacity=".08"/><path d="M110 410h680M110 590h680M110 770h680M280 230v710M450 230v710M620 230v710" stroke="#ffffff" stroke-width="5" opacity=".16"/>`;
+
+        return svgToDataUri(`
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 1200">
+            <defs>
+              <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+                <stop offset="0%" stop-color="${bgA}"/>
+                <stop offset="100%" stop-color="${bgB}"/>
+              </linearGradient>
+              <linearGradient id="shade" x1="0" x2="0" y1="0" y2="1">
+                <stop offset="0%" stop-color="#111111" stop-opacity="0"/>
+                <stop offset="100%" stop-color="#111111" stop-opacity=".34"/>
+              </linearGradient>
+              <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+                <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#263238" flood-opacity=".18"/>
+              </filter>
+            </defs>
+            <rect width="900" height="1200" fill="url(#bg)"/>
+            ${patternMarkup}
+            <g filter="url(#shadow)">
+              <path d="M194 1070c20-260 124-404 256-404s236 144 256 404H194Z" fill="${shirt}"/>
+              <path d="M300 710c42 54 91 82 150 82s108-28 150-82v174c-43 34-93 51-150 51s-107-17-150-51V710Z" fill="${skin}"/>
+              <circle cx="450" cy="500" r="162" fill="${skin}"/>
+              <path d="M285 470c8-136 82-216 206-216 120 0 195 76 213 199-62-78-145-96-248-62-72 24-124 29-171 79Z" fill="${hair}"/>
+              <path d="M296 493c-18-10-42 7-42 41 0 43 31 71 58 59" fill="${skin}"/>
+              <path d="M604 493c18-10 42 7 42 41 0 43-31 71-58 59" fill="${skin}"/>
+              <circle cx="392" cy="514" r="13" fill="#3f3431"/>
+              <circle cx="508" cy="514" r="13" fill="#3f3431"/>
+              <path d="M392 605c34 34 82 34 116 0" stroke="#8f5145" stroke-width="16" stroke-linecap="round" fill="none"/>
+              <path d="M332 450c30-18 66-21 108-10" stroke="${hair}" stroke-width="30" stroke-linecap="round" fill="none"/>
+            </g>
+            <rect y="760" width="900" height="440" fill="url(#shade)"/>
+            <text x="66" y="1094" fill="#ffffff" font-family="Arial, sans-serif" font-size="78" font-weight="800" letter-spacing="0">${initials}</text>
+          </svg>
+        `);
+      };
+
+      const people = {
+        ana: makePortrait({
+          name: "Ana",
+          bgA: "#f7b267",
+          bgB: "#5f9f80",
+          skin: "#f0b98c",
+          hair: "#4b2f2a",
+          shirt: "#4e9f9a",
+          accent: "#fff3cf",
+          pattern: "lines",
+        }),
+        leo: makePortrait({
+          name: "Leo",
+          bgA: "#8ecae6",
+          bgB: "#5f83c7",
+          skin: "#d69b72",
+          hair: "#2f2b35",
+          shirt: "#f4a261",
+          accent: "#ffdf7e",
+          pattern: "dots",
+        }),
+        mia: makePortrait({
+          name: "Mia",
+          bgA: "#b8d8ba",
+          bgB: "#e8884a",
+          skin: "#f3c5a4",
+          hair: "#5b2b42",
+          shirt: "#5f83c7",
+          accent: "#ffffff",
+          pattern: "grid",
+        }),
+        sara: makePortrait({
+          name: "Sara",
+          bgA: "#f6bd60",
+          bgB: "#84a59d",
+          skin: "#c88d67",
+          hair: "#33251f",
+          shirt: "#6b5b95",
+          accent: "#fef3e8",
+          pattern: "lines",
+        }),
+        nico: makePortrait({
+          name: "Nico",
+          bgA: "#90dbf4",
+          bgB: "#f4978e",
+          skin: "#e5ad83",
+          hair: "#352826",
+          shirt: "#2a9d8f",
+          accent: "#ffffff",
+          pattern: "dots",
+        }),
+        ines: makePortrait({
+          name: "Ines",
+          bgA: "#d0f4de",
+          bgB: "#a9def9",
+          skin: "#f1b98f",
+          hair: "#6a3b2f",
+          shirt: "#e8884a",
+          accent: "#5f9f80",
+          pattern: "grid",
+        }),
+        clara: makePortrait({
+          name: "Clara",
+          bgA: "#ffcfd2",
+          bgB: "#bde0fe",
+          skin: "#efbd97",
+          hair: "#3d2c2e",
+          shirt: "#5f9f80",
+          accent: "#ffffff",
+          pattern: "lines",
+        }),
+        val: makePortrait({
+          name: "Val",
+          bgA: "#b8f2e6",
+          bgB: "#ffa69e",
+          skin: "#c88b68",
+          hair: "#1f2a37",
+          shirt: "#5f83c7",
+          accent: "#f4a261",
+          pattern: "dots",
+        }),
+      };
+
+      const reactions = [
+        ["❤️", "4"],
+        ["😂", "2"],
+        ["🔥", "3"],
+        ["👏", "5"],
+        ["✨", "1"],
+      ];
+
+      const makePost = (id, name, image, height, reactionOffset = 0, wide = false) => ({
+        id,
+        name,
+        image,
+        height,
+        wide,
+        reactions: [
+          reactions[reactionOffset % reactions.length],
+          reactions[(reactionOffset + 2) % reactions.length],
+        ],
+      });
+
+      const groups = [
+        {
+          name: "Familia",
+          avatar: "F",
+          color: "#5f9f80",
+          weeks: [
+            {
+              label: "12 jul",
+              fullLabel: "Domingo 12 julio",
+              posts: [
+                makePost("fam-1", "Ana", people.ana, 176, 0),
+                makePost("fam-2", "Leo", people.leo, 206, 1),
+                makePost("fam-3", "Mia", people.mia, 154, 2, true),
+                makePost("fam-4", "Sara", people.sara, 190, 3),
+                makePost("fam-5", "Nico", people.nico, 164, 4),
+                makePost("fam-6", "Ines", people.ines, 198, 0),
+              ],
+            },
+            {
+              label: "5 jul",
+              fullLabel: "Domingo 5 julio",
+              posts: [
+                makePost("fam-7", "Nico", people.nico, 190, 2),
+                makePost("fam-8", "Ana", people.ana, 166, 0),
+                makePost("fam-9", "Ines", people.ines, 210, 4),
+                makePost("fam-10", "Leo", people.leo, 154, 1),
+                makePost("fam-11", "Mia", people.mia, 180, 3, true),
+              ],
+            },
+            {
+              label: "28 jun",
+              fullLabel: "Domingo 28 junio",
+              posts: [
+                makePost("fam-12", "Sara", people.sara, 204, 3),
+                makePost("fam-13", "Mia", people.mia, 160, 1),
+                makePost("fam-14", "Leo", people.leo, 186, 0),
+                makePost("fam-15", "Ana", people.ana, 156, 2),
+              ],
+            },
+          ],
+        },
+        {
+          name: "Amigas",
+          avatar: "A",
+          color: "#5f83c7",
+          weeks: [
+            {
+              label: "12 jul",
+              fullLabel: "Domingo 12 julio",
+              posts: [
+                makePost("ami-1", "Clara", people.clara, 202, 3),
+                makePost("ami-2", "Val", people.val, 164, 0),
+                makePost("ami-3", "Mia", people.mia, 184, 2),
+                makePost("ami-4", "Ana", people.ana, 152, 1),
+                makePost("ami-5", "Ines", people.ines, 210, 4, true),
+              ],
+            },
+            {
+              label: "5 jul",
+              fullLabel: "Domingo 5 julio",
+              posts: [
+                makePost("ami-6", "Val", people.val, 188, 1),
+                makePost("ami-7", "Clara", people.clara, 158, 3),
+                makePost("ami-8", "Ana", people.ana, 210, 0),
+                makePost("ami-9", "Mia", people.mia, 164, 2),
+              ],
+            },
+          ],
+        },
+        {
+          name: "Equipo",
+          avatar: "E",
+          color: "#4e9f9a",
+          weeks: [
+            {
+              label: "12 jul",
+              fullLabel: "Domingo 12 julio",
+              posts: [
+                makePost("eq-1", "Leo", people.leo, 172, 1),
+                makePost("eq-2", "Nico", people.nico, 204, 4),
+                makePost("eq-3", "Sara", people.sara, 158, 3),
+                makePost("eq-4", "Clara", people.clara, 190, 0),
+                makePost("eq-5", "Val", people.val, 168, 2),
+              ],
+            },
+            {
+              label: "28 jun",
+              fullLabel: "Domingo 28 junio",
+              posts: [
+                makePost("eq-6", "Nico", people.nico, 210, 4, true),
+                makePost("eq-7", "Leo", people.leo, 166, 1),
+                makePost("eq-8", "Clara", people.clara, 188, 0),
+              ],
+            },
+          ],
+        },
+      ];
+
+      const state = {
+        groupIndex: 0,
+        weekIndex: 0,
+        style: "classic",
+        showReactions: true,
+        draggingIndex: null,
+      };
+
+      const refs = {
+        groupStrip: document.getElementById("groupStrip"),
+        weekList: document.getElementById("weekList"),
+        poster: document.getElementById("poster"),
+        posterTitle: document.getElementById("posterTitle"),
+        posterWeek: document.getElementById("posterWeek"),
+        photoGrid: document.getElementById("photoGrid"),
+        classicButton: document.getElementById("classicButton"),
+        polaroidButton: document.getElementById("polaroidButton"),
+        reactionsButton: document.getElementById("reactionsButton"),
+        shuffleButton: document.getElementById("shuffleButton"),
+        downloadButton: document.getElementById("downloadButton"),
+        addPhotosButton: document.getElementById("addPhotosButton"),
+        photoInput: document.getElementById("photoInput"),
+        status: document.getElementById("status"),
+        calendarButton: document.getElementById("calendarButton"),
+      };
+
+      const getCurrentGroup = () => groups[state.groupIndex];
+      const getCurrentWeek = () => getCurrentGroup().weeks[state.weekIndex];
+      const getCurrentPosts = () => getCurrentWeek().posts;
+
+      function renderGroups() {
+        refs.groupStrip.replaceChildren();
+        groups.forEach((group, index) => {
+          const button = document.createElement("button");
+          button.className = "group-button";
+          button.type = "button";
+          button.title = group.name;
+          button.setAttribute("aria-label", group.name);
+          button.setAttribute("aria-pressed", String(index === state.groupIndex));
+          button.addEventListener("click", () => {
+            state.groupIndex = index;
+            state.weekIndex = 0;
+            render();
+          });
+
+          const avatar = document.createElement("span");
+          avatar.className = "group-avatar";
+          avatar.style.setProperty("--avatar-bg", group.color);
+          avatar.textContent = group.avatar;
+          button.append(avatar);
+          refs.groupStrip.append(button);
+        });
+      }
+
+      function renderWeeks() {
+        refs.weekList.replaceChildren();
+        const group = getCurrentGroup();
+        group.weeks.forEach((week, index) => {
+          const button = document.createElement("button");
+          button.className = "week-chip";
+          button.type = "button";
+          button.textContent = week.label;
+          button.setAttribute("aria-pressed", String(index === state.weekIndex));
+          button.addEventListener("click", () => {
+            state.weekIndex = index;
+            render();
+          });
+          refs.weekList.append(button);
+        });
+      }
+
+      function reactionNodes(post) {
+        if (!state.showReactions) return [];
+        return post.reactions.map(([emoji, count]) => {
+          const pill = document.createElement("span");
+          pill.className = "reaction-pill";
+          pill.textContent = `${emoji} ${count}`;
+          return pill;
+        });
+      }
+
+      function renderPhotos() {
+        refs.photoGrid.replaceChildren();
+        const posts = getCurrentPosts();
+        posts.forEach((post, index) => {
+          const card = document.createElement("article");
+          card.className = "photo-card";
+          if (post.wide) card.classList.add("is-wide");
+          card.draggable = true;
+          card.tabIndex = 0;
+          card.style.setProperty("--tile-height", `${post.height}px`);
+          card.style.setProperty("--tile-height-mobile", `${Math.max(136, post.height - 24)}px`);
+          card.style.setProperty("--rotation", `${[-1.4, 1.1, -0.7, 1.3, -1.0, 0.8][index % 6]}deg`);
+          card.setAttribute("aria-label", `Selfie de ${post.name}`);
+
+          card.addEventListener("dragstart", (event) => {
+            state.draggingIndex = index;
+            card.classList.add("dragging");
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", post.id);
+          });
+          card.addEventListener("dragend", () => {
+            state.draggingIndex = null;
+            renderPhotos();
+          });
+          card.addEventListener("dragover", (event) => {
+            event.preventDefault();
+            card.classList.add("drag-over");
+          });
+          card.addEventListener("dragleave", () => {
+            card.classList.remove("drag-over");
+          });
+          card.addEventListener("drop", (event) => {
+            event.preventDefault();
+            card.classList.remove("drag-over");
+            movePost(state.draggingIndex, index);
+          });
+
+          const wrap = document.createElement("div");
+          wrap.className = "photo-image-wrap";
+
+          const img = document.createElement("img");
+          img.className = "photo-image";
+          img.src = post.image;
+          img.alt = "";
+          img.loading = "eager";
+
+          const shade = document.createElement("div");
+          shade.className = "photo-shade";
+
+          const name = document.createElement("span");
+          name.className = "photo-name";
+          name.textContent = post.name;
+
+          const reactions = document.createElement("div");
+          reactions.className = "reactions";
+          reactions.append(...reactionNodes(post));
+
+          wrap.append(img, shade, name);
+          card.append(wrap, reactions);
+
+          const tool = document.createElement("button");
+          tool.className = "tile-tool";
+          tool.type = "button";
+          tool.title = "Cambiar ancho";
+          tool.setAttribute("aria-label", "Cambiar ancho");
+          tool.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#icon-expand"></use></svg>';
+          tool.addEventListener("click", (event) => {
+            event.stopPropagation();
+            post.wide = !post.wide;
+            renderPhotos();
+          });
+          card.append(tool);
+
+          refs.photoGrid.append(card);
+        });
+      }
+
+      function movePost(fromIndex, toIndex) {
+        if (fromIndex === null || fromIndex === toIndex) return;
+        const posts = getCurrentPosts();
+        const [item] = posts.splice(fromIndex, 1);
+        posts.splice(toIndex, 0, item);
+        state.draggingIndex = null;
+        renderPhotos();
+      }
+
+      function renderControls() {
+        refs.classicButton.setAttribute("aria-pressed", String(state.style === "classic"));
+        refs.polaroidButton.setAttribute("aria-pressed", String(state.style === "polaroid"));
+        refs.reactionsButton.classList.toggle("soft", state.showReactions);
+        refs.reactionsButton.innerHTML = state.showReactions
+          ? '<svg class="icon" aria-hidden="true"><use href="#icon-eye-off"></use></svg><span>Sin reacciones</span>'
+          : '<svg class="icon" aria-hidden="true"><use href="#icon-eye"></use></svg><span>Con reacciones</span>';
+      }
+
+      function renderPosterMeta() {
+        const group = getCurrentGroup();
+        const week = getCurrentWeek();
+        refs.poster.className = `poster ${state.style}`;
+        refs.posterTitle.textContent = group.name;
+        refs.posterWeek.textContent = week.fullLabel;
+      }
+
+      function render() {
+        renderGroups();
+        renderWeeks();
+        renderPosterMeta();
+        renderPhotos();
+        renderControls();
+      }
+
+      function shufflePosts() {
+        const posts = getCurrentPosts();
+        for (let index = posts.length - 1; index > 0; index -= 1) {
+          const randomIndex = Math.floor(Math.random() * (index + 1));
+          [posts[index], posts[randomIndex]] = [posts[randomIndex], posts[index]];
+        }
+        renderPhotos();
+      }
+
+      function readFileAsDataUrl(file) {
+        return new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(file);
+        });
+      }
+
+      async function addLocalPhotos(files) {
+        const posts = getCurrentPosts();
+        const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
+        for (let index = 0; index < imageFiles.length; index += 1) {
+          const file = imageFiles[index];
+          if (!file.type.startsWith("image/")) return;
+          const url = await readFileAsDataUrl(file);
+          if (!url) continue;
+          const nextNumber = posts.length + 1;
+          posts.push({
+            id: `local-${Date.now()}-${index}`,
+            name: file.name.replace(/\.[^.]+$/, "") || `Foto ${nextNumber}`,
+            image: url,
+            height: [176, 206, 154, 190, 164][posts.length % 5],
+            wide: false,
+            reactions: [
+              reactions[(posts.length + 1) % reactions.length],
+              reactions[(posts.length + 3) % reactions.length],
+            ],
+          });
+        }
+        renderPhotos();
+        refs.status.textContent = imageFiles.length ? "Fotos añadidas" : "";
+      }
+
+      function roundedRect(ctx, x, y, width, height, radius) {
+        const safeRadius = Math.min(radius, width / 2, height / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + safeRadius, y);
+        ctx.lineTo(x + width - safeRadius, y);
+        ctx.quadraticCurveTo(x + width, y, x + width, y + safeRadius);
+        ctx.lineTo(x + width, y + height - safeRadius);
+        ctx.quadraticCurveTo(x + width, y + height, x + width - safeRadius, y + height);
+        ctx.lineTo(x + safeRadius, y + height);
+        ctx.quadraticCurveTo(x, y + height, x, y + height - safeRadius);
+        ctx.lineTo(x, y + safeRadius);
+        ctx.quadraticCurveTo(x, y, x + safeRadius, y);
+        ctx.closePath();
+      }
+
+      function drawCover(ctx, image, x, y, width, height, radius) {
+        ctx.save();
+        roundedRect(ctx, x, y, width, height, radius);
+        ctx.clip();
+        const imageRatio = image.width / image.height;
+        const boxRatio = width / height;
+        let drawWidth = width;
+        let drawHeight = height;
+        let drawX = x;
+        let drawY = y;
+        if (imageRatio > boxRatio) {
+          drawHeight = height;
+          drawWidth = height * imageRatio;
+          drawX = x - (drawWidth - width) / 2;
+        } else {
+          drawWidth = width;
+          drawHeight = width / imageRatio;
+          drawY = y - (drawHeight - height) / 2;
+        }
+        ctx.drawImage(image, drawX, drawY, drawWidth, drawHeight);
+        const gradient = ctx.createLinearGradient(0, y + height * 0.45, 0, y + height);
+        gradient.addColorStop(0, "rgba(0,0,0,0)");
+        gradient.addColorStop(1, "rgba(0,0,0,0.50)");
+        ctx.fillStyle = gradient;
+        ctx.fillRect(x, y, width, height);
+        ctx.restore();
+      }
+
+      function loadImage(source) {
+        return new Promise((resolve) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = () => resolve(null);
+          image.src = source;
+        });
+      }
+
+      function layoutClassic(posts, posterWidth, pad, startY) {
+        const gridWidth = posterWidth - pad * 2;
+        const gap = 22;
+        const colWidth = (gridWidth - gap) / 2;
+        const items = [];
+        let y = startY;
+        let index = 0;
+
+        while (index < posts.length) {
+          const post = posts[index];
+          if (post.wide) {
+            items.push({ post, x: pad, y, width: gridWidth, height: 360 });
+            y += 360 + gap;
+            index += 1;
+            continue;
+          }
+
+          const nextPost = posts[index + 1];
+          if (nextPost && !nextPost.wide) {
+            const leftHeight = 320 + (post.height % 70);
+            const rightHeight = 340 + (nextPost.height % 80);
+            items.push({ post, x: pad, y, width: colWidth, height: leftHeight });
+            items.push({
+              post: nextPost,
+              x: pad + colWidth + gap,
+              y,
+              width: colWidth,
+              height: rightHeight,
+            });
+            y += Math.max(leftHeight, rightHeight) + gap;
+            index += 2;
+          } else {
+            items.push({ post, x: pad, y, width: colWidth, height: 340 });
+            y += 340 + gap;
+            index += 1;
+          }
+        }
+
+        return { items, height: y - gap + pad };
+      }
+
+      function layoutPolaroid(posts, posterWidth, pad, startY) {
+        const gridWidth = posterWidth - pad * 2;
+        const gap = 24;
+        const cardWidth = (gridWidth - gap) / 2;
+        const photoHeight = 330;
+        const cardHeight = photoHeight + 92;
+        const items = [];
+        let y = startY;
+
+        posts.forEach((post, index) => {
+          const column = index % 2;
+          const row = Math.floor(index / 2);
+          const offsetY = column === 1 ? 28 : 0;
+          items.push({
+            post,
+            x: pad + column * (cardWidth + gap),
+            y: y + row * (cardHeight - 18) + offsetY,
+            width: cardWidth,
+            height: cardHeight,
+            photoHeight,
+            rotation: [-0.035, 0.028, -0.018, 0.032, -0.026, 0.02][index % 6],
+          });
+        });
+
+        const rows = Math.ceil(posts.length / 2);
+        return {
+          items,
+          height: y + rows * (cardHeight - 18) + 52 + pad,
+        };
+      }
+
+      function drawCenteredText(ctx, text, x, y, maxWidth, font, color) {
+        ctx.font = font;
+        ctx.fillStyle = color;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const words = text.split(" ");
+        const lines = [];
+        let line = "";
+        words.forEach((word) => {
+          const test = line ? `${line} ${word}` : word;
+          if (ctx.measureText(test).width > maxWidth && line) {
+            lines.push(line);
+            line = word;
+          } else {
+            line = test;
+          }
+        });
+        if (line) lines.push(line);
+        const lineHeight = 48;
+        const firstY = y - ((lines.length - 1) * lineHeight) / 2;
+        lines.slice(0, 2).forEach((lineText, index) => {
+          ctx.fillText(lineText, x, firstY + index * lineHeight);
+        });
+      }
+
+      function drawReactionPills(ctx, post, x, y, showPlain = false) {
+        if (!state.showReactions) return;
+        ctx.font = "700 26px Arial, sans-serif";
+        ctx.textBaseline = "middle";
+        let nextX = x;
+        post.reactions.forEach(([emoji, count]) => {
+          const label = `${emoji} ${count}`;
+          const width = ctx.measureText(label).width + 34;
+          roundedRect(ctx, nextX, y, width, 42, 21);
+          ctx.fillStyle = showPlain ? "#fff8ed" : "rgba(255,255,255,.82)";
+          ctx.fill();
+          ctx.fillStyle = "#564b43";
+          ctx.textAlign = "left";
+          ctx.fillText(label, nextX + 17, y + 21);
+          nextX += width + 10;
+        });
+      }
+
+      async function drawPosterToCanvas() {
+        const group = getCurrentGroup();
+        const week = getCurrentWeek();
+        const posts = getCurrentPosts();
+        const posterWidth = 1080;
+        const pad = state.style === "polaroid" ? 54 : 48;
+        const headerHeight = 250;
+        const layout =
+          state.style === "polaroid"
+            ? layoutPolaroid(posts, posterWidth, pad, headerHeight)
+            : layoutClassic(posts, posterWidth, pad, headerHeight);
+        const canvas = document.createElement("canvas");
+        canvas.width = posterWidth;
+        canvas.height = Math.ceil(layout.height);
+        const ctx = canvas.getContext("2d");
+
+        ctx.fillStyle = state.style === "polaroid" ? "#fff8ed" : "#fef3e8";
+        roundedRect(ctx, 0, 0, canvas.width, canvas.height, 46);
+        ctx.fill();
+
+        ctx.fillStyle = "#f4a261";
+        ctx.beginPath();
+        ctx.arc(posterWidth / 2, 64, 32, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = "#ffffff";
+        ctx.font = "900 26px Arial, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("SS", posterWidth / 2, 64);
+
+        drawCenteredText(
+          ctx,
+          group.name,
+          posterWidth / 2,
+          126,
+          posterWidth - pad * 2,
+          "900 46px Arial, sans-serif",
+          "#545a60"
+        );
+
+        const badgeWidth = Math.min(430, ctx.measureText(week.fullLabel).width + 98);
+        roundedRect(ctx, (posterWidth - badgeWidth) / 2, 176, badgeWidth, 52, 26);
+        ctx.fillStyle = "rgba(255,255,255,.78)";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(244,162,97,.26)";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.fillStyle = "#e8884a";
+        ctx.font = "900 24px Arial, sans-serif";
+        ctx.fillText(week.fullLabel.toUpperCase(), posterWidth / 2, 202);
+
+        ctx.fillStyle = "rgba(244,162,97,.26)";
+        roundedRect(ctx, posterWidth / 2 - 44, 234, 88, 4, 2);
+        ctx.fill();
+
+        const imageMap = new Map();
+        await Promise.all(
+          posts.map(async (post) => {
+            imageMap.set(post.id, await loadImage(post.image));
+          })
+        );
+
+        layout.items.forEach((item) => {
+          const image = imageMap.get(item.post.id);
+          if (state.style === "polaroid") {
+            const cx = item.x + item.width / 2;
+            const cy = item.y + item.height / 2;
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.rotate(item.rotation);
+            ctx.translate(-cx, -cy);
+            ctx.shadowColor = "rgba(107,74,46,.12)";
+            ctx.shadowBlur = 26;
+            ctx.shadowOffsetY = 12;
+            roundedRect(ctx, item.x, item.y, item.width, item.height, 18);
+            ctx.fillStyle = "#ffffff";
+            ctx.fill();
+            ctx.shadowColor = "transparent";
+            if (image) {
+              drawCover(ctx, image, item.x + 18, item.y + 18, item.width - 36, item.photoHeight, 12);
+            }
+            ctx.fillStyle = "#ffffff";
+            ctx.font = "900 26px Arial, sans-serif";
+            ctx.textAlign = "left";
+            ctx.textBaseline = "middle";
+            ctx.fillText(item.post.name, item.x + 36, item.y + item.photoHeight - 20);
+            drawReactionPills(ctx, item.post, item.x + 26, item.y + item.photoHeight + 34, true);
+            ctx.restore();
+            return;
+          }
+
+          if (image) {
+            drawCover(ctx, image, item.x, item.y, item.width, item.height, 28);
+          } else {
+            roundedRect(ctx, item.x, item.y, item.width, item.height, 28);
+            ctx.fillStyle = "#fad9b8";
+            ctx.fill();
+          }
+          ctx.fillStyle = "#ffffff";
+          ctx.font = "900 28px Arial, sans-serif";
+          ctx.textAlign = "left";
+          ctx.textBaseline = "middle";
+          ctx.fillText(item.post.name, item.x + 24, item.y + item.height - 78);
+          drawReactionPills(ctx, item.post, item.x + 20, item.y + item.height - 58);
+        });
+
+        return canvas;
+      }
+
+      async function downloadPoster() {
+        refs.downloadButton.disabled = true;
+        refs.status.textContent = "Preparando PNG...";
+        try {
+          const canvas = await drawPosterToCanvas();
+          const groupName = getCurrentGroup().name
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/[^a-z0-9]+/gi, "_")
+            .replace(/^_+|_+$/g, "")
+            .toLowerCase();
+          const week = getCurrentWeek().label.replace(/\s+/g, "_").toLowerCase();
+          const link = document.createElement("a");
+          link.href = canvas.toDataURL("image/png");
+          link.download = `montaje_${groupName || "grupo"}_${week}.png`;
+          link.click();
+          refs.status.textContent = "Montaje descargado";
+          refs.downloadButton.disabled = false;
+        } catch (error) {
+          refs.status.textContent = "No se pudo generar el PNG";
+          refs.downloadButton.disabled = false;
+        }
+      }
+
+      refs.classicButton.addEventListener("click", () => {
+        state.style = "classic";
+        renderPosterMeta();
+        renderPhotos();
+        renderControls();
+      });
+
+      refs.polaroidButton.addEventListener("click", () => {
+        state.style = "polaroid";
+        renderPosterMeta();
+        renderPhotos();
+        renderControls();
+      });
+
+      refs.reactionsButton.addEventListener("click", () => {
+        state.showReactions = !state.showReactions;
+        renderPhotos();
+        renderControls();
+      });
+
+      refs.shuffleButton.addEventListener("click", shufflePosts);
+      refs.downloadButton.addEventListener("click", downloadPoster);
+      refs.addPhotosButton.addEventListener("click", () => refs.photoInput.click());
+      refs.photoInput.addEventListener("change", (event) => {
+        addLocalPhotos(event.target.files);
+        event.target.value = "";
+      });
+      refs.calendarButton.addEventListener("click", () => {
+        const group = getCurrentGroup();
+        state.weekIndex = (state.weekIndex + 1) % group.weeks.length;
+        render();
+      });
+
+      render();
+    </script>
+  </body>
+</html>

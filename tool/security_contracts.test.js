@@ -17,10 +17,14 @@ const flutterSource = read("lib/main.dart");
 const pubspecSource = read("pubspec.yaml");
 const gitignoreSource = read(".gitignore");
 const androidManifest = read("android/app/src/main/AndroidManifest.xml");
+const androidMainActivity = read(
+  "android/app/src/main/kotlin/com/example/sunday_selfie/MainActivity.kt"
+);
 const iosEntitlements = read("ios/Runner/Runner.entitlements");
 const iosInfoPlist = read("ios/Runner/Info.plist");
 const iosProject = read("ios/Runner.xcodeproj/project.pbxproj");
 const hostingIndex = read("public/index.html");
+const androidAssetLinks = read("public/.well-known/assetlinks.json");
 
 const ignoredSecretScanDirs = new Set([
   ".git",
@@ -201,7 +205,10 @@ test("private group metadata is not exposed by direct reads", () => {
 
   const previewSource = functionsSource.slice(previewStart, previewEnd);
   assert.doesNotMatch(previewSource, /photoUrl|photoStoragePath|inviteLink/);
-  assert.match(flutterSource, /httpsCallable\(\s*'resolverInvitacionGrupo'/);
+  assert.match(
+    flutterSource,
+    /llamarCallableAutenticadoConReintento\(\s*name:\s*'resolverInvitacionGrupo'/
+  );
 
   const previewCardStart = flutterSource.indexOf("class JoinGroupPreviewCard");
   const previewCardEnd = flutterSource.indexOf("class JoinPreviewMessageCard");
@@ -212,14 +219,17 @@ test("private group metadata is not exposed by direct reads", () => {
   assert.doesNotMatch(previewCardSource, /photoUrl:\s*data/);
 });
 
-test("chat GIF messages are constrained to Tenor media URLs", () => {
-  assert.match(firestoreRules, /function isValidTenorGifUrl\(value\)/);
+test("chat GIF messages are constrained to trusted GIF media URLs", () => {
+  assert.match(firestoreRules, /function isValidTrustedGifUrl\(value\)/);
   assert.match(
     firestoreRules,
-    /request\.resource\.data\.gifUrl == null[\s\S]*?\|\| isValidTenorGifUrl\(request\.resource\.data\.gifUrl\)/
+    /request\.resource\.data\.gifUrl == null[\s\S]*?\|\| isValidTrustedGifUrl\(request\.resource\.data\.gifUrl\)/
   );
   assert.ok(
     firestoreRules.includes('value.matches("^https://media\\\\.tenor\\\\.com/[^\\\\s]+$")')
+  );
+  assert.ok(
+    firestoreRules.includes('value.matches("^https://media[0-9]*\\\\.giphy\\\\.com/[^\\\\s]+$")')
   );
 });
 
@@ -272,6 +282,38 @@ test("users delete their own selfies through Cloud Functions", () => {
   assert.doesNotMatch(flutterSource, /FirebaseStorage\.instance[\s\S]{0,200}\.delete\(\)/);
 });
 
+test("selfie registration retries protected callable authentication", () => {
+  const start = flutterSource.indexOf("Future<void> publicarSelfieReal");
+  const end = flutterSource.indexOf("Future<void> reaccionarASelfie");
+  assert.ok(start >= 0, "publicarSelfieReal exists");
+  assert.ok(end > start, "publicarSelfieReal block is bounded");
+
+  const selfieUploadSource = flutterSource.slice(start, end);
+  assert.match(
+    selfieUploadSource,
+    /llamarCallableAutenticadoConReintento\(\s*name:\s*'registrarSelfie'/
+  );
+  assert.doesNotMatch(
+    selfieUploadSource,
+    /FirebaseFunctions\.instance\.httpsCallable\(\s*'registrarSelfie'/
+  );
+});
+
+test("selfie registration tolerates app check attestation outages", () => {
+  assert.match(
+    functionsSource,
+    /exports\.registrarSelfie\s*=\s*callable\(\{enforceAppCheck:\s*false\}/
+  );
+  assert.match(
+    functionsSource,
+    /exports\.registrarSelfie[\s\S]*if \(!context\.auth\)/
+  );
+  assert.match(
+    functionsSource,
+    /exports\.registrarSelfie[\s\S]*customMetadata\.groupId !== groupId[\s\S]*customMetadata\.uid !== authorUid/
+  );
+});
+
 test("abuse protection is configured in backend and Flutter", () => {
   assert.match(functionsSource, /JOIN_REQUESTS_PER_DAY_LIMIT\s*=\s*5/);
   assert.match(functionsSource, /REPORTS_PER_DAY_LIMIT\s*=\s*10/);
@@ -288,12 +330,17 @@ test("abuse protection is configured in backend and Flutter", () => {
   assert.match(flutterSource, /prepararReintentoCallableProtegida/);
   assert.match(androidManifest, /android:allowBackup="false"/);
   assert.match(androidManifest, /android:usesCleartextTraffic="false"/);
-  assert.match(flutterSource, /httpsCallable\(\s*'solicitarEntradaGrupo'/);
+  assert.match(
+    flutterSource,
+    /llamarCallableAutenticadoConReintento\(\s*name:\s*'solicitarEntradaGrupo'/
+  );
 });
 
 test("invitation links are wired for app links", () => {
-  assert.match(pubspecSource, /app_links:\s*\^7\./);
-  assert.match(flutterSource, /AppLinks\(\)/);
+  assert.doesNotMatch(pubspecSource, /app_links:/);
+  assert.match(flutterSource, /class SundayDeepLinks/);
+  assert.match(flutterSource, /MethodChannel deepLinksMethodChannel/);
+  assert.match(flutterSource, /EventChannel deepLinksEventChannel/);
   assert.match(flutterSource, /getInitialLink\(\)/);
   assert.match(flutterSource, /uriLinkStream/);
   assert.match(flutterSource, /obtenerInvitacionDesdeDeepLink/);
@@ -304,6 +351,9 @@ test("invitation links are wired for app links", () => {
   assert.match(androidManifest, /android:name="flutter_deeplinking_enabled"[\s\S]*?android:value="false"/);
   assert.match(androidManifest, /android:host="sundayselfie\.app"/);
   assert.match(androidManifest, /android:pathPrefix="\/j"/);
+  assert.match(androidMainActivity, /handleDeepLinkIntent/);
+  assert.match(androidMainActivity, /isSundaySelfieDeepLink/);
+  assert.match(androidMainActivity, /sunday_selfie\/deep_links/);
   assert.match(iosEntitlements, /applinks:sundayselfie\.app/);
   assert.match(iosInfoPlist, /<key>FlutterDeepLinkingEnabled<\/key>\s*<false\/>/);
   assert.match(iosProject, /CODE_SIGN_ENTITLEMENTS = Runner\/Runner\.entitlements;/);
@@ -315,6 +365,9 @@ test("invitation links are wired for app links", () => {
   assert.match(hostingIndex, /Invitaci\u00f3n a un grupo privado/);
   assert.match(hostingIndex, /PLAY_STORE_URL/);
   assert.match(hostingIndex, /APP_STORE_URL/);
+  assert.match(hostingIndex, /intent:\/\//);
+  assert.match(androidAssetLinks, /delegate_permission\/common\.handle_all_urls/);
+  assert.match(androidAssetLinks, /"package_name": "app\.sundayselfie"/);
 });
 
 test("hosting sets defensive browser headers", () => {

@@ -183,8 +183,12 @@
       const inviteCode = segments.length >= 2 ? decodeURIComponent(segments[1]) : "";
       const inviteUrl = window.location.href;
       const storeUrl = isAndroid ? PLAY_STORE_URL : isIos ? APP_STORE_URL : "";
+      const androidIntentUrl = inviteCode
+        ? `intent://${window.location.host}${window.location.pathname}${window.location.search}#Intent;scheme=https;package=app.sundayselfie;S.browser_fallback_url=${encodeURIComponent(PLAY_STORE_URL)};end`
+        : PLAY_STORE_URL;
+      const openAppUrl = isAndroid ? androidIntentUrl : inviteUrl;
 
-      document.getElementById("open-app").href = inviteUrl;
+      document.getElementById("open-app").href = openAppUrl;
       document.getElementById("invite-code").textContent = inviteCode
         ? `Código: ${inviteCode}`
         : "Invitación no encontrada";
@@ -199,9 +203,11 @@
           ? "Descargar en Google Play"
           : "Descargar en App Store";
 
-        window.setTimeout(() => {
-          window.location.href = storeUrl;
-        }, 1800);
+        if (isAndroid && inviteCode) {
+          window.setTimeout(() => {
+            window.location.href = androidIntentUrl;
+          }, 350);
+        }
       } else {
         document.getElementById("store-link").hidden = true;
         document.getElementById("desktop-store").hidden = false;

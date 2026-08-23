@@ -58,7 +58,9 @@ void logDebug(String message) {
 
 class SundayDeepLinks {
   Stream<Uri> get uriLinkStream {
-    if (!Platform.isIOS) return const Stream<Uri>.empty();
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return const Stream<Uri>.empty();
+    }
 
     return deepLinksEventChannel
         .receiveBroadcastStream()
@@ -67,7 +69,7 @@ class SundayDeepLinks {
   }
 
   Future<Uri?> getInitialLink() async {
-    if (!Platform.isIOS) return null;
+    if (!Platform.isAndroid && !Platform.isIOS) return null;
 
     try {
       final value = await deepLinksMethodChannel.invokeMethod<String>(
@@ -137,6 +139,14 @@ class LocalPhotoCache {
     return '${variant}_$digest.img';
   }
 
+  String _cacheKey(String url, String variant) => '$variant|${url.trim()}';
+
+  File? readyFileFor(String url, {required String variant}) {
+    final trimmedUrl = url.trim();
+    if (trimmedUrl.isEmpty) return null;
+    return _readyFiles[_cacheKey(trimmedUrl, variant)];
+  }
+
   Future<File?> getOrDownload(String url, {required String variant}) async {
     final trimmedUrl = url.trim();
     if (trimmedUrl.isEmpty) return null;
@@ -144,7 +154,7 @@ class LocalPhotoCache {
     final directory = await _directory();
     if (directory == null) return null;
 
-    final key = '$variant|$trimmedUrl';
+    final key = _cacheKey(trimmedUrl, variant);
     final readyFile = _readyFiles[key];
     if (readyFile != null) {
       if (await readyFile.exists() && await readyFile.length() > 0) {
@@ -279,6 +289,7 @@ class CachedRemoteImage extends StatefulWidget {
 
 class _CachedRemoteImageState extends State<CachedRemoteImage> {
   Future<File?>? fileFuture;
+  File? readyFile;
 
   @override
   void initState() {
@@ -297,7 +308,13 @@ class _CachedRemoteImageState extends State<CachedRemoteImage> {
 
   void configureFuture() {
     final trimmedUrl = widget.imageUrl.trim();
-    fileFuture = trimmedUrl.isEmpty
+    readyFile = trimmedUrl.isEmpty
+        ? null
+        : LocalPhotoCache.instance.readyFileFor(
+            trimmedUrl,
+            variant: widget.cacheVariant,
+          );
+    fileFuture = trimmedUrl.isEmpty || readyFile != null
         ? null
         : LocalPhotoCache.instance.getOrDownload(
             trimmedUrl,
@@ -313,6 +330,11 @@ class _CachedRemoteImageState extends State<CachedRemoteImage> {
     }
 
     final currentFuture = fileFuture;
+    final currentReadyFile = readyFile;
+    if (currentReadyFile != null) {
+      return _fileImage(currentReadyFile);
+    }
+
     if (currentFuture == null) {
       return _networkFallback(trimmedUrl);
     }
@@ -342,6 +364,20 @@ class _CachedRemoteImageState extends State<CachedRemoteImage> {
 
         return _networkFallback(trimmedUrl);
       },
+    );
+  }
+
+  Widget _fileImage(File file) {
+    return Image.file(
+      file,
+      width: widget.width,
+      height: widget.height,
+      fit: widget.fit,
+      alignment: widget.alignment,
+      filterQuality: widget.filterQuality,
+      gaplessPlayback: widget.gaplessPlayback,
+      semanticLabel: widget.semanticLabel,
+      errorBuilder: (_, _, _) => widget.errorWidget ?? const _ImageErrorFill(),
     );
   }
 
@@ -387,6 +423,293 @@ void prefetchPostPhotoCache(
   final imageUrl = (post['imageUrl'] ?? thumbUrl).toString();
   if (imageUrl.trim().isNotEmpty) {
     unawaited(LocalPhotoCache.instance.prefetch(imageUrl, variant: 'original'));
+  }
+}
+
+typedef _PhotoCacheWarmupRequest = ({String url, String variant});
+
+const int kHomeLaunchBlockingGroupLimit = 8;
+const Duration kHomeLaunchPreloadTimeout = Duration(seconds: 3);
+const Duration kHomeLaunchPhotoWarmupTimeout = Duration(milliseconds: 1400);
+const Duration kHomeLaunchStreakWarmupTimeout = Duration(milliseconds: 350);
+
+class _HomeGroupPreloadData {
+  final Map<String, dynamic>? groupData;
+  final List<QueryDocumentSnapshot<Map<String, dynamic>>> postDocs;
+  final List<QueryDocumentSnapshot<Map<String, dynamic>>> memberDocs;
+  final Map<String, Map<String, dynamic>> userDataByUid;
+  final GroupStreakStats? streakStats;
+
+  const _HomeGroupPreloadData({
+    required this.groupData,
+    required this.postDocs,
+    required this.memberDocs,
+    required this.userDataByUid,
+    required this.streakStats,
+  });
+}
+
+class _HomeGroupsPreloadCache {
+  static final Map<String, Map<String, _HomeGroupPreloadData>> _byUid = {};
+
+  static void store(String uid, Map<String, _HomeGroupPreloadData> groupsById) {
+    _byUid[uid] = groupsById;
+  }
+
+  static _HomeGroupPreloadData? group(String uid, String groupId) {
+    return _byUid[uid]?[groupId.trim()];
+  }
+}
+
+void _addPhotoCacheWarmupRequest(
+  Set<_PhotoCacheWarmupRequest> requests,
+  dynamic url, {
+  required String variant,
+}) {
+  if (url is! String) return;
+
+  final trimmedUrl = url.trim();
+  if (trimmedUrl.isEmpty) return;
+
+  requests.add((url: trimmedUrl, variant: variant));
+}
+
+Future<T?> _safeHomeLaunchPreload<T>(
+  Future<T> future,
+  String description,
+) async {
+  try {
+    return await future;
+  } catch (error) {
+    logDebug('No se pudo precargar $description: $error');
+    return null;
+  }
+}
+
+Future<List<File?>> _downloadHomeLaunchPhotos(
+  Set<_PhotoCacheWarmupRequest> requests,
+) {
+  return Future.wait(
+    requests.map((request) {
+      return LocalPhotoCache.instance.getOrDownload(
+        request.url,
+        variant: request.variant,
+      );
+    }),
+  );
+}
+
+Future<void> _warmHomeLaunchPhotosInBackground(
+  Set<_PhotoCacheWarmupRequest> requests,
+) async {
+  if (requests.isEmpty) return;
+
+  try {
+    await _downloadHomeLaunchPhotos(requests);
+  } catch (error) {
+    logDebug('No se pudo terminar la precarga secundaria de fotos: $error');
+  }
+}
+
+Future<void> precargarPantallaGruposInicial(
+  BuildContext context,
+  User user,
+) async {
+  try {
+    await _precargarPantallaGruposInicial(
+      context,
+      user,
+    ).timeout(kHomeLaunchPreloadTimeout);
+  } on TimeoutException {
+    logDebug('La precarga inicial de grupos tardó demasiado; seguimos.');
+  } catch (error) {
+    logDebug('No se pudo precargar la pantalla inicial de grupos: $error');
+  }
+}
+
+Future<void> _precargarPantallaGruposInicial(
+  BuildContext context,
+  User user,
+) async {
+  final firestore = FirebaseFirestore.instance;
+  final userGroupsSnapshot = await firestore
+      .collection('users')
+      .doc(user.uid)
+      .collection('groups')
+      .get();
+
+  if (!context.mounted) return;
+
+  final userGroupDocs = [...userGroupsSnapshot.docs]
+    ..sort((a, b) {
+      final comparison = compareUserGroupsBySelfieOrChatActivity(
+        a.data(),
+        b.data(),
+      );
+      if (comparison != 0) return comparison;
+      return a.id.compareTo(b.id);
+    });
+  final weekKey = obtenerWeekKeyVisibleMasReciente();
+  final groupsById = <String, _HomeGroupPreloadData>{};
+  final photoRequests = <_PhotoCacheWarmupRequest>{};
+  final backgroundPhotoRequests = <_PhotoCacheWarmupRequest>{};
+  final blockingUserGroupDocs = userGroupDocs
+      .take(kHomeLaunchBlockingGroupLimit)
+      .toList();
+  final backgroundUserGroupDocs = userGroupDocs
+      .skip(kHomeLaunchBlockingGroupLimit)
+      .toList();
+
+  await Future.wait(
+    blockingUserGroupDocs.map((userGroupDoc) async {
+      final userGroupData = userGroupDoc.data();
+      final groupId = (userGroupData['groupId'] ?? userGroupDoc.id)
+          .toString()
+          .trim();
+      if (groupId.isEmpty) return;
+
+      _addPhotoCacheWarmupRequest(
+        photoRequests,
+        userGroupData['groupPhotoUrlSnapshot'],
+        variant: 'avatar',
+      );
+
+      final groupRef = firestore.collection('groups').doc(groupId);
+      final groupDocFuture = groupRef.get();
+      final membersFuture = groupRef
+          .collection('members')
+          .orderBy('joinedAt')
+          .limit(4)
+          .get();
+      final postsFuture = groupRef
+          .collection('weeks')
+          .doc(weekKey)
+          .collection('posts')
+          .get();
+
+      final groupDoc =
+          await _safeHomeLaunchPreload<DocumentSnapshot<Map<String, dynamic>>>(
+            groupDocFuture,
+            'el grupo $groupId',
+          );
+      final groupData = groupDoc?.data();
+      final deleted = groupData?['deleted'] == true;
+
+      _addPhotoCacheWarmupRequest(
+        photoRequests,
+        groupData?['photoUrl'],
+        variant: 'avatar',
+      );
+
+      final membersSnapshot =
+          await _safeHomeLaunchPreload<QuerySnapshot<Map<String, dynamic>>>(
+            membersFuture,
+            'los miembros de $groupId',
+          );
+      final postSnapshot =
+          await _safeHomeLaunchPreload<QuerySnapshot<Map<String, dynamic>>>(
+            postsFuture,
+            'los selfies recientes de $groupId',
+          );
+      final streakStats = await _safeHomeLaunchPreload<GroupStreakStats>(
+        calcularEstadisticasRachaCompletaGrupoFirestore(
+          groupId: groupId,
+        ).timeout(kHomeLaunchStreakWarmupTimeout),
+        'la racha de $groupId',
+      );
+
+      final userDataByUid = <String, Map<String, dynamic>>{};
+      final memberDocs =
+          membersSnapshot?.docs ??
+          const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+      final memberUserLookups = <Future<void>>[];
+
+      for (final memberDoc in memberDocs) {
+        final memberData = memberDoc.data();
+        final memberPhotoUrl = memberData['effectivePhotoUrl'];
+        _addPhotoCacheWarmupRequest(
+          photoRequests,
+          memberPhotoUrl,
+          variant: 'avatar',
+        );
+
+        if (memberPhotoUrl is String && memberPhotoUrl.trim().isNotEmpty) {
+          continue;
+        }
+
+        memberUserLookups.add(() async {
+          final userDoc =
+              await _safeHomeLaunchPreload<
+                DocumentSnapshot<Map<String, dynamic>>
+              >(
+                firestore.collection('users').doc(memberDoc.id).get(),
+                'el perfil de ${memberDoc.id}',
+              );
+          final userData = userDoc?.data();
+          if (userData == null) return;
+
+          userDataByUid[memberDoc.id] = userData;
+          _addPhotoCacheWarmupRequest(
+            photoRequests,
+            userData['basePhotoUrl'],
+            variant: 'avatar',
+          );
+        }());
+      }
+
+      await Future.wait(memberUserLookups);
+
+      final postDocs =
+          postSnapshot?.docs ??
+          const <QueryDocumentSnapshot<Map<String, dynamic>>>[];
+      for (final postDoc in postDocs) {
+        final postData = postDoc.data();
+        _addPhotoCacheWarmupRequest(
+          backgroundPhotoRequests,
+          postData['thumbUrl'] ?? postData['imageUrl'],
+          variant: 'thumbnail',
+        );
+        _addPhotoCacheWarmupRequest(
+          backgroundPhotoRequests,
+          postData['authorPhotoUrl'],
+          variant: 'avatar',
+        );
+      }
+
+      groupsById[groupId] = _HomeGroupPreloadData(
+        groupData: groupData,
+        postDocs: postDocs,
+        memberDocs: deleted ? const [] : memberDocs,
+        userDataByUid: userDataByUid,
+        streakStats: streakStats,
+      );
+    }),
+  );
+
+  _HomeGroupsPreloadCache.store(user.uid, groupsById);
+
+  for (final userGroupDoc in backgroundUserGroupDocs) {
+    _addPhotoCacheWarmupRequest(
+      backgroundPhotoRequests,
+      userGroupDoc.data()['groupPhotoUrlSnapshot'],
+      variant: 'avatar',
+    );
+  }
+
+  final warmedFiles = await _downloadHomeLaunchPhotos(
+    photoRequests,
+  ).timeout(kHomeLaunchPhotoWarmupTimeout, onTimeout: () => const <File?>[]);
+
+  unawaited(_warmHomeLaunchPhotosInBackground(backgroundPhotoRequests));
+
+  for (final file in warmedFiles.whereType<File>()) {
+    if (!context.mounted) return;
+
+    try {
+      await precacheImage(FileImage(file), context);
+    } catch (error) {
+      logDebug('No se pudo precachear una foto inicial: $error');
+    }
   }
 }
 
@@ -875,12 +1198,79 @@ DateTime inicioDiaLocal(DateTime date) {
   return DateTime(date.year, date.month, date.day);
 }
 
+DateTime _lastSundayOfMonthUtc(int year, int month) {
+  final firstDayOfNextMonth = month == DateTime.december
+      ? DateTime.utc(year + 1, DateTime.january, 1)
+      : DateTime.utc(year, month + 1, 1);
+  final lastDayOfMonth = firstDayOfNextMonth.subtract(const Duration(days: 1));
+  final daysSinceSunday = lastDayOfMonth.weekday % DateTime.sunday;
+
+  return DateTime.utc(
+    lastDayOfMonth.year,
+    lastDayOfMonth.month,
+    lastDayOfMonth.day,
+  ).subtract(Duration(days: daysSinceSunday));
+}
+
+Duration _madridUtcOffset(DateTime utcDate) {
+  final utc = utcDate.toUtc();
+  final dstStart = _lastSundayOfMonthUtc(
+    utc.year,
+    DateTime.march,
+  ).add(const Duration(hours: 1));
+  final dstEnd = _lastSundayOfMonthUtc(
+    utc.year,
+    DateTime.october,
+  ).add(const Duration(hours: 1));
+  final isSummerTime = !utc.isBefore(dstStart) && utc.isBefore(dstEnd);
+
+  return Duration(hours: isSummerTime ? 2 : 1);
+}
+
+DateTime sundayAppTimeFromUtc(DateTime utcDate) {
+  final utc = utcDate.toUtc();
+  final madridTime = utc.add(_madridUtcOffset(utc));
+
+  return DateTime(
+    madridTime.year,
+    madridTime.month,
+    madridTime.day,
+    madridTime.hour,
+    madridTime.minute,
+    madridTime.second,
+    madridTime.millisecond,
+    madridTime.microsecond,
+  );
+}
+
+DateTime sundayAppNow({DateTime? now}) {
+  if (now != null) return now;
+  return sundayAppTimeFromUtc(DateTime.now().toUtc());
+}
+
+DateTime? timestampToSundayTime(dynamic value) {
+  if (value is Timestamp) {
+    return sundayAppTimeFromUtc(value.toDate().toUtc());
+  }
+  if (value is DateTime) return value;
+  return null;
+}
+
 DateTime proximoRefrescoCambioDeDia(DateTime now) {
   return DateTime(
     now.year,
     now.month,
     now.day + 1,
   ).add(const Duration(milliseconds: 250));
+}
+
+Duration demoraHastaProximoRefrescoCambioDeDia({DateTime? utcNow}) {
+  final now = utcNow == null
+      ? sundayAppNow()
+      : sundayAppTimeFromUtc(utcNow.toUtc());
+  final delay = proximoRefrescoCambioDeDia(now).difference(now);
+
+  return delay.isNegative ? Duration.zero : delay;
 }
 
 class SundayClock extends ChangeNotifier with WidgetsBindingObserver {
@@ -898,9 +1288,8 @@ class SundayClock extends ChangeNotifier with WidgetsBindingObserver {
 
   void _scheduleNextDayRefresh() {
     _timer?.cancel();
-    final now = DateTime.now();
-    final delay = proximoRefrescoCambioDeDia(now).difference(now);
-    _timer = Timer(delay.isNegative ? Duration.zero : delay, _handleDayRefresh);
+    final delay = demoraHastaProximoRefrescoCambioDeDia();
+    _timer = Timer(delay, _handleDayRefresh);
   }
 
   void _handleDayRefresh() {
@@ -2772,6 +3161,8 @@ const Map<String, Map<String, String>> kSundayExtraTranslations = {
     'Reemplazo excepcional': 'Exceptional replacement',
     'Sunday Selfie está pensado para guardar un único momento real de cada domingo.':
         'Sunday Selfie is designed to keep one real moment from each Sunday.',
+    'Puedes rehacerla una sola vez viendo un anuncio.':
+        'You can retake it once after watching an ad.',
     'Puedes rehacerla una sola vez viendo un anuncio. La cámara se abrirá al terminar.':
         'You can retake it once after watching an ad. The camera will open when it ends.',
     'Puedes reemplazarla de forma excepcional después de ver un anuncio. La cámara se abrirá cuando el anuncio termine.':
@@ -3053,6 +3444,8 @@ const Map<String, Map<String, String>> kSundayExtraTranslations = {
     'Reemplazo excepcional': 'Remplacement exceptionnel',
     'Sunday Selfie está pensado para guardar un único momento real de cada domingo.':
         'Sunday Selfie est conçu pour garder un seul moment réel de chaque dimanche.',
+    'Puedes rehacerla una sola vez viendo un anuncio.':
+        'Vous pouvez la refaire une seule fois après avoir vu une annonce.',
     'Puedes rehacerla una sola vez viendo un anuncio. La cámara se abrirá al terminar.':
         'Vous pouvez la refaire une seule fois après avoir vu une annonce. La caméra s’ouvrira à la fin.',
     'Puedes reemplazarla de forma excepcional después de ver un anuncio. La cámara se abrirá cuando el anuncio termine.':
@@ -8901,12 +9294,14 @@ Future<CreatedGroupInfo> crearGrupoMinimo({
   late String inviteCode;
 
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable('crearGrupo');
-    final result = await callable.call<dynamic>({
-      'name': nombreGrupo,
-      'emoji': resolvedEmoji,
-      'colorValue': resolvedColorValue,
-    });
+    final result = await llamarCallableAutenticadoConReintento(
+      name: 'crearGrupo',
+      data: {
+        'name': nombreGrupo,
+        'emoji': resolvedEmoji,
+        'colorValue': resolvedColorValue,
+      },
+    );
     final resultData = result.data;
 
     if (resultData is! Map) {
@@ -8920,7 +9315,12 @@ Future<CreatedGroupInfo> crearGrupoMinimo({
       throw Exception('Firebase no devolvió una invitación válida');
     }
   } on FirebaseFunctionsException catch (error) {
-    throw Exception(error.message ?? 'No se pudo crear el grupo');
+    throw Exception(
+      mensajeErrorFirebaseFunction(
+        error,
+        fallback: 'No se pudo crear el grupo',
+      ),
+    );
   }
 
   if (groupPhoto != null) {
@@ -9066,10 +9466,10 @@ Future<GroupInvitePreview?> resolverVistaPreviaInvitacion(String codigo) async {
   if (inviteCode.isEmpty) return null;
 
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable(
-      'resolverInvitacionGrupo',
+    final result = await llamarCallableAutenticadoConReintento(
+      name: 'resolverInvitacionGrupo',
+      data: {'inviteCode': inviteCode},
     );
-    final result = await callable.call<dynamic>({'inviteCode': inviteCode});
     final data = result.data;
 
     if (data is! Map) return null;
@@ -9096,8 +9496,9 @@ Future<GroupInvitePreview?> resolverVistaPreviaInvitacion(String codigo) async {
 }
 
 int calcularNumeroSemanaISO(DateTime fecha) {
-  final jueves = fecha.add(Duration(days: 3 - ((fecha.weekday + 6) % 7)));
-  final primerJueves = DateTime(jueves.year, 1, 4);
+  final fechaUtc = DateTime.utc(fecha.year, fecha.month, fecha.day);
+  final jueves = fechaUtc.add(Duration(days: 3 - ((fechaUtc.weekday + 6) % 7)));
+  final primerJueves = DateTime.utc(jueves.year, 1, 4);
 
   return 1 +
       ((jueves.difference(primerJueves).inDays -
@@ -9108,12 +9509,13 @@ int calcularNumeroSemanaISO(DateTime fecha) {
 }
 
 int calcularAnioISO(DateTime fecha) {
-  final jueves = fecha.add(Duration(days: 3 - ((fecha.weekday + 6) % 7)));
+  final fechaUtc = DateTime.utc(fecha.year, fecha.month, fecha.day);
+  final jueves = fechaUtc.add(Duration(days: 3 - ((fechaUtc.weekday + 6) % 7)));
   return jueves.year;
 }
 
 String obtenerWeekKeyActual({DateTime? now}) {
-  final ahora = now ?? DateTime.now();
+  final ahora = sundayAppNow(now: now);
   final isoYear = calcularAnioISO(ahora);
   final isoWeek = calcularNumeroSemanaISO(ahora).toString().padLeft(2, '0');
 
@@ -9157,7 +9559,7 @@ List<String> construirItemsSelectorSemanas(Iterable<String> weekKeys) {
 }
 
 bool esDomingo({DateTime? now}) {
-  return (now ?? DateTime.now()).weekday == DateTime.sunday;
+  return sundayAppNow(now: now).weekday == DateTime.sunday;
 }
 
 bool debeMostrarMiembroSinPublicar({required bool posted, DateTime? now}) {
@@ -9165,7 +9567,7 @@ bool debeMostrarMiembroSinPublicar({required bool posted, DateTime? now}) {
 }
 
 bool esLunes({DateTime? now}) {
-  return (now ?? DateTime.now()).weekday == DateTime.monday;
+  return sundayAppNow(now: now).weekday == DateTime.monday;
 }
 
 String obtenerWeekKeyDomingoAnterior({DateTime? now}) {
@@ -9173,13 +9575,13 @@ String obtenerWeekKeyDomingoAnterior({DateTime? now}) {
 }
 
 bool puedeSubirSelfieLunesConRetraso(String weekKey, {DateTime? now}) {
-  final current = now ?? DateTime.now();
+  final current = sundayAppNow(now: now);
   return esLunes(now: current) &&
       weekKey == obtenerWeekKeyDomingoAnterior(now: current);
 }
 
 bool sundaySelfieSiguePendiente(String weekKey, {DateTime? now}) {
-  final current = now ?? DateTime.now();
+  final current = sundayAppNow(now: now);
   final isCurrentSunday =
       esDomingo(now: current) && weekKey == obtenerWeekKeyActual(now: current);
 
@@ -9191,7 +9593,7 @@ bool puedeUsarSelfieComoFotoPerfil(String weekKey, {DateTime? now}) {
   final cleanWeekKey = weekKey.trim();
   if (cleanWeekKey.isEmpty) return false;
 
-  final current = now ?? DateTime.now();
+  final current = sundayAppNow(now: now);
   final isCurrentSundaySelfie =
       esDomingo(now: current) &&
       cleanWeekKey == obtenerWeekKeyActual(now: current);
@@ -9207,7 +9609,7 @@ String missingSundaySelfieStatusLabel(String weekKey, {DateTime? now}) {
 }
 
 DateTime cierreDomingoAnterior({DateTime? now}) {
-  final current = now ?? DateTime.now();
+  final current = sundayAppNow(now: now);
   final today = DateTime(current.year, current.month, current.day);
   return today.subtract(const Duration(milliseconds: 1));
 }
@@ -9219,14 +9621,14 @@ bool miembroPuedeSubirSelfieLunesConRetraso(
 }) {
   if (!puedeSubirSelfieLunesConRetraso(weekKey, now: now)) return false;
 
-  final joined = timestampToDate(joinedAt);
+  final joined = timestampToSundayTime(joinedAt);
   if (joined == null) return false;
 
   return !joined.isAfter(cierreDomingoAnterior(now: now));
 }
 
 int diasHastaDomingo() {
-  final weekday = DateTime.now().weekday;
+  final weekday = sundayAppNow().weekday;
   if (weekday == DateTime.sunday) return 0;
   return DateTime.sunday - weekday;
 }
@@ -9246,7 +9648,7 @@ List<String> obtenerWeekKeysDomingosVisibles(
   Iterable<String> weekKeys, {
   DateTime? now,
 }) {
-  final current = now ?? DateTime.now();
+  final current = sundayAppNow(now: now);
   final currentWeekKey = obtenerWeekKeyActual(now: current);
   final currentWeekOrder = _weekKeyOrderValue(currentWeekKey);
   final includeCurrentSunday = esDomingo(now: current);
@@ -9324,7 +9726,7 @@ class SundayWindowState {
 }
 
 SundayWindowState obtenerSundayWindowState({DateTime? now}) {
-  final current = now ?? DateTime.now();
+  final current = sundayAppNow(now: now);
   final today = DateTime(current.year, current.month, current.day);
 
   final daysToSunday = current.weekday == DateTime.sunday
@@ -9382,7 +9784,7 @@ Duration obtenerTiempoRestanteVentana(
   SundayWindowState window, {
   DateTime? now,
 }) {
-  final current = now ?? DateTime.now();
+  final current = sundayAppNow(now: now);
   final target = obtenerObjetivoCountdown(window);
   final remaining = target.difference(current);
 
@@ -9464,17 +9866,11 @@ int intFromValue(dynamic value, {int fallback = 0}) {
 }
 
 int semanasActivasDesdeCreatedAt(dynamic createdAt) {
-  DateTime? created;
-
-  if (createdAt is Timestamp) {
-    created = createdAt.toDate();
-  } else if (createdAt is DateTime) {
-    created = createdAt;
-  }
+  final created = timestampToSundayTime(createdAt);
 
   if (created == null) return 1;
 
-  final now = DateTime.now();
+  final now = sundayAppNow();
   final firstSunday = DateTime(created.year, created.month, created.day).add(
     Duration(
       days: created.weekday == DateTime.sunday
@@ -9542,7 +9938,7 @@ String obtenerWeekKeySiguiente(String weekKey) {
 }
 
 String obtenerWeekKeyVisibleMasReciente({DateTime? now}) {
-  final current = now ?? DateTime.now();
+  final current = sundayAppNow(now: now);
   final currentWeekKey = obtenerWeekKeyActual(now: current);
 
   if (esDomingo(now: current)) return currentWeekKey;
@@ -9597,8 +9993,8 @@ List<String> obtenerWeekKeysCalendarioGrupo({
   required Iterable<String> existingWeekKeys,
   DateTime? now,
 }) {
-  final current = now ?? DateTime.now();
-  final created = timestampToDate(groupCreatedAt);
+  final current = sundayAppNow(now: now);
+  final created = timestampToSundayTime(groupCreatedAt);
 
   if (created == null) {
     return ordenarWeekKeysDescendentes(
@@ -9747,11 +10143,17 @@ Future<void> solicitarEntradaAGrupo({
   }
 
   try {
-    await FirebaseFunctions.instance
-        .httpsCallable('solicitarEntradaGrupo')
-        .call<void>({'groupId': groupId, 'inviteCodeUsed': inviteCodeUsed});
+    await llamarCallableAutenticadoConReintento(
+      name: 'solicitarEntradaGrupo',
+      data: {'groupId': groupId, 'inviteCodeUsed': inviteCodeUsed},
+    );
   } on FirebaseFunctionsException catch (error) {
-    throw Exception(error.message ?? 'No se pudo enviar la solicitud');
+    throw Exception(
+      mensajeErrorFirebaseFunction(
+        error,
+        fallback: 'No se pudo enviar la solicitud',
+      ),
+    );
   }
 }
 
@@ -10021,13 +10423,17 @@ Future<String> actualizarFotoGrupo({
 
 Future<void> regenerarInvitacionGrupo({required String groupId}) async {
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable(
-      'regenerarInvitacion',
+    await llamarCallableAutenticadoConReintento(
+      name: 'regenerarInvitacion',
+      data: {'groupId': groupId},
     );
-
-    await callable.call<void>({'groupId': groupId});
   } on FirebaseFunctionsException catch (error) {
-    throw Exception(error.message ?? 'No se pudo regenerar la invitación');
+    throw Exception(
+      mensajeErrorFirebaseFunction(
+        error,
+        fallback: 'No se pudo regenerar la invitación',
+      ),
+    );
   }
 }
 
@@ -10224,18 +10630,22 @@ Future<void> reaccionarASelfie({
   }
 
   try {
-    final callable = FirebaseFunctions.instance.httpsCallable(
-      'reaccionarASelfie',
+    await llamarCallableAutenticadoConReintento(
+      name: 'reaccionarASelfie',
+      data: {
+        'groupId': groupId,
+        'weekKey': weekKey,
+        'postUid': postUid,
+        'emoji': cleanEmoji,
+      },
     );
-
-    await callable.call<void>({
-      'groupId': groupId,
-      'weekKey': weekKey,
-      'postUid': postUid,
-      'emoji': cleanEmoji,
-    });
   } on FirebaseFunctionsException catch (error) {
-    throw Exception(error.message ?? 'No se pudo guardar la reacción');
+    throw Exception(
+      mensajeErrorFirebaseFunction(
+        error,
+        fallback: 'No se pudo guardar la reacción',
+      ),
+    );
   }
 }
 
@@ -11336,7 +11746,7 @@ Future<void> enviarMensajeChatSemana({
       .collection('weeks')
       .doc(weekKey);
   final messageRef = weekRef.collection('chatMessages').doc();
-  final now = DateTime.now();
+  final now = sundayAppNow();
 
   await firestore.runTransaction((transaction) async {
     final weekDoc = await transaction.get(weekRef);
@@ -12145,9 +12555,57 @@ class _AuthenticatedUserGateState extends State<AuthenticatedUserGate> {
               return OnboardingNameScreen(user: widget.user);
             }
 
-            return authenticatedShell;
+            return HomeLaunchPreloadGate(
+              user: widget.user,
+              child: authenticatedShell,
+            );
           },
         );
+      },
+    );
+  }
+}
+
+class HomeLaunchPreloadGate extends StatefulWidget {
+  final User user;
+  final Widget child;
+
+  const HomeLaunchPreloadGate({
+    super.key,
+    required this.user,
+    required this.child,
+  });
+
+  @override
+  State<HomeLaunchPreloadGate> createState() => _HomeLaunchPreloadGateState();
+}
+
+class _HomeLaunchPreloadGateState extends State<HomeLaunchPreloadGate> {
+  Future<void>? preloadFuture;
+
+  @override
+  void didUpdateWidget(covariant HomeLaunchPreloadGate oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.user.uid != widget.user.uid) {
+      preloadFuture = null;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final future = preloadFuture ??= precargarPantallaGruposInicial(
+      context,
+      widget.user,
+    );
+
+    return FutureBuilder<void>(
+      future: future,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const LoadingScreen();
+        }
+
+        return widget.child;
       },
     );
   }
@@ -13499,7 +13957,7 @@ class _SundayShellState extends State<SundayShell> {
     super.initState();
     selectedIndex = widget.initialIndex.clamp(0, profileTabIndex).toInt();
     pages = buildPages(widget.user);
-    pagesCalendarDay = inicioDiaLocal(DateTime.now());
+    pagesCalendarDay = inicioDiaLocal(sundayAppNow());
     registrarTokenNotificaciones(widget.user);
     setupNotificationNavigation();
   }
@@ -13519,7 +13977,7 @@ class _SundayShellState extends State<SundayShell> {
     super.didChangeDependencies();
     SundayClockScope.watch(context);
 
-    final today = inicioDiaLocal(DateTime.now());
+    final today = inicioDiaLocal(sundayAppNow());
     if (pagesCalendarDay != today) {
       pagesCalendarDay = today;
       pages = buildPages(widget.user);
@@ -13531,7 +13989,7 @@ class _SundayShellState extends State<SundayShell> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.user.uid != widget.user.uid) {
       pages = buildPages(widget.user);
-      pagesCalendarDay = inicioDiaLocal(DateTime.now());
+      pagesCalendarDay = inicioDiaLocal(sundayAppNow());
       registrarTokenNotificaciones(widget.user);
     }
   }
@@ -14073,15 +14531,22 @@ class _HomeScreenState extends State<HomeScreen> {
                         const SizedBox(height: 8),
                         InviteHintCard(onTap: _showCreateJoinSheet),
                       ] else ...[
-                        ...groupDocs.map(
-                          (doc) => RealGroupCard(
+                        ...groupDocs.map((doc) {
+                          final data = doc.data();
+                          final groupId = (data['groupId'] ?? doc.id)
+                              .toString();
+                          final initialPreloadData =
+                              _HomeGroupsPreloadCache.group(
+                                widget.user.uid,
+                                groupId,
+                              );
+
+                          return _RealGroupCard(
                             key: ValueKey('home_group_${doc.id}'),
                             userGroupDoc: doc,
                             currentUid: widget.user.uid,
+                            initialPreloadData: initialPreloadData,
                             onTap: () {
-                              final data = doc.data();
-                              final groupId = (data['groupId'] ?? doc.id)
-                                  .toString();
                               Navigator.push(
                                 context,
                                 MaterialPageRoute(
@@ -14089,8 +14554,8 @@ class _HomeScreenState extends State<HomeScreen> {
                                 ),
                               );
                             },
-                          ),
-                        ),
+                          );
+                        }),
                         const SizedBox(height: 2),
                         InviteHintCard(onTap: _showCreateJoinSheet),
                       ],
@@ -14106,23 +14571,25 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-class RealGroupCard extends StatefulWidget {
+class _RealGroupCard extends StatefulWidget {
   final QueryDocumentSnapshot<Map<String, dynamic>> userGroupDoc;
   final String currentUid;
+  final _HomeGroupPreloadData? initialPreloadData;
   final VoidCallback onTap;
 
-  const RealGroupCard({
+  const _RealGroupCard({
     super.key,
     required this.userGroupDoc,
     required this.currentUid,
+    this.initialPreloadData,
     required this.onTap,
   });
 
   @override
-  State<RealGroupCard> createState() => _RealGroupCardState();
+  State<_RealGroupCard> createState() => _RealGroupCardState();
 }
 
-class _RealGroupCardState extends State<RealGroupCard> {
+class _RealGroupCardState extends State<_RealGroupCard> {
   late String groupId;
   late Stream<DocumentSnapshot<Map<String, dynamic>>> groupStream;
   late Stream<QuerySnapshot<Map<String, dynamic>>> postsStream;
@@ -14135,7 +14602,7 @@ class _RealGroupCardState extends State<RealGroupCard> {
   }
 
   @override
-  void didUpdateWidget(covariant RealGroupCard oldWidget) {
+  void didUpdateWidget(covariant _RealGroupCard oldWidget) {
     super.didUpdateWidget(oldWidget);
     final oldData = oldWidget.userGroupDoc.data();
     final newData = widget.userGroupDoc.data();
@@ -14221,11 +14688,13 @@ class _RealGroupCardState extends State<RealGroupCard> {
   Widget build(BuildContext context) {
     final data = widget.userGroupDoc.data();
     final snapshotName = data['displayNameSnapshot'] ?? 'Grupo';
+    final initialPreloadData = widget.initialPreloadData;
 
     return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
       stream: groupStream,
       builder: (context, groupSnapshot) {
-        final groupData = groupSnapshot.data?.data();
+        final groupData =
+            groupSnapshot.data?.data() ?? initialPreloadData?.groupData;
         final name = groupData?['name'] ?? snapshotName;
         final memberCount = intFromValue(groupData?['memberCount']);
         final deleted = groupData?['deleted'] == true;
@@ -14235,7 +14704,8 @@ class _RealGroupCardState extends State<RealGroupCard> {
         return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
           stream: postsStream,
           builder: (context, postsSnapshot) {
-            final postDocs = postsSnapshot.data?.docs ?? [];
+            final postDocs =
+                postsSnapshot.data?.docs ?? initialPreloadData?.postDocs ?? [];
             for (final postDoc in postDocs) {
               prefetchPostPhotoCache(postDoc.data());
             }
@@ -14324,6 +14794,10 @@ class _RealGroupCardState extends State<RealGroupCard> {
                               GroupMembersAvatarStrip(
                                 groupId: groupId,
                                 memberCount: memberCount,
+                                initialMemberDocs:
+                                    initialPreloadData?.memberDocs,
+                                initialUserDataByUid:
+                                    initialPreloadData?.userDataByUid,
                               ),
                             ],
                           ),
@@ -14341,7 +14815,10 @@ class _RealGroupCardState extends State<RealGroupCard> {
                   Positioned(
                     right: -6,
                     bottom: -6,
-                    child: GroupStreakMedal(groupId: groupId),
+                    child: GroupStreakMedal(
+                      groupId: groupId,
+                      initialStats: initialPreloadData?.streakStats,
+                    ),
                   ),
                 ],
               ),
@@ -20377,11 +20854,11 @@ class _GroupAllPostsGridState extends State<GroupAllPostsGrid> {
 
 const double kGroupWeekSelectorKeyboardReserveHeight = 33.0;
 const double kWeeklyChatCollapsedSlotHeight = 60.0;
+const double kWeeklyChatExpandedDragZoneMinHeight = 76.0;
 const Duration kWeeklyChatPanelAnimationDuration = Duration(milliseconds: 240);
 const Curve kWeeklyChatPanelAnimationCurve = Curves.easeOutCubic;
 const double kWeeklyChatDragDismissDistance = 24.0;
 const double kWeeklyChatDragDismissVelocity = 320.0;
-const double kWeeklyChatExpandedDragInfluenceHeight = 112.0;
 
 double resolverAlturaPanelChatSemanal({
   required double screenHeight,
@@ -20440,6 +20917,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
   double dragAnimationStartOffset = 0;
   double dragAnimationEndOffset = 0;
   double lastExpandedPanelHeight = 0;
+  bool gifPickerWarmupStarted = false;
 
   @override
   void initState() {
@@ -20450,6 +20928,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
     )..addListener(_handleDragAnimationTick);
     configureMessagesStream();
     configureReadStateStream();
+    _warmGifPicker();
   }
 
   @override
@@ -20461,11 +20940,35 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
       configureReadStateStream();
       optimisticReadAt = null;
       lastReadWriteMarker = null;
+      gifPickerWarmupStarted = false;
+      _warmGifPicker();
     }
 
     if (oldWidget.expanded != widget.expanded) {
       dragAnimationController.stop();
       dragOffset = 0;
+      _warmGifPicker();
+    }
+  }
+
+  void _warmGifPicker() {
+    if (gifPickerWarmupStarted || !canWrite) return;
+
+    gifPickerWarmupStarted = true;
+    unawaited(_prefetchInitialGifs());
+  }
+
+  Future<void> _prefetchInitialGifs() async {
+    final result = await SundayGifRepository.prefetchInitial();
+    if (!mounted) return;
+
+    if (result.errorMessage != null || result.gifs.isEmpty) {
+      gifPickerWarmupStarted = false;
+      return;
+    }
+
+    for (final gif in result.gifs.take(8)) {
+      unawaited(precacheImage(NetworkImage(gif.url), context));
     }
   }
 
@@ -20567,6 +21070,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
     if (sending || !canWrite) return;
 
     FocusScope.of(context).unfocus();
+    _warmGifPicker();
 
     final gif = await showModalBottomSheet<SundayChatGif>(
       context: context,
@@ -21058,21 +21562,26 @@ class WeeklyChatExpandedDragZone extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      height: kWeeklyChatExpandedDragInfluenceHeight,
-      child: WeeklyChatDragArea(
-        onDismiss: onDismiss,
-        onDragStart: onDragStart,
-        onDragUpdate: onDragUpdate,
-        onDragEnd: onDragEnd,
-        onDragCancel: onDragCancel,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            WeeklyChatDragHandle(onDismiss: onDismiss, dragEnabled: false),
-            WeeklyChatHeader(weekLabel: weekLabel),
-            const Expanded(child: SizedBox.shrink()),
-          ],
+    return WeeklyChatDragArea(
+      onDismiss: onDismiss,
+      onDragStart: onDragStart,
+      onDragUpdate: onDragUpdate,
+      onDragEnd: onDragEnd,
+      onDragCancel: onDragCancel,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(
+          minHeight: kWeeklyChatExpandedDragZoneMinHeight,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              WeeklyChatDragHandle(onDismiss: onDismiss, dragEnabled: false),
+              WeeklyChatHeader(weekLabel: weekLabel),
+            ],
+          ),
         ),
       ),
     );
@@ -21116,7 +21625,7 @@ class _WeeklyChatDragHandleState extends State<WeeklyChatDragHandle> {
         onDragCancel: widget.dragEnabled ? widget.onDragCancel : null,
         child: SizedBox(
           width: double.infinity,
-          height: 22,
+          height: 34,
           child: Center(
             child: Container(
               width: 42,
@@ -21765,20 +22274,111 @@ class SundayGifSearchResult {
   });
 }
 
+class _SundayGifCacheEntry {
+  final SundayGifSearchResult result;
+  final DateTime storedAt;
+
+  const _SundayGifCacheEntry({required this.result, required this.storedAt});
+}
+
 class SundayGifRepository {
+  static const int initialPageSize = 18;
   static const int pageSize = 24;
+  static const Duration _cacheTtl = Duration(minutes: 10);
+  static final Map<String, _SundayGifCacheEntry> _cache = {};
+  static final Map<String, Future<SundayGifSearchResult>> _inFlight = {};
+
+  static Future<SundayGifSearchResult> prefetchInitial() {
+    return SundayGifRepository().search(query: '', limit: initialPageSize);
+  }
+
+  static SundayGifSearchResult? cachedInitialResult() {
+    return _cachedResult(query: '', pos: '', limit: initialPageSize);
+  }
 
   Future<SundayGifSearchResult> search({
     required String query,
     String? pos,
+    int limit = pageSize,
   }) async {
     final cleanQuery = query.trim();
     final cleanPos = pos?.trim() ?? '';
+    final cleanLimit = limit.clamp(1, pageSize);
+    final cacheKey = _cacheKey(
+      query: cleanQuery,
+      pos: cleanPos,
+      limit: cleanLimit,
+    );
+    final cached = _cachedResult(
+      query: cleanQuery,
+      pos: cleanPos,
+      limit: cleanLimit,
+    );
+    if (cached != null) return cached;
 
+    final inFlight = _inFlight[cacheKey];
+    if (inFlight != null) return inFlight;
+
+    final future = _fetchSearch(
+      query: cleanQuery,
+      pos: cleanPos,
+      limit: cleanLimit,
+    );
+    _inFlight[cacheKey] = future;
+
+    try {
+      final result = await future;
+      if (result.errorMessage == null && result.gifs.isNotEmpty) {
+        _cache[cacheKey] = _SundayGifCacheEntry(
+          result: result,
+          storedAt: DateTime.now(),
+        );
+      }
+
+      return result;
+    } finally {
+      _inFlight.remove(cacheKey);
+    }
+  }
+
+  static String _cacheKey({
+    required String query,
+    required String pos,
+    required int limit,
+  }) {
+    return '${query.toLowerCase()}|$pos|$limit';
+  }
+
+  static SundayGifSearchResult? _cachedResult({
+    required String query,
+    required String pos,
+    required int limit,
+  }) {
+    final cacheKey = _cacheKey(
+      query: query.trim(),
+      pos: pos.trim(),
+      limit: limit,
+    );
+    final cached = _cache[cacheKey];
+    if (cached == null) return null;
+
+    if (DateTime.now().difference(cached.storedAt) > _cacheTtl) {
+      _cache.remove(cacheKey);
+      return null;
+    }
+
+    return cached.result;
+  }
+
+  Future<SundayGifSearchResult> _fetchSearch({
+    required String query,
+    required String pos,
+    required int limit,
+  }) async {
     try {
       final response = await llamarCallableAutenticadoConReintento(
         name: 'buscarGifsTenor',
-        data: {'query': cleanQuery, 'pos': cleanPos, 'limit': pageSize},
+        data: {'query': query, 'pos': pos, 'limit': limit},
       );
       final data = response.data;
 
@@ -21806,10 +22406,7 @@ class SundayGifRepository {
         gifs: const [],
         next: '',
         fromGiphy: false,
-        errorMessage: _searchErrorMessage(
-          error,
-          paginating: cleanPos.isNotEmpty,
-        ),
+        errorMessage: _searchErrorMessage(error, paginating: pos.isNotEmpty),
       );
     }
   }
@@ -21893,7 +22490,15 @@ class _SundayGifPickerSheetState extends State<SundayGifPickerSheet> {
   void initState() {
     super.initState();
     scrollController.addListener(_handleScroll);
-    unawaited(_loadGifs(reset: true));
+    final cachedInitialResult = SundayGifRepository.cachedInitialResult();
+    if (cachedInitialResult != null) {
+      gifs = cachedInitialResult.gifs;
+      nextPagePosition = cachedInitialResult.next;
+      showingGiphyResults = cachedInitialResult.fromGiphy;
+      loading = false;
+    } else {
+      unawaited(_loadGifs(reset: true));
+    }
   }
 
   @override
@@ -21954,6 +22559,9 @@ class _SundayGifPickerSheetState extends State<SundayGifPickerSheet> {
     final result = await gifRepository.search(
       query: searchQuery,
       pos: pagePosition,
+      limit: reset
+          ? SundayGifRepository.initialPageSize
+          : SundayGifRepository.pageSize,
     );
 
     if (!mounted || generation != requestGeneration) return;
@@ -25436,79 +26044,109 @@ class _SelfieReplacementInfoScreenState
           children: [
             AppHeader(onBack: () => Navigator.pop(context)),
             Expanded(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(24, 0, 24, 26),
-                child: Column(
-                  children: [
-                    Expanded(
-                      child: SingleChildScrollView(
-                        physics: const BouncingScrollPhysics(),
-                        child: Padding(
-                          padding: const EdgeInsets.only(top: 8, bottom: 18),
-                          child: Column(
-                            children: [
-                              _SelfieReplacementPolaroid(
-                                imageUrl: widget.selfieImageUrl,
-                                thumbnailUrl: widget.selfieThumbnailUrl,
-                                dateLabel: localizedSelfieDateLabel(
-                                  context,
-                                  _polaroidDate,
-                                ),
-                              ),
-                              const SizedBox(height: 22),
-                              const _SelfiePublishedTodayChip(),
-                              const SizedBox(height: 28),
-                              Text(
-                                context.tr('Una selfie por domingo'),
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(
-                                  color: ssTitle,
-                                  fontSize: 30,
-                                  height: 1.08,
-                                  fontWeight: FontWeight.w900,
-                                ),
-                              ),
-                              const SizedBox(height: 14),
-                              Text(
-                                context.tr(
-                                  'Puedes rehacerla una sola vez viendo un anuncio. La cámara se abrirá al terminar.',
-                                ),
-                                textAlign: TextAlign.center,
-                                style: const TextStyle(
-                                  color: ssText2,
-                                  fontSize: 19,
-                                  height: 1.45,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
-                            ],
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final compact = constraints.maxHeight < 690;
+                  final veryCompact = constraints.maxHeight < 620;
+                  final preferredPolaroidMaxWidth = veryCompact
+                      ? 198.0
+                      : compact
+                      ? 232.0
+                      : 300.0;
+                  final buttonHeight = compact ? 62.0 : 68.0;
+                  final estimatedNonPolaroidHeight =
+                      (veryCompact ? 10.0 : 16.0) +
+                      36.0 +
+                      (veryCompact ? 16.0 : 22.0) +
+                      (veryCompact ? 56.0 : 62.0) +
+                      (veryCompact ? 8.0 : 10.0) +
+                      (veryCompact ? 42.0 : 48.0) +
+                      buttonHeight +
+                      (compact ? 8.0 : 12.0) +
+                      48.0 +
+                      (compact ? 16.0 : 24.0);
+                  final availablePolaroidHeight =
+                      (constraints.maxHeight - estimatedNonPolaroidHeight - 71)
+                          .clamp(178.0, 360.0)
+                          .toDouble();
+                  final heightCappedPolaroidWidth =
+                      availablePolaroidHeight * 0.82 + 24;
+                  final polaroidMaxWidth = math.min(
+                    preferredPolaroidMaxWidth,
+                    heightCappedPolaroidWidth,
+                  );
+
+                  return Padding(
+                    padding: EdgeInsets.fromLTRB(
+                      24,
+                      veryCompact ? 0 : 4,
+                      24,
+                      compact ? 16 : 24,
+                    ),
+                    child: Column(
+                      children: [
+                        _SelfieReplacementPolaroid(
+                          imageUrl: widget.selfieImageUrl,
+                          thumbnailUrl: widget.selfieThumbnailUrl,
+                          dateLabel: localizedSelfieDateLabel(
+                            context,
+                            _polaroidDate,
+                          ),
+                          maxWidth: polaroidMaxWidth,
+                        ),
+                        SizedBox(height: veryCompact ? 10 : 16),
+                        const _SelfiePublishedTodayChip(),
+                        SizedBox(height: veryCompact ? 16 : 22),
+                        Text(
+                          context.tr('Una selfie por domingo'),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: ssTitle,
+                            fontSize: veryCompact ? 25 : 28,
+                            height: 1.08,
+                            fontWeight: FontWeight.w900,
                           ),
                         ),
-                      ),
-                    ),
-                    _SelfieReplacementPrimaryButton(
-                      loading: loadingAd,
-                      onPressed: loadingAd ? null : _watchAdAndOpenCamera,
-                    ),
-                    const SizedBox(height: 12),
-                    TextButton(
-                      onPressed: loadingAd
-                          ? null
-                          : () => Navigator.pop(context),
-                      style: TextButton.styleFrom(
-                        foregroundColor: ssOrangeDark,
-                        disabledForegroundColor: ssOrangeDark.withValues(
-                          alpha: 0.42,
+                        SizedBox(height: veryCompact ? 8 : 10),
+                        Text(
+                          context.tr(
+                            'Puedes rehacerla una sola vez viendo un anuncio.',
+                          ),
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: ssText2,
+                            fontSize: veryCompact ? 15.5 : 17,
+                            height: 1.35,
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
-                        textStyle: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w800,
+                        const Spacer(),
+                        _SelfieReplacementPrimaryButton(
+                          loading: loadingAd,
+                          height: buttonHeight,
+                          onPressed: loadingAd ? null : _watchAdAndOpenCamera,
                         ),
-                      ),
-                      child: Text(context.tr('Conservar mi selfie actual')),
+                        SizedBox(height: compact ? 8 : 12),
+                        TextButton(
+                          onPressed: loadingAd
+                              ? null
+                              : () => Navigator.pop(context),
+                          style: TextButton.styleFrom(
+                            foregroundColor: ssOrangeDark,
+                            disabledForegroundColor: ssOrangeDark.withValues(
+                              alpha: 0.42,
+                            ),
+                            textStyle: TextStyle(
+                              fontSize: compact ? 16 : 18,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          child: Text(context.tr('Conservar mi selfie actual')),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
+                  );
+                },
               ),
             ),
           ],
@@ -25522,17 +26160,20 @@ class _SelfieReplacementPolaroid extends StatelessWidget {
   final String imageUrl;
   final String thumbnailUrl;
   final String dateLabel;
+  final double maxWidth;
 
   const _SelfieReplacementPolaroid({
     required this.imageUrl,
     required this.thumbnailUrl,
     required this.dateLabel,
+    required this.maxWidth,
   });
 
   @override
   Widget build(BuildContext context) {
     final screenWidth = MediaQuery.sizeOf(context).width;
-    final width = math.min(342.0, math.max(232.0, screenWidth * 0.64));
+    final minWidth = math.min(188.0, maxWidth);
+    final width = math.min(maxWidth, math.max(minWidth, screenWidth * 0.56));
     final cleanImageUrl = imageUrl.trim();
     final cleanThumbnailUrl = thumbnailUrl.trim();
     final loadingPreview =
@@ -25640,10 +26281,12 @@ class _SelfiePublishedTodayChip extends StatelessWidget {
 
 class _SelfieReplacementPrimaryButton extends StatelessWidget {
   final bool loading;
+  final double height;
   final VoidCallback? onPressed;
 
   const _SelfieReplacementPrimaryButton({
     required this.loading,
+    required this.height,
     required this.onPressed,
   });
 
@@ -25651,7 +26294,7 @@ class _SelfieReplacementPrimaryButton extends StatelessWidget {
   Widget build(BuildContext context) {
     return SizedBox(
       width: double.infinity,
-      height: 70,
+      height: height,
       child: ElevatedButton(
         onPressed: onPressed,
         style: ElevatedButton.styleFrom(
@@ -25710,7 +26353,7 @@ class _SelfieReplacementPrimaryButton extends StatelessWidget {
                   const SizedBox(width: 18),
                   Flexible(
                     child: Text(
-                      context.tr('Ver anuncio y rehacer'),
+                      context.tr('Ver anuncio'),
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
@@ -27245,8 +27888,82 @@ class _MontageScreenState extends State<MontageScreen> {
   final ScrollController montageWeekSelectorScrollController =
       ScrollController();
   final GlobalKey montageBoundaryKey = GlobalKey();
+  late Stream<QuerySnapshot<Map<String, dynamic>>> userGroupsStream;
+  String? montageGroupStreamKey;
+  Stream<DocumentSnapshot<Map<String, dynamic>>>? montageGroupStream;
+  String? montageWeeksStreamKey;
+  Stream<QuerySnapshot<Map<String, dynamic>>>? montageWeeksStream;
   String? montagePostsFutureKey;
   Future<QuerySnapshot<Map<String, dynamic>>>? montagePostsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _configureUserGroupsStream();
+  }
+
+  @override
+  void didUpdateWidget(covariant MontageScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.user.uid != widget.user.uid) {
+      selectedGroupIndex = 0;
+      selectedMontageWeekKey = null;
+      montageShuffleSeed = 0;
+      montageGroupStreamKey = null;
+      montageGroupStream = null;
+      montageWeeksStreamKey = null;
+      montageWeeksStream = null;
+      montagePostsFutureKey = null;
+      montagePostsFuture = null;
+      _configureUserGroupsStream();
+    }
+  }
+
+  void _configureUserGroupsStream() {
+    userGroupsStream = FirebaseFirestore.instance
+        .collection('users')
+        .doc(widget.user.uid)
+        .collection('groups')
+        .orderBy('joinedAt', descending: true)
+        .snapshots();
+  }
+
+  Stream<DocumentSnapshot<Map<String, dynamic>>> _groupStreamFor(
+    DocumentReference<Map<String, dynamic>> groupRef,
+    String groupId,
+  ) {
+    if (montageGroupStreamKey != groupId || montageGroupStream == null) {
+      montageGroupStreamKey = groupId;
+      montageGroupStream = groupRef.snapshots();
+    }
+
+    return montageGroupStream!;
+  }
+
+  Stream<QuerySnapshot<Map<String, dynamic>>> _weeksStreamFor(
+    DocumentReference<Map<String, dynamic>> groupRef,
+    String groupId,
+  ) {
+    if (montageWeeksStreamKey != groupId || montageWeeksStream == null) {
+      montageWeeksStreamKey = groupId;
+      montageWeeksStream = groupRef
+          .collection('weeks')
+          .orderBy('createdAt', descending: true)
+          .snapshots();
+    }
+
+    return montageWeeksStream!;
+  }
+
+  void _selectMontageGroup(int index) {
+    if (selectedGroupIndex == index) return;
+
+    setState(() {
+      selectedGroupIndex = index;
+      selectedMontageWeekKey = null;
+      montageShuffleSeed = 0;
+    });
+  }
 
   Object? _postCountForWeek(
     List<QueryDocumentSnapshot<Map<String, dynamic>>> weekDocs,
@@ -27504,12 +28221,6 @@ class _MontageScreenState extends State<MontageScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final userGroupsRef = FirebaseFirestore.instance
-        .collection('users')
-        .doc(widget.user.uid)
-        .collection('groups')
-        .orderBy('joinedAt', descending: true);
-
     return Scaffold(
       backgroundColor: ssBg,
       body: SafeArea(
@@ -27518,7 +28229,7 @@ class _MontageScreenState extends State<MontageScreen> {
             const AppHeader(),
             Expanded(
               child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                stream: userGroupsRef.snapshots(),
+                stream: userGroupsStream,
                 builder: (context, snapshot) {
                   if (snapshot.connectionState == ConnectionState.waiting) {
                     return const Center(
@@ -27558,9 +28269,11 @@ class _MontageScreenState extends State<MontageScreen> {
                   final groupRef = FirebaseFirestore.instance
                       .collection('groups')
                       .doc(groupId);
+                  final groupStream = _groupStreamFor(groupRef, groupId);
+                  final weeksStream = _weeksStreamFor(groupRef, groupId);
 
                   return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-                    stream: groupRef.snapshots(),
+                    stream: groupStream,
                     builder: (context, groupSnapshot) {
                       final groupData =
                           groupSnapshot.data?.data() ??
@@ -27573,12 +28286,8 @@ class _MontageScreenState extends State<MontageScreen> {
                       final memberCount = memberCountRaw is int
                           ? memberCountRaw
                           : int.tryParse('$memberCountRaw') ?? 0;
-                      final weeksRef = groupRef
-                          .collection('weeks')
-                          .orderBy('createdAt', descending: true);
-
                       return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-                        stream: weeksRef.snapshots(),
+                        stream: weeksStream,
                         builder: (context, weeksSnapshot) {
                           final weekDocs = weeksSnapshot.data?.docs ?? [];
                           final weekKeys = obtenerWeekKeysCalendarioGrupo(
@@ -27603,11 +28312,7 @@ class _MontageScreenState extends State<MontageScreen> {
                                   selectedGroupIndex: selectedGroupIndex,
                                   controller:
                                       montageGroupSelectorScrollController,
-                                  onSelected: (index) => setState(() {
-                                    selectedGroupIndex = index;
-                                    selectedMontageWeekKey = null;
-                                    montageShuffleSeed = 0;
-                                  }),
+                                  onSelected: _selectMontageGroup,
                                 ),
                                 const Padding(
                                   padding: EdgeInsets.fromLTRB(16, 42, 16, 28),
@@ -27658,11 +28363,7 @@ class _MontageScreenState extends State<MontageScreen> {
                                       selectedGroupIndex: selectedGroupIndex,
                                       controller:
                                           montageGroupSelectorScrollController,
-                                      onSelected: (index) => setState(() {
-                                        selectedGroupIndex = index;
-                                        selectedMontageWeekKey = null;
-                                        montageShuffleSeed = 0;
-                                      }),
+                                      onSelected: _selectMontageGroup,
                                     ),
                                     SizedBox(
                                       height: 37,
@@ -28028,6 +28729,11 @@ class _MontageGroupIconButton extends StatelessWidget {
             clipBehavior: Clip.antiAlias,
             child: InkWell(
               onTap: onTap,
+              splashFactory: NoSplash.splashFactory,
+              splashColor: Colors.transparent,
+              highlightColor: Colors.transparent,
+              hoverColor: Colors.transparent,
+              focusColor: Colors.transparent,
               child: Center(
                 child: AnimatedScale(
                   scale: selected ? 1.04 : 1,
@@ -30133,6 +30839,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   final screenHeight = MediaQuery.sizeOf(context).height;
                   final compactProfile = screenHeight < 780;
                   final profileAvatarSize = compactProfile ? 86.0 : 99.0;
+                  final profileAvatarVisualSize = profileAvatarSize * 1.15;
+                  final profileAvatarLift =
+                      (profileAvatarVisualSize - profileAvatarSize) / 2;
                   final profileTopPadding = compactProfile ? 6.0 : 16.0;
                   final profileBottomPadding = compactProfile ? 14.0 : 24.0;
                   final profileMainGap = compactProfile ? 12.0 : 20.0;
@@ -30169,11 +30878,22 @@ class _ProfileScreenState extends State<ProfileScreen> {
                                 ),
                                 child: Column(
                                   children: [
-                                    ProfileAvatar(
-                                      name: baseName,
-                                      photoUrl: basePhotoUrl,
-                                      size: profileAvatarSize,
-                                      onTap: openEditProfile,
+                                    SizedBox(
+                                      width: profileAvatarSize,
+                                      height: profileAvatarSize,
+                                      child: OverflowBox(
+                                        maxWidth: profileAvatarVisualSize,
+                                        maxHeight: profileAvatarVisualSize,
+                                        child: Transform.translate(
+                                          offset: Offset(0, -profileAvatarLift),
+                                          child: ProfileAvatar(
+                                            name: baseName,
+                                            photoUrl: basePhotoUrl,
+                                            size: profileAvatarVisualSize,
+                                            onTap: openEditProfile,
+                                          ),
+                                        ),
+                                      ),
                                     ),
                                     SizedBox(height: compactProfile ? 12 : 16),
                                     Text(
@@ -33190,7 +33910,7 @@ int activeWeeksFromGroups(
   if (groupDocs.isEmpty) return 0;
 
   final joinedDates = groupDocs
-      .map((doc) => timestampToDate(doc.data()['joinedAt']))
+      .map((doc) => timestampToSundayTime(doc.data()['joinedAt']))
       .whereType<DateTime>()
       .toList();
 
@@ -33198,7 +33918,7 @@ int activeWeeksFromGroups(
 
   joinedDates.sort();
   final first = joinedDates.first;
-  final now = DateTime.now();
+  final now = sundayAppNow();
   if (first.isAfter(now)) return 0;
 
   final firstDay = DateTime(first.year, first.month, first.day);
@@ -33858,7 +34578,7 @@ class SundayWindowCountdownCard extends StatelessWidget {
     return StreamBuilder<int>(
       stream: Stream.periodic(const Duration(seconds: 1), (value) => value),
       builder: (context, snapshot) {
-        final now = DateTime.now();
+        final now = sundayAppNow();
         final window = obtenerSundayWindowState(now: now);
         final remaining = obtenerTiempoRestanteVentana(window, now: now);
         final isOpen = window.canUpload;
@@ -33972,7 +34692,7 @@ class SundayBanner extends StatelessWidget {
     return StreamBuilder<int>(
       stream: Stream.periodic(const Duration(minutes: 1), (value) => value),
       builder: (context, snapshot) {
-        final now = DateTime.now();
+        final now = sundayAppNow();
         final dayNames = [
           'Lunes',
           'Martes',
@@ -33986,7 +34706,7 @@ class SundayBanner extends StatelessWidget {
         final isSunday = now.weekday == DateTime.sunday;
         final daysUntilSunday = isSunday ? 0 : DateTime.sunday - now.weekday;
         final weekLabel = isSunday
-            ? localizedWeekLabel(context, obtenerWeekKeyActual())
+            ? localizedWeekLabel(context, obtenerWeekKeyActual(now: now))
             : '';
         final leftText = context.tr(
           isSunday ? '¡Sube tu selfie del domingo!' : '¡Toca esperar!',
@@ -34425,11 +35145,15 @@ class _MiniAvatarInitials extends StatelessWidget {
 class GroupMembersAvatarStrip extends StatelessWidget {
   final String groupId;
   final int memberCount;
+  final List<QueryDocumentSnapshot<Map<String, dynamic>>>? initialMemberDocs;
+  final Map<String, Map<String, dynamic>>? initialUserDataByUid;
 
   const GroupMembersAvatarStrip({
     super.key,
     required this.groupId,
     required this.memberCount,
+    this.initialMemberDocs,
+    this.initialUserDataByUid,
   });
 
   @override
@@ -34444,7 +35168,7 @@ class GroupMembersAvatarStrip extends StatelessWidget {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: membersRef.snapshots(),
       builder: (context, snapshot) {
-        final members = snapshot.data?.docs ?? [];
+        final members = snapshot.data?.docs ?? initialMemberDocs ?? [];
         final shown = members.length;
         final remaining = (memberCount - shown).clamp(0, 999);
 
@@ -34468,6 +35192,7 @@ class GroupMembersAvatarStrip extends StatelessWidget {
                   uid: member.id,
                   name: name,
                   photoUrl: photoUrl,
+                  initialUserData: initialUserDataByUid?[member.id],
                 ),
               );
             }),
@@ -34484,12 +35209,14 @@ class ResolvedMemberMiniAvatar extends StatelessWidget {
   final String uid;
   final String name;
   final String? photoUrl;
+  final Map<String, dynamic>? initialUserData;
 
   const ResolvedMemberMiniAvatar({
     super.key,
     required this.uid,
     required this.name,
     required this.photoUrl,
+    this.initialUserData,
   });
 
   bool get hasMemberPhoto => photoUrl != null && photoUrl!.trim().isNotEmpty;
@@ -34506,7 +35233,7 @@ class ResolvedMemberMiniAvatar extends StatelessWidget {
           .doc(uid)
           .snapshots(),
       builder: (context, snapshot) {
-        final userData = snapshot.data?.data();
+        final userData = snapshot.data?.data() ?? initialUserData;
         final rawUserPhotoUrl = userData?['basePhotoUrl'];
         final resolvedPhotoUrl = rawUserPhotoUrl is String
             ? rawUserPhotoUrl
@@ -34529,8 +35256,9 @@ class ResolvedMemberMiniAvatar extends StatelessWidget {
 
 class GroupStreakMedal extends StatelessWidget {
   final String groupId;
+  final GroupStreakStats? initialStats;
 
-  const GroupStreakMedal({super.key, required this.groupId});
+  const GroupStreakMedal({super.key, required this.groupId, this.initialStats});
 
   void _openStats(BuildContext context, GroupStreakStats stats) {
     showModalBottomSheet(
@@ -34546,7 +35274,7 @@ class GroupStreakMedal extends StatelessWidget {
     return FutureBuilder<GroupStreakStats>(
       future: calcularEstadisticasRachaCompletaGrupoFirestore(groupId: groupId),
       builder: (context, snapshot) {
-        final stats = snapshot.data ?? GroupStreakStats.zero;
+        final stats = snapshot.data ?? initialStats ?? GroupStreakStats.zero;
         final medalCount = stats.current;
 
         if (medalCount <= 0) {
@@ -36392,7 +37120,7 @@ class WeekCalendarGraphic extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final days = ['L', 'M', 'X', 'J', 'V', 'S', 'D'];
-    final todayIndex = DateTime.now().weekday - 1;
+    final todayIndex = sundayAppNow().weekday - 1;
 
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,

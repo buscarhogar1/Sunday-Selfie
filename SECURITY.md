@@ -7,7 +7,9 @@ Los archivos de configuracion cliente de Firebase (`google-services.json`,
 publicos de la app, no secretos de servidor. La proteccion real debe venir de:
 
 - Firestore Rules y Storage Rules estrictas.
-- Firebase App Check activado y exigido en Cloud Functions.
+- Firebase App Check activado y exigido en Cloud Functions. La funcion
+  `registrarSelfie` queda exenta porque la subida ya esta protegida por Auth,
+  membresia de grupo, ventana de domingo, metadatos firmes y reglas de Storage.
 - Restricciones de las API keys en Google Cloud/Firebase por app, paquete,
   bundle id, SHA-1/SHA-256 y APIs permitidas.
 

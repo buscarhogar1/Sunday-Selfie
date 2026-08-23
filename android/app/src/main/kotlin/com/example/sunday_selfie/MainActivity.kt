@@ -10,12 +10,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.MediaScannerConnection
+import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.view.KeyEvent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.util.concurrent.CountDownLatch
@@ -26,12 +28,19 @@ class MainActivity : FlutterActivity() {
     private val methodChannelName = "sunday_selfie/foreground_notifications"
     private val mediaSaverChannelName = "sunday_selfie/media_saver"
     private val volumeButtonsChannelName = "sunday_selfie/volume_buttons"
+    private val deepLinksChannelName = "sunday_selfie/deep_links"
+    private val deepLinksEventChannelName = "sunday_selfie/deep_links/events"
     private val extraForegroundNotification = "foreground_notification"
     private val extraPayload = "payload"
     private var methodChannel: MethodChannel? = null
     private var mediaSaverChannel: MethodChannel? = null
     private var volumeButtonsChannel: MethodChannel? = null
+    private var deepLinksChannel: MethodChannel? = null
+    private var deepLinksEventChannel: EventChannel? = null
+    private var deepLinksEventSink: EventChannel.EventSink? = null
     private var pendingLaunchPayload: String? = null
+    private var initialDeepLink: String? = null
+    private var latestDeepLink: String? = null
     private var volumeButtonCaptureEnabled = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -48,6 +57,14 @@ class MainActivity : FlutterActivity() {
         volumeButtonsChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             volumeButtonsChannelName
+        )
+        deepLinksChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            deepLinksChannelName
+        )
+        deepLinksEventChannel = EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            deepLinksEventChannelName
         )
 
         methodChannel?.setMethodCallHandler { call, result ->
@@ -125,8 +142,25 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+        deepLinksChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getInitialLink" -> result.success(initialDeepLink ?: latestDeepLink)
+                else -> result.notImplemented()
+            }
+        }
+        deepLinksEventChannel?.setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                deepLinksEventSink = events
+                latestDeepLink?.let { events?.success(it) }
+            }
+
+            override fun onCancel(arguments: Any?) {
+                deepLinksEventSink = null
+            }
+        })
 
         handleForegroundNotificationIntent(intent)
+        handleDeepLinkIntent(intent)
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -144,11 +178,13 @@ class MainActivity : FlutterActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleForegroundNotificationIntent(intent)
+        handleDeepLinkIntent(intent)
     }
 
     override fun onResume() {
         super.onResume()
         handleForegroundNotificationIntent(intent)
+        handleDeepLinkIntent(intent)
     }
 
     private fun showForegroundNotification(args: Map<*, *>) {
@@ -260,6 +296,35 @@ class MainActivity : FlutterActivity() {
         val payload = consumePayload(intent) ?: return
         pendingLaunchPayload = payload
         methodChannel?.invokeMethod("notificationTap", payload)
+    }
+
+    private fun handleDeepLinkIntent(intent: Intent?) {
+        val uri = intent?.data ?: return
+        if (intent.action != Intent.ACTION_VIEW || !isSundaySelfieDeepLink(uri)) {
+            return
+        }
+
+        val value = uri.toString()
+        if (initialDeepLink == null) {
+            initialDeepLink = value
+        }
+        if (latestDeepLink == value) return
+
+        latestDeepLink = value
+        deepLinksEventSink?.success(value)
+    }
+
+    private fun isSundaySelfieDeepLink(uri: Uri): Boolean {
+        if (uri.scheme?.lowercase() != "https") return false
+        val host = uri.host?.lowercase() ?: return false
+        if (host != "sundayselfie.app" && host != "www.sundayselfie.app") {
+            return false
+        }
+
+        val firstPathSegment = uri.pathSegments.firstOrNull()?.lowercase()
+        return firstPathSegment == "j" ||
+            firstPathSegment == "join" ||
+            firstPathSegment == "invite"
     }
 
     private fun consumePayload(intent: Intent?): String? {

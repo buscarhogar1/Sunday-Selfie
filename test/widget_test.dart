@@ -110,6 +110,25 @@ void main() {
     );
   });
 
+  test('usa la hora de Madrid para abrir la semana del domingo', () {
+    final madridSunday = sundayAppTimeFromUtc(
+      DateTime.utc(2026, 8, 15, 22, 11),
+    );
+
+    expect(madridSunday, DateTime(2026, 8, 16, 0, 11));
+    expect(esDomingo(now: madridSunday), isTrue);
+    expect(obtenerWeekKeyActual(now: madridSunday), '2026-W33');
+    expect(obtenerWeekKeyVisibleMasReciente(now: madridSunday), '2026-W33');
+  });
+
+  test('programa el refresco segun el cambio de dia en Madrid', () {
+    final delay = demoraHastaProximoRefrescoCambioDeDia(
+      utcNow: DateTime.utc(2026, 8, 15, 22, 11),
+    );
+
+    expect(delay, const Duration(hours: 23, minutes: 49, milliseconds: 250));
+  });
+
   test('limita los pixeles exportados en montajes largos', () {
     expect(
       calcularPixelRatioCapturaMontaje(const Size(360, 900)),
@@ -277,7 +296,7 @@ void main() {
       now: now,
     );
 
-    expect(weekKeys, ['2026-W22', '2026-W21', '2026-W20']);
+    expect(weekKeys, ['2026-W23', '2026-W22', '2026-W21']);
   });
 
   test('la semana inicial del grupo es la mas reciente visible', () {
@@ -706,51 +725,51 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
-  testWidgets(
-    'el chat abierto tiene una zona amplia para arrastrar hacia abajo',
-    (tester) async {
-      var dragStarted = false;
-      double? updatedDistance;
-      double? endedDistance;
+  testWidgets('el chat abierto acerca los mensajes a la cabecera compacta', (
+    tester,
+  ) async {
+    var dragStarted = false;
+    double? updatedDistance;
+    double? endedDistance;
 
-      await tester.pumpWidget(
-        MaterialApp(
-          home: Scaffold(
-            body: Align(
-              alignment: Alignment.topCenter,
-              child: SizedBox(
-                width: 360,
-                child: WeeklyChatExpandedDragZone(
-                  weekLabel: 'SEMANA 26 / 2026',
-                  onDismiss: () {},
-                  onDragStart: () => dragStarted = true,
-                  onDragUpdate: (distance) => updatedDistance = distance,
-                  onDragEnd: (distance, _) => endedDistance = distance,
-                ),
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.topCenter,
+            child: SizedBox(
+              width: 360,
+              child: WeeklyChatExpandedDragZone(
+                weekLabel: 'SEMANA 26 / 2026',
+                onDismiss: () {},
+                onDragStart: () => dragStarted = true,
+                onDragUpdate: (distance) => updatedDistance = distance,
+                onDragEnd: (distance, _) => endedDistance = distance,
               ),
             ),
           ),
         ),
-      );
+      ),
+    );
 
-      final zoneTopLeft = tester.getTopLeft(
-        find.byType(WeeklyChatExpandedDragZone),
-      );
-      await tester.dragFrom(
-        zoneTopLeft +
-            const Offset(180, kWeeklyChatExpandedDragInfluenceHeight - 8),
-        const Offset(0, 36),
-      );
-      await tester.pump();
+    final zone = find.byType(WeeklyChatExpandedDragZone);
+    expect(tester.getSize(zone).height, lessThanOrEqualTo(60));
 
-      expect(dragStarted, isTrue);
-      expect(updatedDistance, isNotNull);
-      expect(updatedDistance!, greaterThan(0));
-      expect(endedDistance, isNotNull);
-      expect(endedDistance!, greaterThan(kWeeklyChatDragDismissDistance));
-      expect(tester.takeException(), isNull);
-    },
-  );
+    final zoneTopLeft = tester.getTopLeft(zone);
+    final zoneHeight = tester.getSize(zone).height;
+    await tester.dragFrom(
+      zoneTopLeft + Offset(180, zoneHeight - 8),
+      const Offset(0, 36),
+    );
+    await tester.pump();
+
+    expect(dragStarted, isTrue);
+    expect(updatedDistance, isNotNull);
+    expect(updatedDistance!, greaterThan(0));
+    expect(endedDistance, isNotNull);
+    expect(endedDistance!, greaterThan(kWeeklyChatDragDismissDistance));
+    expect(tester.takeException(), isNull);
+  });
 
   testWidgets('el chat finalizado no muestra flecha ni mueve el candado', (
     tester,

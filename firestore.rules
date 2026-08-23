@@ -87,7 +87,7 @@ service cloud.firestore {
         && request.resource.data.text.size() <= 500
         && (
           request.resource.data.gifUrl == null
-          || isValidTenorGifUrl(request.resource.data.gifUrl)
+          || isValidTrustedGifUrl(request.resource.data.gifUrl)
         )
         && (
           request.resource.data.gifLabel == null
@@ -112,11 +112,14 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time;
     }
 
-    function isValidTenorGifUrl(value) {
+    function isValidTrustedGifUrl(value) {
       return value is string
         && value.size() > 0
         && value.size() <= 2000
-        && value.matches("^https://media\\.tenor\\.com/[^\\s]+$");
+        && (
+          value.matches("^https://media\\.tenor\\.com/[^\\s]+$")
+          || value.matches("^https://media[0-9]*\\.giphy\\.com/[^\\s]+$")
+        );
     }
 
     function validGroupActivityUpdate(groupId) {
