@@ -7,6 +7,205 @@ void main() {
   const englandFlag =
       '🏴\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}';
 
+  test(
+    'el reencuadre de un montaje solo se activa si la foto tiene margen',
+    () {
+      expect(
+        montagePhotoCanBeReframed(
+          imageSize: const Size(720, 1280),
+          frameSize: const Size(180, 180),
+        ),
+        isTrue,
+      );
+      expect(
+        montagePhotoCanBeReframed(
+          imageSize: const Size(720, 720),
+          frameSize: const Size(180, 180),
+        ),
+        isFalse,
+      );
+    },
+  );
+
+  test('el reencuadre se limita a los bordes de la imagen', () {
+    final alignment = montagePhotoAlignmentAfterDrag(
+      imageSize: const Size(100, 300),
+      frameSize: const Size(100, 100),
+      startAlignment: Alignment.center,
+      offsetFromOrigin: const Offset(0, 500),
+    );
+
+    expect(alignment.x, 0);
+    expect(alignment.y, -1);
+  });
+
+  testWidgets('el cierre de sesión elimina las rutas autenticadas', (
+    tester,
+  ) async {
+    final navigatorKey = GlobalKey<NavigatorState>();
+
+    await tester.pumpWidget(
+      MaterialApp(
+        navigatorKey: navigatorKey,
+        home: const Scaffold(body: Text('Inicio')),
+      ),
+    );
+    navigatorKey.currentState!.push(
+      MaterialPageRoute<void>(
+        builder: (_) => const Scaffold(body: Text('Ajustes')),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    restablecerNavegacionTrasCerrarSesion(navigatorKey.currentState);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Inicio'), findsOneWidget);
+    expect(find.text('Ajustes'), findsNothing);
+  });
+
+  testWidgets('la miniatura publicada indica que se puede rehacer', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: Center(child: CameraSelfieRetakeThumbnail(thumbnailUrl: '')),
+        ),
+      ),
+    );
+
+    expect(find.text('Rehacer'), findsOneWidget);
+    expect(find.byIcon(Icons.photo_camera_rounded), findsOneWidget);
+  });
+
+  testWidgets('la miniatura publicada recorta la foto dentro del marco', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: Scaffold(
+          body: Center(
+            child: CameraSelfieRetakeThumbnail(
+              thumbnailUrl: 'https://example.invalid/selfie.jpg',
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(
+      find.byKey(const ValueKey('camera-published-selfie-thumbnail-frame')),
+      findsOneWidget,
+    );
+    expect(
+      tester.getSize(
+        find.byKey(const ValueKey('camera-published-selfie-thumbnail-frame')),
+      ),
+      const Size(42, 42),
+    );
+    expect(
+      find.byKey(const ValueKey('camera-published-selfie-thumbnail-clip')),
+      findsOneWidget,
+    );
+
+    final decoration = tester.widget<DecoratedBox>(
+      find.byType(DecoratedBox),
+    ).decoration as BoxDecoration;
+    expect(decoration.border, isNull);
+
+    final image = tester.widget<CachedRemoteImage>(
+      find.byType(CachedRemoteImage),
+    );
+    expect(image.fit, BoxFit.cover);
+  });
+
+  testWidgets('la pantalla de rehacer compacta fecha y se adapta a la altura', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(360, 800));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: SelfieReplacementInfoScreen(
+          selfieImageUrl: '',
+          selfieThumbnailUrl: '',
+          weekKey: '2026-W35',
+          publishedAt: DateTime(2026, 8, 30),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('30 ago'), findsOneWidget);
+    expect(find.text('domingo, 30 de agosto'), findsNothing);
+
+    final tallPolaroid = tester.getSize(
+      find.byKey(const ValueKey('selfie-replacement-polaroid')),
+    );
+    final descriptionBottom = tester
+        .getBottomLeft(
+          find.text('Puedes rehacerla una sola vez viendo un anuncio.'),
+        )
+        .dy;
+    final buttonTextTop = tester.getTopLeft(find.text('Ver anuncio')).dy;
+    expect(buttonTextTop - descriptionBottom, lessThan(64));
+    expect(tester.takeException(), isNull);
+
+    await tester.binding.setSurfaceSize(const Size(360, 600));
+    await tester.pump();
+
+    final compactPolaroid = tester.getSize(
+      find.byKey(const ValueKey('selfie-replacement-polaroid')),
+    );
+    expect(compactPolaroid.height, lessThan(tallPolaroid.height));
+    expect(
+      tester.getBottomRight(find.text('Conservar mi selfie actual')).dy,
+      lessThanOrEqualTo(600),
+    );
+    expect(tester.takeException(), isNull);
+  });
+
+  test('en Cámara prioriza los grupos pendientes de esta semana', () {
+    final selfieStatus = {
+      'publicado': true,
+      'pendiente_b': false,
+      'pendiente_a': false,
+    };
+    final groupIds = selfieStatus.keys.toList();
+
+    groupIds.sort((a, b) {
+      final comparison = compareCameraGroupsByCurrentWeekSelfie(
+        selfieStatus[a]!,
+        selfieStatus[b]!,
+      );
+      return comparison != 0 ? comparison : a.compareTo(b);
+    });
+
+    expect(groupIds, ['pendiente_a', 'pendiente_b', 'publicado']);
+  });
+
+  test('traduce todos los textos globales del acceso en cada idioma', () {
+    final sourceKeys = kSundayInterfaceTranslations['en']!.keys.toSet();
+
+    for (final languageCode in kSundaySupportedLanguageCodes) {
+      if (languageCode == 'es') continue;
+
+      final translations = kSundayInterfaceTranslations[languageCode];
+      expect(translations, isNotNull, reason: languageCode);
+      expect(translations!.keys.toSet(), sourceKeys, reason: languageCode);
+
+      for (final source in sourceKeys) {
+        expect(
+          sundayTranslate(source, languageCode: languageCode),
+          isNot(source),
+          reason: '$languageCode: $source',
+        );
+      }
+    }
+  });
+
   test('solo acepta reacciones con un emoji real', () {
     expect(normalizarEmojiReaccion('🔥'), '🔥');
     expect(normalizarEmojiReaccion('🔥 texto extra'), '🔥');
@@ -607,6 +806,41 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('el footer permanece bajo el teclado mientras se oculta', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(360, 780));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+
+    const footerKey = ValueKey('footer');
+    const bodyKey = ValueKey('body');
+
+    Widget buildScaffold(double keyboardInset) {
+      return MaterialApp(
+        home: MediaQuery(
+          data: MediaQueryData(
+            size: const Size(360, 780),
+            viewInsets: EdgeInsets.only(bottom: keyboardInset),
+          ),
+          child: Scaffold(
+            resizeToAvoidBottomInset: true,
+            body: const SizedBox.expand(key: bodyKey),
+            bottomNavigationBar: const SizedBox(key: footerKey, height: 60),
+          ),
+        ),
+      );
+    }
+
+    await tester.pumpWidget(buildScaffold(320));
+    expect(tester.getTopLeft(find.byKey(footerKey)).dy, 720);
+    expect(tester.getSize(find.byKey(bodyKey)).height, 460);
+
+    await tester.pumpWidget(buildScaffold(30));
+    expect(tester.getTopLeft(find.byKey(footerKey)).dy, 720);
+    expect(tester.getSize(find.byKey(bodyKey)).height, 720);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('abrir el chat conserva la cuadricula semanal', (tester) async {
     var gridMountCount = 0;
 
@@ -642,6 +876,35 @@ void main() {
 
     expect(gridMountCount, 1);
     expect(find.text('grid'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('el chat abierto llega hasta debajo del selector semanal', (
+    tester,
+  ) async {
+    const chatKey = ValueKey('chat-expandido-completo');
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            height: 420,
+            child: GroupWeeklyContentLayout(
+              keyboardVisible: false,
+              chatExpanded: true,
+              expandedChatHeight: resolverAlturaPanelChatSemanal(
+                screenHeight: 780,
+              ),
+              weekSelector: const SizedBox(height: 33, child: Text('selector')),
+              postsGrid: const SizedBox.shrink(),
+              chatPanel: const SizedBox(key: chatKey, height: 780),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    expect(tester.getSize(find.byKey(chatKey)).height, 382);
     expect(tester.takeException(), isNull);
   });
 
@@ -725,6 +988,48 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('el chat se puede cerrar al arrastrar desde sus mensajes', (
+    tester,
+  ) async {
+    var dragStarted = false;
+    double? updatedDistance;
+    double? endedDistance;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: Align(
+            alignment: Alignment.topCenter,
+            child: SizedBox(
+              width: 360,
+              height: 220,
+              child: WeeklyChatDragArea(
+                captureDescendantDrags: true,
+                onDragStart: () => dragStarted = true,
+                onDragUpdate: (distance) => updatedDistance = distance,
+                onDragEnd: (distance, _) => endedDistance = distance,
+                child: ListView.builder(
+                  itemCount: 12,
+                  itemBuilder: (_, index) =>
+                      SizedBox(height: 40, child: Text('Mensaje $index')),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.drag(find.text('Mensaje 2'), const Offset(0, 36));
+    await tester.pump();
+
+    expect(dragStarted, isTrue);
+    expect(updatedDistance, isNotNull);
+    expect(updatedDistance!, greaterThan(kWeeklyChatDragDismissDistance));
+    expect(endedDistance, equals(updatedDistance));
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('el chat abierto acerca los mensajes a la cabecera compacta', (
     tester,
   ) async {
@@ -789,7 +1094,6 @@ void main() {
               child: expanded
                   ? WeeklyChatInputBar(
                       canWrite: false,
-                      sending: false,
                       controller: controller,
                       onSend: () {},
                       onGif: () {},
@@ -876,7 +1180,6 @@ void main() {
                             ),
                             WeeklyChatInputBar(
                               canWrite: true,
-                              sending: false,
                               controller: controller,
                               onSend: () {},
                               onGif: () {},
@@ -926,7 +1229,6 @@ void main() {
               height: kWeeklyChatCollapsedSlotHeight,
               child: WeeklyChatInputBar(
                 canWrite: true,
-                sending: false,
                 controller: controller,
                 onSend: () => sends += 1,
                 onGif: () {},
@@ -952,6 +1254,8 @@ void main() {
     await tester.tap(sendButton);
     await tester.pump();
     expect(sends, 1);
+    expect(find.byIcon(Icons.send_rounded), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsNothing);
 
     await tester.enterText(find.byType(TextField), '   ');
     await tester.pump();

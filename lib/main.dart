@@ -31,6 +31,9 @@ import 'firebase_options.dart';
 
 final GlobalKey<NavigatorState> sundayNavigatorKey =
     GlobalKey<NavigatorState>();
+final NavigatorObserver sundaySnackNavigationObserver =
+    _SundaySnackNavigationObserver();
+final ValueNotifier<bool> sundaySignOutInProgress = ValueNotifier(false);
 const MethodChannel foregroundNotificationChannel = MethodChannel(
   'sunday_selfie/foreground_notifications',
 );
@@ -53,6 +56,26 @@ const double kMontageCaptureMinPixelRatio = 0.65;
 void logDebug(String message) {
   if (kDebugMode) {
     debugPrint(message);
+  }
+}
+
+void restablecerNavegacionTrasCerrarSesion(NavigatorState? navigator) {
+  navigator?.popUntil((route) => route.isFirst);
+}
+
+/// Muestra el acceso y elimina las pantallas autenticadas sin esperar a que
+/// Firebase termine de borrar la sesión local.
+Future<void> cerrarSesionYMostrarAcceso() async {
+  if (sundaySignOutInProgress.value) return;
+
+  sundaySignOutInProgress.value = true;
+  _dismissActiveSundaySnack();
+  restablecerNavegacionTrasCerrarSesion(sundayNavigatorKey.currentState);
+
+  try {
+    await FirebaseAuth.instance.signOut();
+  } finally {
+    sundaySignOutInProgress.value = false;
   }
 }
 
@@ -103,7 +126,10 @@ class LocalPhotoCache {
 
   final Map<String, Future<File?>> _inFlightDownloads = {};
   final Map<String, File> _readyFiles = {};
+  final Set<String> _storedFileNames = {};
   Directory? _cacheDirectory;
+  Future<void>? _cacheIndexInitialization;
+  bool _cacheIndexReady = false;
 
   bool get isSupported =>
       !kIsWeb &&
@@ -141,37 +167,100 @@ class LocalPhotoCache {
 
   String _cacheKey(String url, String variant) => '$variant|${url.trim()}';
 
+  /// Restores the on-disk cache index once at app startup.
+  ///
+  /// The names are deterministic from the URL, so keeping this small index in
+  /// memory lets visible images use [FileImage] immediately after a relaunch
+  /// instead of awaiting an existence check for every tile.
+  Future<void> initialize() {
+    final pendingInitialization = _cacheIndexInitialization;
+    if (pendingInitialization != null) return pendingInitialization;
+
+    final initialization = _restoreCacheIndex();
+    _cacheIndexInitialization = initialization;
+    return initialization;
+  }
+
+  Future<void> _restoreCacheIndex() async {
+    try {
+      final directory = await _directory();
+      if (directory == null) return;
+
+      final storedNames = <String>{};
+      await for (final entity in directory.list(followLinks: false)) {
+        if (entity is! File || !entity.path.endsWith('.img')) continue;
+        storedNames.add(entity.uri.pathSegments.last);
+      }
+
+      _storedFileNames
+        ..clear()
+        ..addAll(storedNames);
+    } catch (error) {
+      logDebug('No se pudo restaurar la caché local de fotos: $error');
+    } finally {
+      _cacheIndexReady = true;
+    }
+  }
+
+  void _markFileReady(String key, File file) {
+    _readyFiles[key] = file;
+    _storedFileNames.add(file.uri.pathSegments.last);
+  }
+
+  void _forgetFile(String key, String fileName) {
+    _readyFiles.remove(key);
+    _storedFileNames.remove(fileName);
+  }
+
   File? readyFileFor(String url, {required String variant}) {
     final trimmedUrl = url.trim();
     if (trimmedUrl.isEmpty) return null;
-    return _readyFiles[_cacheKey(trimmedUrl, variant)];
+
+    final key = _cacheKey(trimmedUrl, variant);
+    final inMemoryFile = _readyFiles[key];
+    if (inMemoryFile != null) return inMemoryFile;
+
+    // After initialize(), this path lookup has no I/O. This is what makes a
+    // locally downloaded selfie render without first showing its loader.
+    final directory = _cacheDirectory;
+    final fileName = _fileNameForUrl(trimmedUrl, variant);
+    if (!_cacheIndexReady ||
+        directory == null ||
+        !_storedFileNames.contains(fileName)) {
+      return null;
+    }
+
+    final file = File('${directory.path}/$fileName');
+    _readyFiles[key] = file;
+    return file;
   }
 
   Future<File?> getOrDownload(String url, {required String variant}) async {
     final trimmedUrl = url.trim();
     if (trimmedUrl.isEmpty) return null;
 
-    final directory = await _directory();
+    await initialize();
+    final directory = _cacheDirectory ?? await _directory();
     if (directory == null) return null;
 
     final key = _cacheKey(trimmedUrl, variant);
+    final fileName = _fileNameForUrl(trimmedUrl, variant);
     final readyFile = _readyFiles[key];
     if (readyFile != null) {
       if (await readyFile.exists() && await readyFile.length() > 0) {
         return readyFile;
       }
-      _readyFiles.remove(key);
+      _forgetFile(key, fileName);
     }
 
-    final file = File(
-      '${directory.path}/${_fileNameForUrl(trimmedUrl, variant)}',
-    );
+    final file = File('${directory.path}/$fileName');
     if (await file.exists()) {
       if (await file.length() > 0) {
-        _readyFiles[key] = file;
+        _markFileReady(key, file);
         return file;
       }
       await file.delete();
+      _storedFileNames.remove(fileName);
     }
 
     final existingDownload = _inFlightDownloads[key];
@@ -182,7 +271,7 @@ class LocalPhotoCache {
     try {
       final downloadedFile = await download;
       if (downloadedFile != null) {
-        _readyFiles[key] = downloadedFile;
+        _markFileReady(key, downloadedFile);
       }
       return downloadedFile;
     } finally {
@@ -230,6 +319,7 @@ class LocalPhotoCache {
   }
 
   Future<int> clear() async {
+    await initialize();
     final directory = await _directory();
     if (directory == null || !await directory.exists()) return 0;
 
@@ -251,6 +341,7 @@ class LocalPhotoCache {
     PaintingBinding.instance.imageCache.clear();
     PaintingBinding.instance.imageCache.clearLiveImages();
     _readyFiles.clear();
+    _storedFileNames.clear();
     return deletedCount;
   }
 }
@@ -258,6 +349,8 @@ class LocalPhotoCache {
 class CachedRemoteImage extends StatefulWidget {
   final String imageUrl;
   final String cacheVariant;
+  final String? localFallbackImageUrl;
+  final String? localFallbackCacheVariant;
   final BoxFit fit;
   final double? width;
   final double? height;
@@ -267,11 +360,14 @@ class CachedRemoteImage extends StatefulWidget {
   final String? semanticLabel;
   final Widget? loadingWidget;
   final Widget? errorWidget;
+  final ValueChanged<Size>? onImageSizeResolved;
 
   const CachedRemoteImage({
     super.key,
     required this.imageUrl,
     required this.cacheVariant,
+    this.localFallbackImageUrl,
+    this.localFallbackCacheVariant,
     this.fit = BoxFit.cover,
     this.width,
     this.height,
@@ -281,6 +377,7 @@ class CachedRemoteImage extends StatefulWidget {
     this.semanticLabel,
     this.loadingWidget,
     this.errorWidget,
+    this.onImageSizeResolved,
   });
 
   @override
@@ -290,6 +387,9 @@ class CachedRemoteImage extends StatefulWidget {
 class _CachedRemoteImageState extends State<CachedRemoteImage> {
   Future<File?>? fileFuture;
   File? readyFile;
+  String? imageSizeSource;
+  ImageStream? imageSizeStream;
+  ImageStreamListener? imageSizeListener;
 
   @override
   void initState() {
@@ -301,12 +401,21 @@ class _CachedRemoteImageState extends State<CachedRemoteImage> {
   void didUpdateWidget(covariant CachedRemoteImage oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.imageUrl != widget.imageUrl ||
-        oldWidget.cacheVariant != widget.cacheVariant) {
+        oldWidget.cacheVariant != widget.cacheVariant ||
+        oldWidget.localFallbackImageUrl != widget.localFallbackImageUrl ||
+        oldWidget.localFallbackCacheVariant !=
+            widget.localFallbackCacheVariant) {
       configureFuture();
     }
   }
 
   void configureFuture() {
+    imageSizeSource = null;
+    if (imageSizeStream != null && imageSizeListener != null) {
+      imageSizeStream!.removeListener(imageSizeListener!);
+    }
+    imageSizeStream = null;
+    imageSizeListener = null;
     final trimmedUrl = widget.imageUrl.trim();
     readyFile = trimmedUrl.isEmpty
         ? null
@@ -314,6 +423,18 @@ class _CachedRemoteImageState extends State<CachedRemoteImage> {
             trimmedUrl,
             variant: widget.cacheVariant,
           );
+    final fallbackUrl = widget.localFallbackImageUrl?.trim();
+    final fallbackVariant = widget.localFallbackCacheVariant;
+    if (readyFile == null &&
+        fallbackUrl != null &&
+        fallbackUrl.isNotEmpty &&
+        fallbackVariant != null &&
+        fallbackVariant.isNotEmpty) {
+      readyFile = LocalPhotoCache.instance.readyFileFor(
+        fallbackUrl,
+        variant: fallbackVariant,
+      );
+    }
     fileFuture = trimmedUrl.isEmpty || readyFile != null
         ? null
         : LocalPhotoCache.instance.getOrDownload(
@@ -344,18 +465,7 @@ class _CachedRemoteImageState extends State<CachedRemoteImage> {
       builder: (context, snapshot) {
         final file = snapshot.data;
         if (file != null) {
-          return Image.file(
-            file,
-            width: widget.width,
-            height: widget.height,
-            fit: widget.fit,
-            alignment: widget.alignment,
-            filterQuality: widget.filterQuality,
-            gaplessPlayback: widget.gaplessPlayback,
-            semanticLabel: widget.semanticLabel,
-            errorBuilder: (_, _, _) =>
-                widget.errorWidget ?? const _ImageErrorFill(),
-          );
+          return _fileImage(file);
         }
 
         if (snapshot.connectionState != ConnectionState.done) {
@@ -368,6 +478,10 @@ class _CachedRemoteImageState extends State<CachedRemoteImage> {
   }
 
   Widget _fileImage(File file) {
+    _scheduleImageSizeResolution(
+      source: 'file:${file.path}',
+      provider: FileImage(file),
+    );
     return Image.file(
       file,
       width: widget.width,
@@ -382,6 +496,10 @@ class _CachedRemoteImageState extends State<CachedRemoteImage> {
   }
 
   Widget _networkFallback(String url) {
+    _scheduleImageSizeResolution(
+      source: 'network:$url',
+      provider: NetworkImage(url),
+    );
     return Image.network(
       url,
       width: widget.width,
@@ -397,6 +515,62 @@ class _CachedRemoteImageState extends State<CachedRemoteImage> {
       },
       errorBuilder: (_, _, _) => widget.errorWidget ?? const _ImageErrorFill(),
     );
+  }
+
+  void _scheduleImageSizeResolution<T extends Object>({
+    required String source,
+    required ImageProvider<T> provider,
+  }) {
+    if (widget.onImageSizeResolved == null || imageSizeSource == source) {
+      return;
+    }
+
+    imageSizeSource = source;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || imageSizeSource != source) return;
+
+      final stream = provider.resolve(createLocalImageConfiguration(context));
+      if (imageSizeStream != null && imageSizeListener != null) {
+        imageSizeStream!.removeListener(imageSizeListener!);
+      }
+
+      late final ImageStreamListener listener;
+      listener = ImageStreamListener(
+        (imageInfo, _) {
+          if (mounted && imageSizeSource == source) {
+            widget.onImageSizeResolved?.call(
+              Size(
+                imageInfo.image.width.toDouble(),
+                imageInfo.image.height.toDouble(),
+              ),
+            );
+          }
+          stream.removeListener(listener);
+          if (identical(imageSizeStream, stream)) {
+            imageSizeStream = null;
+            imageSizeListener = null;
+          }
+        },
+        onError: (error, stackTrace) {
+          stream.removeListener(listener);
+          if (identical(imageSizeStream, stream)) {
+            imageSizeStream = null;
+            imageSizeListener = null;
+          }
+        },
+      );
+      imageSizeStream = stream;
+      imageSizeListener = listener;
+      stream.addListener(listener);
+    });
+  }
+
+  @override
+  void dispose() {
+    if (imageSizeStream != null && imageSizeListener != null) {
+      imageSizeStream!.removeListener(imageSizeListener!);
+    }
+    super.dispose();
   }
 }
 
@@ -1176,6 +1350,10 @@ const String kSundaySelfieLogoMarkBase64 =
     'WXQ6AlIGUA1FBMUpS0SLeoHGohB+3joul4Fy6lYcMalYpHQTYgbK5RKV40fii/twKK5jxG9QLjNm87apKCwg/z9TVvDkFDjXwgAA'
     'AABJRU5ErkJggg==';
 
+final MemoryImage sundaySelfieLogoMarkImage = MemoryImage(
+  base64Decode(kSundaySelfieLogoMarkBase64),
+);
+
 const String kGoogleGLogoPngBase64 =
     'iVBORw0KGgoAAAANSUhEUgAAACgAAAAoCAYAAACM/rhtAAAABmJLR0QA/wD/AP+gvaeTAAAFWElEQVRYhc2YaWxUVRTHf+e+12k7pRRaOwUXJMYt4lKslUrcKIhBI1FxUKNpcE3ED0Ri3HCpMTVucYGI0U9GcGtVEqokKgx1V1qNYjCIogaUUJBCYTrd5t3jh9KmtJ03b9rS+E8meTnn/+75vZv3ztwcYRjSaNTZs++vGUaYo3AeyikIk4GCHofEQfcI/GHhJ2P1cy+ra8OkTza3ZVpLMjHvqpx+YpY4ixWpAiZlWCsh8IHA8mM2NDaOKuDuuTMj4nU/IXAr4GYINkgqrMXapSWx77ePGLB5dvnNwEsChSMFG6CEoEuLNzS96mdKCajRaaG9LbkrQW4bZbAj68BrkcKpi6Wuzhsqb4YK7p57dt6/LeGPjjYcgMDVu/fuPCFVfhCgRqeFjJe9RmHO0UUDYI9nqZzc8O1fqQyDXvi9LXmvgF42jGKKcODw1QTSv989cBsbt/iZjtjBng9Cbw1OxC+oPCBqy4oLEzmR9Y2FkfWNhcWFiRy1UipwL+jm4cJBv6fcPXdmxNjurSgTA4DtQHRpZH3TBwKazt9cef41IrocOD4TOOi3g47tejwIHFAf8rrPKVnf9H4QOICS2KY1XUgpyHuZwMHhHdRPc6e0/xbe3rZuiqvtqfuwKm9FiqZWpWoJR0MGICne3VmnHnTHL9qGU9Kego6vIq120VjCAThai2NzndeBfMnxCJ25HxvPwmvO7e9LeNaZk/9NY8tYwgGY5AS3AnRyb0CyLHlX7iDvip2Ia3ujL/r1qqMKiDBrqETonH3kV/2GmdDVqcjysQbrlQuUp0o6Je3k3761IXteZ3PQBStr4k+NChlyKLYsr8ZF5DQ/m8nyYhmufP8IqPpJvbJX9RkDHOtnE9XAPWuU5eQfaC8xQJ6fyxqzd4yABsnttBOHPG79X+S5JmyAuJ/JWFs8RjyDJBY1CLv8TIqcMVZAA+Vo936D6q9+pkNkzRsroAHSHG/8PwalKZVjW7KARQcuuWjGW/NLgq7aZZKFQX6I3JlmqR311ZJwETYATwzM1ndM4bm2s+hSx1WRJcBDQQC/fHDC/iC+WU/GL/E7cgvSBGDcL5Pfgfa9h13qUHOolCfjpXSp02MWXVL+5oKTghQOosuebjtWlAV+Hqs2BmCkGouYNwB2eWHuaL2QDzunDPSHcXjz5HXzskcDMOnp80COL1+WsxYOnwfdpLPy6+5I/JbWi9mWLBjyDoWKgtbwG5duvHREk4XZNfElolzv51Eh1nB/+O8+QLm8fee9rRWrDtqQ7+IiLIw3F629oDaa+ZRBVSpr2pYpvJDOapCX+mr2XkyvjRY71m4l0IhDdgnc17j1zLeprrbp3DNqo2fYzoIVuf8uqnQTpensm2IP5VUgokcAApS/c91Niq5OD9in7YiuMuJ80tGRs3lz1ao2gJPXzcsuiI87VazOBL2WniGAASF7/3yyW64mxVDDQ83M2MPhTb2BQV962dsLXhPhjgwg+ysOWGC8n8lNTCN3z12Ilz8gozWxZfkP948MfoyDRXcLfDxMwHHp4ACS4S3ET3gUL+f3vpjAx0WnjHtsoHfIXllWf1VY2kJrgLnDBA0kUZfsfTcQap3zte1uv7yhOjLo4JKymU+rjYZyrV0BpPtLGinkF90dFfN/vOWeA0Pm0y1w3rsLbsSyAqFolNk8gWfzSvY90jCrIZnKFGgEPL02Wuxa+7jCbYB/swymz60xS39YWPd9OmNGQ/QZq689PumYxYhWCRyXIVSHQD3GvNy4sO6zoDdlBNin6mpTdtrP5YLMRvRc4HSUSQgT6ekMBxWaBf4EfhLhi4SYjVsW1vme3ofSf4An9u/kR1AQAAAAAElFTkSuQmCC';
 
@@ -1439,6 +1617,7 @@ String sundayTranslate(String source, {String? languageCode}) {
 
   return kSundayTranslations[code]?[source] ??
       kSundayExtraTranslations[code]?[source] ??
+      kSundayInterfaceTranslations[code]?[source] ??
       kSundayExtraTranslations['en']?[source] ??
       source;
 }
@@ -1811,33 +1990,9 @@ const Map<String, List<String>> kSundayLocalizedWeekdayNames = {
 };
 
 String localizedSelfieDateLabel(BuildContext context, DateTime date) {
-  final code = SundayLanguageController.normalize(
-    SundayLanguageScope.languageCodeOf(context),
-  );
-  final weekdayNames =
-      kSundayLocalizedWeekdayNames[code] ??
-      kSundayLocalizedWeekdayNames[kDefaultSundayLanguageCode]!;
-  final weekday = weekdayNames[date.weekday - 1];
   final month = localizedMonthName(context, date.month);
-
-  switch (code) {
-    case 'en':
-      return '$weekday, $month ${date.day}';
-    case 'fr':
-      return '$weekday ${date.day} $month';
-    case 'de':
-      return '$weekday, ${date.day}. $month';
-    case 'it':
-    case 'pl':
-    case 'ro':
-      return '$weekday, ${date.day} $month';
-    case 'nl':
-      return '$weekday ${date.day} $month';
-    case 'pt':
-    case 'es':
-    default:
-      return '$weekday, ${date.day} de $month';
-  }
+  final abbreviatedMonth = month.length > 3 ? month.substring(0, 3) : month;
+  return '${date.day} $abbreviatedMonth';
 }
 
 const Map<String, Map<String, String>> kSundayTranslations = {
@@ -3618,9 +3773,137 @@ const Map<String, Map<String, String>> kSundayExtraTranslations = {
   },
 };
 
+// Textos que no pertenecen a una pantalla concreta, sino a elementos globales
+// como el acceso y el selector de emoji. Mantenerlos separados evita que esos
+// componentes se queden en español al cambiar el idioma.
+const Map<String, Map<String, String>> kSundayInterfaceTranslations = {
+  'en': {
+    'Seguir conectados una vez por semana': 'Stay connected once a week',
+    'Conectando...': 'Connecting...',
+    'Continuar con Google': 'Continue with Google',
+    'Continuar con Apple': 'Continue with Apple',
+    'Al continuar aceptas nuestros ': 'By continuing, you accept our ',
+    'Términos': 'Terms',
+    ' y ': ' and ',
+    'Política de Privacidad': 'Privacy Policy',
+    'Elige un emoticono': 'Choose an emoji',
+  },
+  'fr': {
+    'Seguir conectados una vez por semana':
+        'Restez connectés une fois par semaine',
+    'Conectando...': 'Connexion...',
+    'Continuar con Google': 'Continuer avec Google',
+    'Continuar con Apple': 'Continuer avec Apple',
+    'Al continuar aceptas nuestros ': 'En continuant, vous acceptez nos ',
+    'Términos': 'Conditions',
+    ' y ': ' et notre ',
+    'Política de Privacidad': 'Politique de confidentialité',
+    'Elige un emoticono': 'Choisissez un emoji',
+  },
+  'de': {
+    'Seguir conectados una vez por semana':
+        'Einmal pro Woche verbunden bleiben',
+    'Conectando...': 'Verbindung wird hergestellt...',
+    'Continuar con Google': 'Mit Google fortfahren',
+    'Continuar con Apple': 'Mit Apple fortfahren',
+    'Al continuar aceptas nuestros ':
+        'Mit dem Fortfahren akzeptierst du unsere ',
+    'Términos': 'Nutzungsbedingungen',
+    ' y ': ' und die ',
+    'Política de Privacidad': 'Datenschutzerklärung',
+    'Elige un emoticono': 'Wähle ein Emoji aus',
+  },
+  'it': {
+    'Seguir conectados una vez por semana':
+        'Resta connesso una volta a settimana',
+    'Conectando...': 'Connessione in corso...',
+    'Continuar con Google': 'Continua con Google',
+    'Continuar con Apple': 'Continua con Apple',
+    'Al continuar aceptas nuestros ': 'Continuando, accetti i nostri ',
+    'Términos': 'Termini',
+    ' y ': ' e la nostra ',
+    'Política de Privacidad': 'Informativa sulla privacy',
+    'Elige un emoticono': 'Scegli un emoji',
+  },
+  'pt': {
+    'Seguir conectados una vez por semana':
+        'Mantenham-se ligados uma vez por semana',
+    'Conectando...': 'A ligar...',
+    'Continuar con Google': 'Continuar com o Google',
+    'Continuar con Apple': 'Continuar com a Apple',
+    'Al continuar aceptas nuestros ': 'Ao continuar, aceitas os nossos ',
+    'Términos': 'Termos',
+    ' y ': ' e a nossa ',
+    'Política de Privacidad': 'Política de Privacidade',
+    'Elige un emoticono': 'Escolhe um emoji',
+  },
+  'nl': {
+    'Seguir conectados una vez por semana': 'Blijf eenmaal per week verbonden',
+    'Conectando...': 'Verbinden...',
+    'Continuar con Google': 'Doorgaan met Google',
+    'Continuar con Apple': 'Doorgaan met Apple',
+    'Al continuar aceptas nuestros ': 'Door door te gaan, accepteer je onze ',
+    'Términos': 'Voorwaarden',
+    ' y ': ' en ons ',
+    'Política de Privacidad': 'Privacybeleid',
+    'Elige un emoticono': 'Kies een emoji',
+  },
+  'pl': {
+    'Seguir conectados una vez por semana':
+        'Bądźcie w kontakcie raz w tygodniu',
+    'Conectando...': 'Łączenie...',
+    'Continuar con Google': 'Kontynuuj z Google',
+    'Continuar con Apple': 'Kontynuuj z Apple',
+    'Al continuar aceptas nuestros ': 'Kontynuując, akceptujesz nasze ',
+    'Términos': 'Warunki',
+    ' y ': ' oraz ',
+    'Política de Privacidad': 'Politykę prywatności',
+    'Elige un emoticono': 'Wybierz emoji',
+  },
+  'ro': {
+    'Seguir conectados una vez por semana':
+        'Rămâneți conectați o dată pe săptămână',
+    'Conectando...': 'Se conectează...',
+    'Continuar con Google': 'Continuă cu Google',
+    'Continuar con Apple': 'Continuă cu Apple',
+    'Al continuar aceptas nuestros ': 'Continuând, accepți ',
+    'Términos': 'Termenii',
+    ' y ': ' și ',
+    'Política de Privacidad': 'Politica de confidențialitate',
+    'Elige un emoticono': 'Alege un emoji',
+  },
+};
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  WidgetsBinding.instance.deferFirstFrame();
   runApp(const MyApp());
+  unawaited(_releaseFirstFrameWhenLogoIsReady());
+}
+
+Future<void> _releaseFirstFrameWhenLogoIsReady() async {
+  final logoStream = sundaySelfieLogoMarkImage.resolve(
+    ImageConfiguration.empty,
+  );
+  final logoReady = Completer<void>();
+  final listener = ImageStreamListener(
+    (_, _) {
+      if (!logoReady.isCompleted) logoReady.complete();
+    },
+    onError: (_, _) {
+      if (!logoReady.isCompleted) logoReady.complete();
+    },
+  );
+  logoStream.addListener(listener);
+
+  try {
+    await logoReady.future.timeout(const Duration(seconds: 2));
+  } on TimeoutException {
+    logDebug('El logo de arranque tardó demasiado en decodificarse.');
+  } finally {
+    logoStream.removeListener(listener);
+    WidgetsBinding.instance.allowFirstFrame();
+  }
 }
 
 Future<void> inicializarServiciosDeArranque() async {
@@ -3628,6 +3911,10 @@ Future<void> inicializarServiciosDeArranque() async {
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
   ]);
+  // Se hace antes de mostrar las pantallas autenticadas: así las fotos que ya
+  // están en el dispositivo se resuelven como archivos locales desde el primer
+  // frame de "Mis selfies".
+  await LocalPhotoCache.instance.initialize();
   if (Firebase.apps.isEmpty) {
     await Firebase.initializeApp(
       options: DefaultFirebaseOptions.currentPlatform,
@@ -10468,7 +10755,9 @@ Future<void> publicarSelfieReal({
   String? weekKey,
   bool rewardedAdWatched = false,
   bool replaceExisting = false,
+  void Function(SelfieUploadStage stage)? onStageChanged,
 }) async {
+  onStageChanged?.call(SelfieUploadStage.checking);
   final currentWeekKey = obtenerWeekKeyActual();
   final targetWeekKey = weekKey ?? currentWeekKey;
   final window = obtenerSundayWindowState();
@@ -10509,6 +10798,7 @@ Future<void> publicarSelfieReal({
     throw Exception('No se encontró una selfie para reemplazar');
   }
 
+  onStageChanged?.call(SelfieUploadStage.validating);
   await validarFotoSelfie(foto);
 
   final replacementUploadId = isRewardedReplacement
@@ -10535,6 +10825,7 @@ Future<void> publicarSelfieReal({
     if (isRewardedReplacement) 'replacement': 'true',
     'replacementUploadId': ?replacementUploadId,
   };
+  onStageChanged?.call(SelfieUploadStage.preparingFile);
   final uploadFile = await _prepararArchivoSelfieParaSubidaTemporal(
     foto: foto,
     groupId: groupId,
@@ -10543,6 +10834,7 @@ Future<void> publicarSelfieReal({
   );
 
   try {
+    onStageChanged?.call(SelfieUploadStage.uploadingImage);
     await storageRef.putFile(
       uploadFile,
       SettableMetadata(
@@ -10569,6 +10861,7 @@ Future<void> publicarSelfieReal({
 
   File? thumbnailFile;
   try {
+    onStageChanged?.call(SelfieUploadStage.preparingThumbnail);
     thumbnailFile = await crearMiniaturaSelfieTemporal(
       foto: foto,
       groupId: groupId,
@@ -10576,6 +10869,7 @@ Future<void> publicarSelfieReal({
       uid: user.uid,
     );
     if (thumbnailFile != null) {
+      onStageChanged?.call(SelfieUploadStage.uploadingThumbnail);
       await thumbnailStorageRef.putFile(
         thumbnailFile,
         SettableMetadata(
@@ -10597,6 +10891,7 @@ Future<void> publicarSelfieReal({
   }
 
   try {
+    onStageChanged?.call(SelfieUploadStage.registering);
     await llamarCallableAutenticadoConReintento(
       name: 'registrarSelfie',
       data: {
@@ -10616,6 +10911,188 @@ Future<void> publicarSelfieReal({
       ),
     );
   }
+}
+
+enum SelfieUploadStage {
+  checking,
+  validating,
+  preparingFile,
+  uploadingImage,
+  preparingThumbnail,
+  uploadingThumbnail,
+  registering,
+  completed,
+  failed,
+}
+
+class SelfieUploadStatus {
+  final SelfieUploadStage stage;
+  final String? errorMessage;
+
+  const SelfieUploadStatus(this.stage, {this.errorMessage});
+
+  bool get hasFailed => stage == SelfieUploadStage.failed;
+}
+
+class SelfieUploadResult {
+  final bool succeeded;
+  final String? errorMessage;
+
+  const SelfieUploadResult._({required this.succeeded, this.errorMessage});
+
+  const SelfieUploadResult.success() : this._(succeeded: true);
+
+  const SelfieUploadResult.failure(String errorMessage)
+    : this._(succeeded: false, errorMessage: errorMessage);
+}
+
+class SelfieUploadSession {
+  final String groupId;
+  final User user;
+  final XFile foto;
+  final String weekKey;
+  final bool rewardedAdWatched;
+  final bool replaceExisting;
+  final ValueNotifier<SelfieUploadStatus> status = ValueNotifier(
+    const SelfieUploadStatus(SelfieUploadStage.checking),
+  );
+
+  Future<SelfieUploadResult>? _completion;
+
+  SelfieUploadSession({
+    required this.groupId,
+    required this.user,
+    required this.foto,
+    required this.weekKey,
+    this.rewardedAdWatched = false,
+    this.replaceExisting = false,
+  });
+
+  Future<SelfieUploadResult> start() {
+    return _completion ??= _upload();
+  }
+
+  Future<SelfieUploadResult> _upload() async {
+    try {
+      await publicarSelfieReal(
+        groupId: groupId,
+        user: user,
+        foto: foto,
+        weekKey: weekKey,
+        rewardedAdWatched: rewardedAdWatched,
+        replaceExisting: replaceExisting,
+        onStageChanged: (stage) {
+          status.value = SelfieUploadStatus(stage);
+        },
+      );
+      status.value = const SelfieUploadStatus(SelfieUploadStage.completed);
+      return const SelfieUploadResult.success();
+    } on SelfiePhotoValidationException catch (error) {
+      status.value = SelfieUploadStatus(
+        SelfieUploadStage.failed,
+        errorMessage: error.message,
+      );
+      return SelfieUploadResult.failure(error.message);
+    } catch (error) {
+      final message = _selfieUploadErrorMessage(error);
+      status.value = SelfieUploadStatus(
+        SelfieUploadStage.failed,
+        errorMessage: message,
+      );
+      return SelfieUploadResult.failure(message);
+    }
+  }
+}
+
+class PendingSelfieUpload {
+  final String groupId;
+  final String weekKey;
+  final String userId;
+  final XFile foto;
+  final SelfieUploadSession session;
+
+  const PendingSelfieUpload({
+    required this.groupId,
+    required this.weekKey,
+    required this.userId,
+    required this.foto,
+    required this.session,
+  });
+
+  ValueListenable<SelfieUploadStatus> get status => session.status;
+  bool get shouldShowLocalPhoto => !status.value.hasFailed;
+}
+
+class PendingSelfieUploads extends ChangeNotifier {
+  PendingSelfieUploads._();
+
+  static final PendingSelfieUploads instance = PendingSelfieUploads._();
+
+  final Map<String, PendingSelfieUpload> _uploads = {};
+
+  String _key({
+    required String groupId,
+    required String weekKey,
+    required String userId,
+  }) => '$groupId|$weekKey|$userId';
+
+  void add(PendingSelfieUpload upload) {
+    final key = _key(
+      groupId: upload.groupId,
+      weekKey: upload.weekKey,
+      userId: upload.userId,
+    );
+    final previous = _uploads[key];
+    previous?.status.removeListener(notifyListeners);
+    _uploads[key] = upload;
+    upload.status.addListener(notifyListeners);
+    notifyListeners();
+  }
+
+  PendingSelfieUpload? find({
+    required String groupId,
+    required String weekKey,
+    required String userId,
+  }) {
+    return _uploads[_key(groupId: groupId, weekKey: weekKey, userId: userId)];
+  }
+}
+
+String _selfieUploadErrorMessage(Object error) {
+  final message = error.toString().replaceFirst(RegExp(r'^Exception:\\s*'), '');
+  return message.trim().isEmpty
+      ? 'No se pudo publicar la selfie. Inténtalo de nuevo.'
+      : message;
+}
+
+/// Publica en segundo plano y deja disponible la foto local de inmediato.
+Future<SelfieUploadResult> subirSelfieEnSegundoPlano({
+  required String groupId,
+  required User user,
+  required XFile foto,
+  String? weekKey,
+  bool rewardedAdWatched = false,
+  bool replaceExisting = false,
+}) {
+  final targetWeekKey = weekKey ?? obtenerWeekKeyActual();
+  final session = SelfieUploadSession(
+    groupId: groupId,
+    user: user,
+    foto: foto,
+    weekKey: targetWeekKey,
+    rewardedAdWatched: rewardedAdWatched,
+    replaceExisting: replaceExisting,
+  );
+  PendingSelfieUploads.instance.add(
+    PendingSelfieUpload(
+      groupId: groupId,
+      weekKey: targetWeekKey,
+      userId: user.uid,
+      foto: foto,
+      session: session,
+    ),
+  );
+  return session.start();
 }
 
 Future<void> reaccionarASelfie({
@@ -10925,11 +11402,10 @@ class _MontageAdConfirmationDialog extends StatefulWidget {
 class _MontageAdConfirmationDialogState
     extends State<_MontageAdConfirmationDialog> {
   bool loadingAd = false;
-  bool adWatched = false;
   String? statusMessage;
 
   Future<void> _watchAd() async {
-    if (loadingAd || adWatched) return;
+    if (loadingAd) return;
 
     setState(() {
       loadingAd = true;
@@ -10941,14 +11417,7 @@ class _MontageAdConfirmationDialogState
       if (!mounted) return;
 
       if (rewardEarned) {
-        setState(() {
-          adWatched = true;
-          loadingAd = false;
-          statusMessage =
-              'Anuncio completado. Preparando montaje para ${widget.accion}...';
-        });
-        await Future<void>.delayed(const Duration(milliseconds: 350));
-        if (mounted) Navigator.pop(context, true);
+        Navigator.pop(context, true);
         return;
       }
 
@@ -10971,10 +11440,8 @@ class _MontageAdConfirmationDialogState
   Widget build(BuildContext context) {
     final statusIcon = loadingAd
         ? Icons.hourglass_top_rounded
-        : adWatched
-        ? Icons.check_rounded
         : Icons.play_circle_outline_rounded;
-    final statusColor = adWatched ? ssOrangeDark : ssText2;
+    final statusColor = ssText2;
 
     return Dialog(
       backgroundColor: Colors.transparent,
@@ -11043,9 +11510,9 @@ class _MontageAdConfirmationDialogState
                   vertical: 11,
                 ),
                 decoration: BoxDecoration(
-                  color: adWatched ? ssOrangeLight : ssSeparator,
+                  color: ssSeparator,
                   borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: adWatched ? ssOrangeMid : ssBorder),
+                  border: Border.all(color: ssBorder),
                 ),
                 child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -11081,13 +11548,9 @@ class _MontageAdConfirmationDialogState
                 const SizedBox(width: 10),
                 Expanded(
                   child: _SundayAdDialogButton(
-                    text: loadingAd
-                        ? 'Cargando'
-                        : adWatched
-                        ? 'Listo'
-                        : widget.confirmText,
+                    text: loadingAd ? 'Cargando' : widget.confirmText,
                     primary: true,
-                    onTap: loadingAd || adWatched ? null : _watchAd,
+                    onTap: loadingAd ? null : _watchAd,
                   ),
                 ),
               ],
@@ -11213,15 +11676,8 @@ Future<bool> prepararZumbidoExtraConAnuncio(BuildContext context) async {
 Future<bool> prepararMontajeConAnuncio(
   BuildContext context, {
   required String accion,
-}) async {
-  final unlocked = await confirmarAnuncioMontaje(context, accion: accion);
-  if (!context.mounted) return unlocked;
-
-  if (unlocked) {
-    showSundaySnack(context, 'Anuncio completado. Preparando montaje...');
-  }
-
-  return unlocked;
+}) {
+  return confirmarAnuncioMontaje(context, accion: accion);
 }
 
 Future<bool> prepararSelfieConRetrasoConAnuncio(BuildContext context) async {
@@ -11915,46 +12371,34 @@ Future<List<XFile>> descargarSelfiesGrupo({
   }
 
   final files = <XFile>[];
-  final httpClient = HttpClient();
+  for (final currentWeekKey in weekIds) {
+    final postsSnapshot = await firestore
+        .collection('groups')
+        .doc(groupId)
+        .collection('weeks')
+        .doc(currentWeekKey)
+        .collection('posts')
+        .get();
 
-  try {
-    for (final currentWeekKey in weekIds) {
-      final postsSnapshot = await firestore
-          .collection('groups')
-          .doc(groupId)
-          .collection('weeks')
-          .doc(currentWeekKey)
-          .collection('posts')
-          .get();
+    for (final postDoc in postsSnapshot.docs) {
+      final data = postDoc.data();
+      final imageUrl = (data['imageUrl'] ?? data['thumbUrl'] ?? '').toString();
+      if (imageUrl.trim().isEmpty) continue;
 
-      for (final postDoc in postsSnapshot.docs) {
-        final data = postDoc.data();
-        final imageUrl = (data['imageUrl'] ?? data['thumbUrl'] ?? '')
-            .toString();
-        if (imageUrl.trim().isEmpty) continue;
+      final authorName = formatUserDisplayName(data['authorName'] ?? postDoc.id)
+          .replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_')
+          .replaceAll(RegExp(r'_+'), '_')
+          .trim();
+      final file = await LocalPhotoCache.instance.getOrDownload(
+        imageUrl,
+        variant: 'original',
+      );
+      if (file == null) continue;
 
-        final authorName =
-            formatUserDisplayName(data['authorName'] ?? postDoc.id)
-                .replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_')
-                .replaceAll(RegExp(r'_+'), '_')
-                .trim();
-        final uri = Uri.tryParse(imageUrl);
-        if (uri == null) continue;
-
-        final request = await httpClient.getUrl(uri);
-        final response = await request.close();
-        if (response.statusCode < 200 || response.statusCode >= 300) continue;
-
-        final bytes = await consolidateHttpClientResponseBytes(response);
-        final fileName =
-            '${sanitizedGroupName.isEmpty ? 'grupo' : sanitizedGroupName}_${currentWeekKey}_${authorName.isEmpty ? postDoc.id : authorName}.jpg';
-        final file = File('${Directory.systemTemp.path}/$fileName');
-        await file.writeAsBytes(bytes, flush: true);
-        files.add(XFile(file.path, mimeType: 'image/jpeg', name: fileName));
-      }
+      final fileName =
+          '${sanitizedGroupName.isEmpty ? 'grupo' : sanitizedGroupName}_${currentWeekKey}_${authorName.isEmpty ? postDoc.id : authorName}.jpg';
+      files.add(XFile(file.path, mimeType: 'image/jpeg', name: fileName));
     }
-  } finally {
-    httpClient.close(force: true);
   }
 
   return files;
@@ -11968,21 +12412,6 @@ String sanitizarParteNombreArchivo(String value, String fallback) {
   return sanitized.isEmpty ? fallback : sanitized;
 }
 
-String extensionImagenParaMimeType(String mimeType) {
-  switch (mimeType.toLowerCase()) {
-    case 'image/png':
-      return 'png';
-    case 'image/webp':
-      return 'webp';
-    case 'image/heic':
-      return 'heic';
-    case 'image/heif':
-      return 'heif';
-    default:
-      return 'jpg';
-  }
-}
-
 Future<XFile> descargarSelfieIndividual({
   required String imageUrl,
   required String groupName,
@@ -11994,33 +12423,19 @@ Future<XFile> descargarSelfieIndividual({
     throw Exception('Esta selfie no tiene una imagen disponible');
   }
 
-  final uri = Uri.tryParse(trimmedUrl);
-  if (uri == null || !uri.hasScheme) {
-    throw Exception('No se pudo preparar la descarga');
+  final file = await LocalPhotoCache.instance.getOrDownload(
+    trimmedUrl,
+    variant: 'original',
+  );
+  if (file == null) {
+    throw Exception('No se pudo descargar la selfie');
   }
 
-  final httpClient = HttpClient();
-  try {
-    final request = await httpClient.getUrl(uri);
-    final response = await request.close();
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('No se pudo descargar la selfie');
-    }
-
-    final bytes = await consolidateHttpClientResponseBytes(response);
-    final mimeType = response.headers.contentType?.mimeType ?? 'image/jpeg';
-    final extension = extensionImagenParaMimeType(mimeType);
-    final safeGroupName = sanitizarParteNombreArchivo(groupName, 'grupo');
-    final safeWeekKey = sanitizarParteNombreArchivo(weekKey, 'semana');
-    final safeAuthorName = sanitizarParteNombreArchivo(authorName, 'selfie');
-    final fileName =
-        'selfie_${safeGroupName}_${safeWeekKey}_$safeAuthorName.$extension';
-    final file = File('${Directory.systemTemp.path}/$fileName');
-    await file.writeAsBytes(bytes, flush: true);
-    return XFile(file.path, mimeType: mimeType, name: fileName);
-  } finally {
-    httpClient.close(force: true);
-  }
+  final safeGroupName = sanitizarParteNombreArchivo(groupName, 'grupo');
+  final safeWeekKey = sanitizarParteNombreArchivo(weekKey, 'semana');
+  final safeAuthorName = sanitizarParteNombreArchivo(authorName, 'selfie');
+  final fileName = 'selfie_${safeGroupName}_${safeWeekKey}_$safeAuthorName.jpg';
+  return XFile(file.path, mimeType: 'image/jpeg', name: fileName);
 }
 
 Future<void> compartirArchivosDescargados({
@@ -12377,6 +12792,7 @@ class _MyAppState extends State<MyApp> {
           builder: (context, _) {
             return MaterialApp(
               navigatorKey: sundayNavigatorKey,
+              navigatorObservers: [sundaySnackNavigationObserver],
               debugShowCheckedModeBanner: false,
               title: 'Sunday Selfie',
               locale: sundayLanguageController.locale,
@@ -12395,22 +12811,34 @@ class _MyAppState extends State<MyApp> {
                 ),
                 textTheme: GoogleFonts.dmSansTextTheme(),
               ),
-              home: FutureBuilder<void>(
-                future: appStartupFuture,
-                builder: (context, startupSnapshot) {
-                  if (startupSnapshot.connectionState ==
-                      ConnectionState.waiting) {
-                    return const LoadingScreen();
+              home: AnimatedBuilder(
+                animation: sundaySignOutInProgress,
+                builder: (context, _) {
+                  // El cierre de Firebase puede tardar varios segundos. No se
+                  // debe mantener ninguna ruta autenticada visible mientras
+                  // tanto, ni permitir volver a ella con el historial.
+                  if (sundaySignOutInProgress.value) {
+                    return const AbsorbPointer(child: LoginScreen());
                   }
 
-                  if (startupSnapshot.hasError) {
-                    return AppStartupErrorScreen(
-                      error: startupSnapshot.error.toString(),
-                      onRetry: _retryStartup,
-                    );
-                  }
+                  return FutureBuilder<void>(
+                    future: appStartupFuture,
+                    builder: (context, startupSnapshot) {
+                      if (startupSnapshot.connectionState ==
+                          ConnectionState.waiting) {
+                        return const LoadingScreen();
+                      }
 
-                  return _buildAuthGate();
+                      if (startupSnapshot.hasError) {
+                        return AppStartupErrorScreen(
+                          error: startupSnapshot.error.toString(),
+                          onRetry: _retryStartup,
+                        );
+                      }
+
+                      return _buildAuthGate();
+                    },
+                  );
                 },
               ),
             );
@@ -12659,7 +13087,7 @@ class AuthSetupErrorScreen extends StatelessWidget {
               SundayButton(
                 text: 'Cerrar sesión',
                 variant: SundayButtonVariant.ghost,
-                onPressed: () => FirebaseAuth.instance.signOut(),
+                onPressed: () => cerrarSesionYMostrarAcceso(),
               ),
             ],
           ),
@@ -13728,7 +14156,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   left: 20,
                   right: 20,
                   top: height * 0.18,
-                  child: const Column(
+                  child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       SundaySelfieLogoMark(size: 142),
@@ -13736,7 +14164,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       SundayLogo(size: 48),
                       SizedBox(height: 10),
                       Text(
-                        'Seguir conectados una vez por semana',
+                        context.tr('Seguir conectados una vez por semana'),
                         textAlign: TextAlign.center,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
@@ -13794,9 +14222,11 @@ class _LoginScreenState extends State<LoginScreen> {
                                 const SizedBox(width: 12),
                                 Expanded(
                                   child: Text(
-                                    isSigningInWithGoogle
-                                        ? 'Conectando...'
-                                        : 'Continuar con Google',
+                                    context.tr(
+                                      isSigningInWithGoogle
+                                          ? 'Conectando...'
+                                          : 'Continuar con Google',
+                                    ),
                                     textAlign: TextAlign.center,
                                     style: GoogleFonts.roboto(
                                       fontSize: 15,
@@ -13849,9 +14279,11 @@ class _LoginScreenState extends State<LoginScreen> {
                                 const SizedBox(width: 12),
                                 Expanded(
                                   child: Text(
-                                    isSigningInWithApple
-                                        ? 'Conectando...'
-                                        : 'Continuar con Apple',
+                                    context.tr(
+                                      isSigningInWithApple
+                                          ? 'Conectando...'
+                                          : 'Continuar con Apple',
+                                    ),
                                     textAlign: TextAlign.center,
                                     style: const TextStyle(
                                       fontSize: 15,
@@ -13875,26 +14307,28 @@ class _LoginScreenState extends State<LoginScreen> {
                   bottom: loginLegalBottomInset,
                   child: RichText(
                     textAlign: TextAlign.center,
-                    text: const TextSpan(
-                      style: TextStyle(
+                    text: TextSpan(
+                      style: const TextStyle(
                         color: ssText3,
                         fontSize: 12,
                         height: 1.5,
                       ),
                       children: [
-                        TextSpan(text: 'Al continuar aceptas nuestros '),
                         TextSpan(
-                          text: 'Términos',
-                          style: TextStyle(
+                          text: context.tr('Al continuar aceptas nuestros '),
+                        ),
+                        TextSpan(
+                          text: context.tr('Términos'),
+                          style: const TextStyle(
                             color: ssOrange,
                             decoration: TextDecoration.underline,
                             fontWeight: FontWeight.w500,
                           ),
                         ),
-                        TextSpan(text: ' y '),
+                        TextSpan(text: context.tr(' y ')),
                         TextSpan(
-                          text: 'Política de Privacidad',
-                          style: TextStyle(
+                          text: context.tr('Política de Privacidad'),
+                          style: const TextStyle(
                             color: ssOrange,
                             decoration: TextDecoration.underline,
                             fontWeight: FontWeight.w500,
@@ -13941,11 +14375,13 @@ class SundayShell extends StatefulWidget {
 }
 
 class _SundayShellState extends State<SundayShell> {
+  static const int cameraTabIndex = 2;
   static const int profileTabIndex = 4;
 
   late int selectedIndex;
   late List<Widget> pages;
   DateTime? pagesCalendarDay;
+  final ValueNotifier<int> cameraTabVisitNotifier = ValueNotifier(0);
   StreamSubscription<RemoteMessage>? foregroundNotificationSubscription;
   StreamSubscription<RemoteMessage>? notificationOpenSubscription;
   String? lastHandledNotificationKey;
@@ -13966,9 +14402,16 @@ class _SundayShellState extends State<SundayShell> {
     return [
       HomeScreen(user: user),
       MySelfiesScreen(user: user),
-      CameraTabScreen(user: user),
+      CameraTabScreen(
+        user: user,
+        cameraTabVisitNotifier: cameraTabVisitNotifier,
+      ),
       MontageScreen(user: user),
-      ProfileScreen(key: profileScreenKey, user: user),
+      ProfileScreen(
+        key: profileScreenKey,
+        user: user,
+        onOpenMySelfies: () => selectTab(1),
+      ),
     ];
   }
 
@@ -14001,6 +14444,7 @@ class _SundayShellState extends State<SundayShell> {
     if (Platform.isAndroid) {
       foregroundNotificationChannel.setMethodCallHandler(null);
     }
+    cameraTabVisitNotifier.dispose();
     super.dispose();
   }
 
@@ -14237,11 +14681,17 @@ class _SundayShellState extends State<SundayShell> {
       return;
     }
 
+    _dismissActiveSundaySnack();
+
     if (leavingProfile || showingProfile) {
       resetProfileScroll();
     }
 
     setState(() => selectedIndex = nextIndex);
+
+    if (nextIndex == cameraTabIndex) {
+      cameraTabVisitNotifier.value++;
+    }
 
     if (leavingProfile || showingProfile) {
       resetProfileScrollAfterFrame();
@@ -15351,8 +15801,8 @@ class _GroupEmojiPickerSheetState extends State<GroupEmojiPickerSheet> {
                 ),
               ),
             ),
-            const Text(
-              'Elige un emoticono',
+            Text(
+              context.tr('Elige un emoticono'),
               style: TextStyle(
                 color: ssTitle,
                 fontSize: 19,
@@ -15372,7 +15822,7 @@ class _GroupEmojiPickerSheetState extends State<GroupEmojiPickerSheet> {
                   final selected = index == selectedSectionIndex;
 
                   return Tooltip(
-                    message: option.label,
+                    message: context.tr(option.label),
                     child: InkWell(
                       onTap: () => setState(() {
                         selectedSectionIndex = index;
@@ -15402,7 +15852,7 @@ class _GroupEmojiPickerSheetState extends State<GroupEmojiPickerSheet> {
             ),
             const SizedBox(height: 12),
             Text(
-              section.label,
+              context.tr(section.label),
               style: const TextStyle(
                 color: ssText2,
                 fontSize: 13,
@@ -16428,7 +16878,10 @@ class _GroupScreenState extends State<GroupScreen> {
     return Scaffold(
       backgroundColor: ssBg,
       resizeToAvoidBottomInset: true,
-      bottomNavigationBar: currentUser == null || keyboardVisible
+      // El footer permanece colocado al fondo, detrás del teclado. Así se va
+      // descubriendo conforme este baja y el campo de mensaje se detiene
+      // directamente encima de él, sin hacer un salto de ida y vuelta.
+      bottomNavigationBar: currentUser == null
           ? null
           : SundayTabBar(
               selectedIndex: 0,
@@ -16730,16 +17183,9 @@ class _GroupScreenState extends State<GroupScreen> {
                           }
 
                           final allWeeksMode = showingAllWeeks;
-                          final chatCanWrite =
-                              effectiveSelectedWeekKey.isNotEmpty &&
-                              esDomingo() &&
-                              effectiveSelectedWeekKey ==
-                                  obtenerWeekKeyActual();
                           final expandedChatHeight =
                               resolverAlturaPanelChatSemanal(
                                 screenHeight: MediaQuery.sizeOf(context).height,
-                                keyboardOpen: keyboardVisible,
-                                canWrite: chatCanWrite,
                               );
 
                           return GroupWeeklyContentLayout(
@@ -17840,7 +18286,7 @@ class GroupMembersHtmlContent extends StatelessWidget {
                   rows: [
                     GroupOptionRow(
                       icon: GroupOptionIconKind.leave,
-                      title: 'Salir',
+                      title: 'Abandonar grupo',
                       destructive: true,
                       onTap: () => _leaveGroup(context),
                     ),
@@ -20094,27 +20540,32 @@ class MemberActionsSheet extends StatefulWidget {
 
 class _MemberActionsSheetState extends State<MemberActionsSheet> {
   bool sendingReminder = false;
+  bool reminderSentOptimistically = false;
   bool preparingExtraReminder = false;
   bool extraReminderUnlocked = false;
 
-  Future<void> _sendReminder() async {
+  void _sendReminder() {
     if (sendingReminder) return;
 
-    setState(() => sendingReminder = true);
+    setState(() {
+      sendingReminder = true;
+      reminderSentOptimistically = true;
+    });
 
+    unawaited(_sendReminderInBackground());
+  }
+
+  Future<void> _sendReminderInBackground() async {
     try {
       await enviarZumbidoSelfie(
         groupId: widget.groupId,
         targetUid: widget.memberDoc.id,
         rewardedAdWatched: extraReminderUnlocked,
       );
-
-      if (!mounted) return;
-      Navigator.pop(context);
-      showSundaySnack(context, 'Zumbido enviado');
     } catch (error) {
       if (!mounted) return;
-      showSundaySnack(context, 'Error: $error');
+      setState(() => reminderSentOptimistically = false);
+      showSundaySnack(context, 'Error enviando el zumbido: $error');
     } finally {
       if (mounted) setState(() => sendingReminder = false);
     }
@@ -20296,22 +20747,22 @@ class _MemberActionsSheetState extends State<MemberActionsSheet> {
                     builder: (context, snapshot) {
                       final targetAlreadyReminded =
                           snapshot.data?.docs.isNotEmpty ?? false;
-                      final needsAd =
-                          targetAlreadyReminded && !extraReminderUnlocked;
-                      final busy = sendingReminder || preparingExtraReminder;
+                      final hasReminder =
+                          targetAlreadyReminded || reminderSentOptimistically;
+                      final needsAd = hasReminder && !extraReminderUnlocked;
+                      final interactionLocked =
+                          sendingReminder || preparingExtraReminder;
 
                       return InviteActionButton(
-                        text: busy
-                            ? preparingExtraReminder
-                                  ? 'Cargando anuncio...'
-                                  : 'Enviando zumbido...'
+                        text: preparingExtraReminder
+                            ? 'Cargando anuncio...'
                             : needsAd
                             ? 'Zumbido enviado'
                             : 'Enviar zumbido',
-                        variant: needsAd && !busy
+                        variant: needsAd && !interactionLocked
                             ? InviteActionButtonVariant.secondary
                             : InviteActionButtonVariant.primary,
-                        onTap: busy
+                        onTap: interactionLocked
                             ? () {}
                             : needsAd
                             ? _prepareExtraReminder
@@ -20530,83 +20981,178 @@ class _GroupPostsGridState extends State<GroupPostsGrid> {
           stream: currentMembersStream,
           builder: (context, membersSnapshot) {
             final memberDocs = membersSnapshot.data?.docs ?? [];
-            final missingMembers = memberDocs
-                .where((m) => !postedUids.contains(m.id))
-                .toList();
+            return ListenableBuilder(
+              listenable: PendingSelfieUploads.instance,
+              builder: (context, _) {
+                final currentUser = FirebaseAuth.instance.currentUser;
+                final pending = currentUser == null
+                    ? null
+                    : PendingSelfieUploads.instance.find(
+                        groupId: widget.groupId,
+                        weekKey: widget.weekKey,
+                        userId: currentUser.uid,
+                      );
+                final hasLocalPendingPhoto =
+                    pending?.shouldShowLocalPhoto == true;
+                final showPendingSelfie =
+                    hasLocalPendingPhoto &&
+                    currentUser != null &&
+                    !postedUids.contains(currentUser.uid);
+                final currentMember = currentUser == null
+                    ? null
+                    : memberDocs
+                          .where((member) => member.id == currentUser.uid)
+                          .firstOrNull;
+                final pendingPost = <String, dynamic>{
+                  'authorName':
+                      currentMember?.data()['effectiveName'] ??
+                      currentUser?.displayName ??
+                      'Tú',
+                  'authorPhotoUrl':
+                      currentMember?.data()['effectivePhotoUrl'] ??
+                      currentUser?.photoURL,
+                };
+                final missingMembers = memberDocs
+                    .where(
+                      (member) =>
+                          !postedUids.contains(member.id) &&
+                          !(showPendingSelfie && member.id == currentUser.uid),
+                    )
+                    .toList();
+                final pendingOffset = showPendingSelfie ? 1 : 0;
 
-            return CustomScrollView(
-              slivers: [
-                SliverPadding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
-                  sliver: SliverGrid(
-                    gridDelegate:
-                        const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 2,
-                          mainAxisSpacing: 12,
-                          crossAxisSpacing: 12,
-                          childAspectRatio: 0.56,
-                        ),
-                    delegate: SliverChildBuilderDelegate((context, index) {
-                      if (index < postDocs.length) {
-                        final doc = postDocs[index];
-                        final post = doc.data();
-                        return SelfieTile(
-                          groupId: widget.groupId,
-                          groupName: widget.groupName,
-                          groupPhotoUrl: widget.groupPhotoUrl,
-                          weekKey: widget.weekKey,
-                          postUid: doc.id,
-                          post: post,
-                          onTap: () {
-                            Navigator.push(
-                              context,
-                              MaterialPageRoute(
-                                builder: (_) => SelfieFullScreen(
-                                  groupId: widget.groupId,
-                                  groupName: widget.groupName,
-                                  groupPhotoUrl: widget.groupPhotoUrl,
-                                  weekKey: widget.weekKey,
-                                  postUid: doc.id,
-                                  post: post,
-                                  initialIndex: index,
-                                  galleryEntries: postDocs.map((postDoc) {
-                                    return SelfieViewerEntry(
-                                      groupId: widget.groupId,
-                                      groupName: widget.groupName,
-                                      groupPhotoUrl: widget.groupPhotoUrl,
-                                      weekKey: widget.weekKey,
-                                      postUid: postDoc.id,
-                                      post: postDoc.data(),
-                                    );
-                                  }).toList(),
-                                ),
-                              ),
+                return CustomScrollView(
+                  slivers: [
+                    SliverPadding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+                      sliver: SliverGrid(
+                        gridDelegate:
+                            const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 2,
+                              mainAxisSpacing: 12,
+                              crossAxisSpacing: 12,
+                              childAspectRatio: 0.56,
+                            ),
+                        delegate: SliverChildBuilderDelegate(
+                          (context, index) {
+                            if (showPendingSelfie && index == 0) {
+                              return SelfieTile(
+                                groupId: widget.groupId,
+                                groupName: widget.groupName,
+                                groupPhotoUrl: widget.groupPhotoUrl,
+                                weekKey: widget.weekKey,
+                                postUid: currentUser.uid,
+                                post: pendingPost,
+                                localImagePath: pending!.foto.path,
+                                onTap: () {
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => SelfieFullScreen(
+                                        groupId: widget.groupId,
+                                        groupName: widget.groupName,
+                                        groupPhotoUrl: widget.groupPhotoUrl,
+                                        weekKey: widget.weekKey,
+                                        postUid: currentUser.uid,
+                                        post: pendingPost,
+                                        localImagePath: pending.foto.path,
+                                      ),
+                                    ),
+                                  );
+                                },
+                              );
+                            }
+
+                            final postIndex = index - pendingOffset;
+                            if (postIndex < postDocs.length) {
+                              final doc = postDocs[postIndex];
+                              final post = doc.data();
+                              final localImagePath =
+                                  hasLocalPendingPhoto &&
+                                      doc.id == currentUser?.uid
+                                  ? pending?.foto.path
+                                  : null;
+                              return SelfieTile(
+                                groupId: widget.groupId,
+                                groupName: widget.groupName,
+                                groupPhotoUrl: widget.groupPhotoUrl,
+                                weekKey: widget.weekKey,
+                                postUid: doc.id,
+                                post: post,
+                                localImagePath: localImagePath,
+                                onTap: () {
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => localImagePath != null
+                                          ? SelfieFullScreen(
+                                              groupId: widget.groupId,
+                                              groupName: widget.groupName,
+                                              groupPhotoUrl:
+                                                  widget.groupPhotoUrl,
+                                              weekKey: widget.weekKey,
+                                              postUid: doc.id,
+                                              post: post,
+                                              localImagePath: localImagePath,
+                                            )
+                                          : SelfieFullScreen(
+                                              groupId: widget.groupId,
+                                              groupName: widget.groupName,
+                                              groupPhotoUrl:
+                                                  widget.groupPhotoUrl,
+                                              weekKey: widget.weekKey,
+                                              postUid: doc.id,
+                                              post: post,
+                                              initialIndex: postIndex,
+                                              galleryEntries: postDocs.map((
+                                                postDoc,
+                                              ) {
+                                                return SelfieViewerEntry(
+                                                  groupId: widget.groupId,
+                                                  groupName: widget.groupName,
+                                                  groupPhotoUrl:
+                                                      widget.groupPhotoUrl,
+                                                  weekKey: widget.weekKey,
+                                                  postUid: postDoc.id,
+                                                  post: postDoc.data(),
+                                                );
+                                              }).toList(),
+                                            ),
+                                    ),
+                                  );
+                                },
+                              );
+                            }
+
+                            final missingDoc =
+                                missingMembers[postIndex - postDocs.length];
+                            final missing = missingDoc.data();
+                            final name = formatUserDisplayName(
+                              missing['effectiveName'] ?? 'Usuario',
+                            );
+                            final photoUrl =
+                                missing['effectivePhotoUrl'] as String?;
+                            return MissingSelfieTile(
+                              groupId: widget.groupId,
+                              groupName: widget.groupName,
+                              groupPhotoUrl: widget.groupPhotoUrl,
+                              weekKey: widget.weekKey,
+                              targetUid: missingDoc.id,
+                              name: name,
+                              photoUrl: photoUrl,
+                              joinedAt: missing['joinedAt'],
                             );
                           },
-                        );
-                      }
-
-                      final missingDoc =
-                          missingMembers[index - postDocs.length];
-                      final missing = missingDoc.data();
-                      final name = formatUserDisplayName(
-                        missing['effectiveName'] ?? 'Usuario',
-                      );
-                      final photoUrl = missing['effectivePhotoUrl'] as String?;
-                      return MissingSelfieTile(
-                        groupId: widget.groupId,
-                        groupName: widget.groupName,
-                        groupPhotoUrl: widget.groupPhotoUrl,
-                        weekKey: widget.weekKey,
-                        targetUid: missingDoc.id,
-                        name: name,
-                        photoUrl: photoUrl,
-                        joinedAt: missing['joinedAt'],
-                      );
-                    }, childCount: postDocs.length + missingMembers.length),
-                  ),
-                ),
-              ],
+                          childCount:
+                              pendingOffset +
+                              postDocs.length +
+                              missingMembers.length,
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
             );
           },
         );
@@ -20862,14 +21408,12 @@ const double kWeeklyChatDragDismissVelocity = 320.0;
 
 double resolverAlturaPanelChatSemanal({
   required double screenHeight,
-  required bool keyboardOpen,
-  required bool canWrite,
   double? maxExpandedHeight,
 }) {
-  final targetHeight = math.min(
-    screenHeight * (keyboardOpen ? 0.34 : 0.43),
-    keyboardOpen ? 292.0 : (canWrite ? 356.0 : 326.0),
-  );
+  // El contenedor padre lo limita al espacio situado bajo el selector semanal.
+  // Pedir la altura completa de la pantalla hace que el chat llegue hasta ese
+  // borde, sin tapar los botones de selección de semana.
+  final targetHeight = math.max(0.0, screenHeight);
 
   final availableHeight = maxExpandedHeight;
   if (availableHeight == null || !availableHeight.isFinite) {
@@ -20907,12 +21451,14 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
     with SingleTickerProviderStateMixin {
   final TextEditingController messageController = TextEditingController();
   final FocusNode messageFocusNode = FocusNode();
+  final ScrollController messagesScrollController = ScrollController();
   late final AnimationController dragAnimationController;
-  bool sending = false;
   Stream<QuerySnapshot<Map<String, dynamic>>>? messagesStream;
   Stream<DocumentSnapshot<Map<String, dynamic>>>? readStateStream;
   DateTime? optimisticReadAt;
   String? lastReadWriteMarker;
+  String? lastAutoScrolledMessageMarker;
+  bool messagesAtTop = true;
   double dragOffset = 0;
   double dragAnimationStartOffset = 0;
   double dragAnimationEndOffset = 0;
@@ -20928,6 +21474,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
     )..addListener(_handleDragAnimationTick);
     configureMessagesStream();
     configureReadStateStream();
+    messagesScrollController.addListener(_updateMessagesAtTop);
     _warmGifPicker();
   }
 
@@ -20940,6 +21487,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
       configureReadStateStream();
       optimisticReadAt = null;
       lastReadWriteMarker = null;
+      lastAutoScrolledMessageMarker = null;
       gifPickerWarmupStarted = false;
       _warmGifPicker();
     }
@@ -20947,6 +21495,9 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
     if (oldWidget.expanded != widget.expanded) {
       dragAnimationController.stop();
       dragOffset = 0;
+      if (widget.expanded) {
+        lastAutoScrolledMessageMarker = null;
+      }
       _warmGifPicker();
     }
   }
@@ -20973,6 +21524,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
   }
 
   void configureMessagesStream() {
+    messagesAtTop = true;
     if (widget.weekKey.isEmpty) {
       messagesStream = null;
       return;
@@ -21008,6 +21560,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
     dragAnimationController.dispose();
     messageFocusNode.dispose();
     messageController.dispose();
+    messagesScrollController.dispose();
     super.dispose();
   }
 
@@ -21018,12 +21571,12 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
   }
 
   Future<void> _send() async {
-    if (sending || !canWrite) return;
+    if (!canWrite) return;
 
     final text = messageController.text.trim();
     if (text.isEmpty) return;
 
-    setState(() => sending = true);
+    messageController.clear();
 
     try {
       await enviarMensajeChatSemana(
@@ -21031,22 +21584,21 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
         weekKey: widget.weekKey,
         text: text,
       );
-
-      messageController.clear();
     } catch (error) {
       if (!mounted) return;
+      if (messageController.text.trim().isEmpty) {
+        messageController.text = text;
+      }
       showSundaySnack(context, 'Error: $error');
-    } finally {
-      if (mounted) setState(() => sending = false);
     }
   }
 
   Future<void> _sendGif(SundayChatGif gif) async {
-    if (sending || !canWrite) return;
+    if (!canWrite) return;
 
     final caption = messageController.text.trim();
 
-    setState(() => sending = true);
+    messageController.clear();
 
     try {
       await enviarMensajeChatSemana(
@@ -21056,18 +21608,17 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
         gifUrl: gif.url,
         gifLabel: gif.label,
       );
-
-      messageController.clear();
     } catch (error) {
       if (!mounted) return;
+      if (messageController.text.trim().isEmpty) {
+        messageController.text = caption;
+      }
       showSundaySnack(context, 'Error: $error');
-    } finally {
-      if (mounted) setState(() => sending = false);
     }
   }
 
   Future<void> _openGifPicker() async {
-    if (sending || !canWrite) return;
+    if (!canWrite) return;
 
     FocusScope.of(context).unfocus();
     _warmGifPicker();
@@ -21170,6 +21721,42 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
     }
   }
 
+  void _scheduleScrollToLatestMessage(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> messages,
+  ) {
+    if (!widget.expanded || messages.isEmpty) return;
+
+    final latestMessage = messages.last;
+    final marker = '${widget.groupId}:${widget.weekKey}:${latestMessage.id}';
+    if (lastAutoScrolledMessageMarker == marker) return;
+    lastAutoScrolledMessageMarker = marker;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          !widget.expanded ||
+          !messagesScrollController.hasClients) {
+        return;
+      }
+
+      final position = messagesScrollController.position;
+      messagesScrollController.animateTo(
+        position.maxScrollExtent,
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOutCubic,
+      );
+    });
+  }
+
+  void _updateMessagesAtTop() {
+    if (!messagesScrollController.hasClients) return;
+
+    final position = messagesScrollController.position;
+    final nextMessagesAtTop = position.pixels <= position.minScrollExtent + 0.5;
+    if (messagesAtTop == nextMessagesAtTop) return;
+
+    setState(() => messagesAtTop = nextMessagesAtTop);
+  }
+
   void _togglePanel() {
     if (widget.expanded) {
       _collapsePanel();
@@ -21212,8 +21799,6 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
 
     return resolverAlturaPanelChatSemanal(
       screenHeight: MediaQuery.sizeOf(context).height,
-      keyboardOpen: MediaQuery.viewInsetsOf(context).bottom > 0,
-      canWrite: canWrite,
     );
   }
 
@@ -21302,6 +21887,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
             messages: messages,
             unreadCount: unreadCount,
           );
+          _scheduleScrollToLatestMessage(messages);
 
           Widget animatedPanelSize(Widget child) {
             if (widget.fillAvailableHeight) return child;
@@ -21324,106 +21910,125 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
             );
           }
 
-          final keyboardOpen = MediaQuery.viewInsetsOf(context).bottom > 0;
           final panelHeight = resolverAlturaPanelChatSemanal(
             screenHeight: MediaQuery.sizeOf(context).height,
-            keyboardOpen: keyboardOpen,
-            canWrite: canWrite,
             maxExpandedHeight: widget.maxExpandedHeight,
           );
 
-          final panel = Container(
-            decoration: const BoxDecoration(
-              color: ssBg,
-              border: Border(top: BorderSide(color: ssSeparator, width: 1)),
-            ),
-            child: Column(
-              children: [
-                WeeklyChatExpandedDragZone(
-                  weekLabel: widget.weekKey == obtenerWeekKeyActual()
-                      ? context.tr('ESTA SEMANA')
-                      : localizedWeekLabel(context, widget.weekKey),
-                  onDismiss: _collapsePanel,
-                  onDragStart: _handlePanelDragStart,
-                  onDragUpdate: _handlePanelDragUpdate,
-                  onDragEnd: _handlePanelDragEnd,
-                  onDragCancel: _handlePanelDragCancel,
+          Widget buildExpandedPanel(double height) {
+            lastExpandedPanelHeight = height;
+            final visibleDragOffset = dragOffset.clamp(0.0, height).toDouble();
+
+            return SizedBox(
+              height: height,
+              child: Container(
+                decoration: const BoxDecoration(
+                  color: ssBg,
+                  border: Border(top: BorderSide(color: ssSeparator, width: 1)),
                 ),
-                Expanded(
-                  child: snapshot.connectionState == ConnectionState.waiting
-                      ? const Center(
-                          child: CircularProgressIndicator(
-                            color: ssOrange,
-                            strokeWidth: 2,
+                child: Column(
+                  children: [
+                    Expanded(
+                      child: ClipRect(
+                        child: Transform.translate(
+                          offset: Offset(0, visibleDragOffset),
+                          child: Column(
+                            children: [
+                              WeeklyChatExpandedDragZone(
+                                weekLabel:
+                                    widget.weekKey == obtenerWeekKeyActual()
+                                    ? context.tr('ESTA SEMANA')
+                                    : localizedWeekLabel(
+                                        context,
+                                        widget.weekKey,
+                                      ),
+                                onDismiss: _collapsePanel,
+                                onDragStart: _handlePanelDragStart,
+                                onDragUpdate: _handlePanelDragUpdate,
+                                onDragEnd: _handlePanelDragEnd,
+                                onDragCancel: _handlePanelDragCancel,
+                              ),
+                              Expanded(
+                                child: WeeklyChatDragArea(
+                                  captureDescendantDrags: true,
+                                  onDragStart: messagesAtTop
+                                      ? _handlePanelDragStart
+                                      : null,
+                                  onDragUpdate: messagesAtTop
+                                      ? _handlePanelDragUpdate
+                                      : null,
+                                  onDragEnd: messagesAtTop
+                                      ? _handlePanelDragEnd
+                                      : null,
+                                  onDragCancel: messagesAtTop
+                                      ? _handlePanelDragCancel
+                                      : null,
+                                  child:
+                                      snapshot.connectionState ==
+                                          ConnectionState.waiting
+                                      ? const Center(
+                                          child: CircularProgressIndicator(
+                                            color: ssOrange,
+                                            strokeWidth: 2,
+                                          ),
+                                        )
+                                      : messages.isEmpty
+                                      ? WeeklyChatEmptyState(canWrite: canWrite)
+                                      : ListView.separated(
+                                          controller: messagesScrollController,
+                                          padding: const EdgeInsets.fromLTRB(
+                                            12,
+                                            4,
+                                            12,
+                                            12,
+                                          ),
+                                          itemCount: messages.length,
+                                          separatorBuilder: (_, _) =>
+                                              const SizedBox(height: 8),
+                                          itemBuilder: (context, index) {
+                                            final doc = messages[index];
+                                            return WeeklyChatMessageBubble(
+                                              message: doc.data(),
+                                              fallbackSeed: doc.id,
+                                            );
+                                          },
+                                        ),
+                                ),
+                              ),
+                            ],
                           ),
-                        )
-                      : messages.isEmpty
-                      ? WeeklyChatEmptyState(canWrite: canWrite)
-                      : ListView.separated(
-                          padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-                          itemCount: messages.length,
-                          separatorBuilder: (_, _) => const SizedBox(height: 8),
-                          itemBuilder: (context, index) {
-                            final doc = messages[index];
-                            return WeeklyChatMessageBubble(
-                              message: doc.data(),
-                              fallbackSeed: doc.id,
-                            );
-                          },
                         ),
+                      ),
+                    ),
+                    WeeklyChatInputBar(
+                      canWrite: canWrite,
+                      controller: messageController,
+                      focusNode: messageFocusNode,
+                      onSend: _send,
+                      onGif: _openGifPicker,
+                      onToggle: _togglePanel,
+                    ),
+                  ],
                 ),
-                WeeklyChatInputBar(
-                  canWrite: canWrite,
-                  sending: sending,
-                  controller: messageController,
-                  focusNode: messageFocusNode,
-                  onSend: _send,
-                  onGif: _openGifPicker,
-                  onToggle: _togglePanel,
-                ),
-              ],
-            ),
-          );
+              ),
+            );
+          }
 
           if (widget.fillAvailableHeight) {
             return LayoutBuilder(
               builder: (context, constraints) {
-                final panelDistance =
+                final availablePanelHeight =
                     constraints.hasBoundedHeight &&
                         constraints.maxHeight.isFinite
                     ? constraints.maxHeight
                     : panelHeight;
-                lastExpandedPanelHeight = panelDistance;
-                final visibleDragOffset = dragOffset
-                    .clamp(0.0, panelDistance)
-                    .toDouble();
 
-                return ClipRect(
-                  child: Transform.translate(
-                    offset: Offset(0, visibleDragOffset),
-                    child: panel,
-                  ),
-                );
+                return buildExpandedPanel(availablePanelHeight);
               },
             );
           }
 
-          lastExpandedPanelHeight = panelHeight;
-          final visibleDragOffset = dragOffset
-              .clamp(0.0, panelHeight)
-              .toDouble();
-
-          return animatedPanelSize(
-            SizedBox(
-              height: panelHeight,
-              child: ClipRect(
-                child: Transform.translate(
-                  offset: Offset(0, visibleDragOffset),
-                  child: panel,
-                ),
-              ),
-            ),
-          );
+          return animatedPanelSize(buildExpandedPanel(panelHeight));
         }
 
         if (currentReadStateStream == null) {
@@ -21512,7 +22117,7 @@ class WeeklyChatHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+      padding: const EdgeInsets.fromLTRB(12, 1, 12, 4),
       child: Row(
         children: [
           const Icon(
@@ -21549,6 +22154,7 @@ class WeeklyChatExpandedDragZone extends StatelessWidget {
   final ValueChanged<double>? onDragUpdate;
   final void Function(double distance, double velocity)? onDragEnd;
   final VoidCallback? onDragCancel;
+  final bool dragEnabled;
 
   const WeeklyChatExpandedDragZone({
     super.key,
@@ -21558,32 +22164,37 @@ class WeeklyChatExpandedDragZone extends StatelessWidget {
     this.onDragUpdate,
     this.onDragEnd,
     this.onDragCancel,
+    this.dragEnabled = true,
   });
 
   @override
   Widget build(BuildContext context) {
+    final content = ConstrainedBox(
+      constraints: const BoxConstraints(
+        minHeight: kWeeklyChatExpandedDragZoneMinHeight,
+      ),
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            WeeklyChatDragHandle(onDismiss: onDismiss, dragEnabled: false),
+            WeeklyChatHeader(weekLabel: weekLabel),
+          ],
+        ),
+      ),
+    );
+
+    if (!dragEnabled) return content;
+
     return WeeklyChatDragArea(
       onDismiss: onDismiss,
       onDragStart: onDragStart,
       onDragUpdate: onDragUpdate,
       onDragEnd: onDragEnd,
       onDragCancel: onDragCancel,
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(
-          minHeight: kWeeklyChatExpandedDragZoneMinHeight,
-        ),
-        child: Padding(
-          padding: const EdgeInsets.only(bottom: 8),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              WeeklyChatDragHandle(onDismiss: onDismiss, dragEnabled: false),
-              WeeklyChatHeader(weekLabel: weekLabel),
-            ],
-          ),
-        ),
-      ),
+      child: content,
     );
   }
 }
@@ -21650,6 +22261,7 @@ class WeeklyChatDragArea extends StatefulWidget {
   final ValueChanged<double>? onDragUpdate;
   final void Function(double distance, double velocity)? onDragEnd;
   final VoidCallback? onDragCancel;
+  final bool captureDescendantDrags;
 
   const WeeklyChatDragArea({
     super.key,
@@ -21660,6 +22272,7 @@ class WeeklyChatDragArea extends StatefulWidget {
     this.onDragUpdate,
     this.onDragEnd,
     this.onDragCancel,
+    this.captureDescendantDrags = false,
   });
 
   @override
@@ -21668,9 +22281,81 @@ class WeeklyChatDragArea extends StatefulWidget {
 
 class _WeeklyChatDragAreaState extends State<WeeklyChatDragArea> {
   double dragDistance = 0;
+  int? activePointer;
+  Offset? lastPointerPosition;
+  Duration? lastPointerTimeStamp;
+  double lastPointerVelocity = 0;
 
   void _resetDrag() {
     dragDistance = 0;
+  }
+
+  void _handlePointerDown(PointerDownEvent event) {
+    if (activePointer != null) return;
+
+    activePointer = event.pointer;
+    lastPointerPosition = event.position;
+    lastPointerTimeStamp = event.timeStamp;
+    lastPointerVelocity = 0;
+    _resetDrag();
+    widget.onDragStart?.call();
+  }
+
+  void _handlePointerMove(PointerMoveEvent event) {
+    if (event.pointer != activePointer) return;
+
+    final previousPosition = lastPointerPosition;
+    final previousTimeStamp = lastPointerTimeStamp;
+    if (previousPosition == null || previousTimeStamp == null) return;
+
+    final delta = event.position.dy - previousPosition.dy;
+    final elapsedMicros = (event.timeStamp - previousTimeStamp).inMicroseconds;
+    if (elapsedMicros > 0) {
+      lastPointerVelocity =
+          delta * Duration.microsecondsPerSecond / elapsedMicros;
+    }
+
+    lastPointerPosition = event.position;
+    lastPointerTimeStamp = event.timeStamp;
+    dragDistance = math.max(0, dragDistance + delta);
+    widget.onDragUpdate?.call(dragDistance);
+  }
+
+  void _finishPointerDrag({required int pointer, required double velocity}) {
+    if (pointer != activePointer) return;
+
+    final distance = dragDistance;
+    activePointer = null;
+    lastPointerPosition = null;
+    lastPointerTimeStamp = null;
+    lastPointerVelocity = 0;
+    _resetDrag();
+
+    final onDragEnd = widget.onDragEnd;
+    if (onDragEnd != null) {
+      onDragEnd(distance, velocity);
+      return;
+    }
+
+    final shouldDismiss =
+        distance > kWeeklyChatDragDismissDistance ||
+        velocity > kWeeklyChatDragDismissVelocity;
+    if (shouldDismiss) widget.onDismiss?.call();
+  }
+
+  void _handlePointerUp(PointerUpEvent event) {
+    _finishPointerDrag(pointer: event.pointer, velocity: lastPointerVelocity);
+  }
+
+  void _handlePointerCancel(PointerCancelEvent event) {
+    if (event.pointer != activePointer) return;
+
+    activePointer = null;
+    lastPointerPosition = null;
+    lastPointerTimeStamp = null;
+    lastPointerVelocity = 0;
+    _resetDrag();
+    widget.onDragCancel?.call();
   }
 
   @override
@@ -21683,6 +22368,21 @@ class _WeeklyChatDragAreaState extends State<WeeklyChatDragArea> {
         widget.onDragCancel != null;
     final tapEnabled = widget.onTap != null;
     if (!dragEnabled && !tapEnabled) return widget.child;
+
+    if (widget.captureDescendantDrags) {
+      return Listener(
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: dragEnabled ? _handlePointerDown : null,
+        onPointerMove: dragEnabled ? _handlePointerMove : null,
+        onPointerUp: dragEnabled ? _handlePointerUp : null,
+        onPointerCancel: dragEnabled ? _handlePointerCancel : null,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          onTap: widget.onTap,
+          child: widget.child,
+        ),
+      );
+    }
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -21943,7 +22643,6 @@ class WeeklyChatMessageBubble extends StatelessWidget {
 
 class WeeklyChatInputBar extends StatelessWidget {
   final bool canWrite;
-  final bool sending;
   final TextEditingController controller;
   final FocusNode? focusNode;
   final VoidCallback onSend;
@@ -21953,7 +22652,6 @@ class WeeklyChatInputBar extends StatelessWidget {
   const WeeklyChatInputBar({
     super.key,
     required this.canWrite,
-    required this.sending,
     required this.controller,
     this.focusNode,
     required this.onSend,
@@ -22032,7 +22730,7 @@ class WeeklyChatInputBar extends StatelessWidget {
               clipBehavior: Clip.antiAlias,
               child: InkWell(
                 borderRadius: BorderRadius.circular(8),
-                onTap: sending ? null : onGif,
+                onTap: onGif,
                 child: Container(
                   width: 52,
                   height: 40,
@@ -22057,34 +22755,22 @@ class WeeklyChatInputBar extends StatelessWidget {
               valueListenable: controller,
               builder: (context, value, _) {
                 final hasText = value.text.trim().isNotEmpty;
-                final active = hasText || sending;
 
                 return Material(
                   key: const ValueKey('weekly-chat-send-button'),
-                  color: active ? ssOrange : ssOrangeMid,
+                  color: hasText ? ssOrange : ssOrangeMid,
                   shape: const CircleBorder(),
                   child: InkWell(
                     customBorder: const CircleBorder(),
-                    onTap: sending || !hasText ? null : onSend,
+                    onTap: !hasText ? null : onSend,
                     child: SizedBox(
                       width: 40,
                       height: 40,
-                      child: sending
-                          ? const Center(
-                              child: SizedBox(
-                                width: 16,
-                                height: 16,
-                                child: CircularProgressIndicator(
-                                  color: Colors.white,
-                                  strokeWidth: 2,
-                                ),
-                              ),
-                            )
-                          : const Icon(
-                              Icons.send_rounded,
-                              color: Colors.white,
-                              size: 18,
-                            ),
+                      child: const Icon(
+                        Icons.send_rounded,
+                        color: Colors.white,
+                        size: 18,
+                      ),
                     ),
                   ),
                 );
@@ -22989,30 +23675,36 @@ class MissingSelfieTile extends StatefulWidget {
 class _MissingSelfieTileState extends State<MissingSelfieTile> {
   bool openingCameraOrUploading = false;
   bool sendingReminder = false;
+  bool reminderSentOptimistically = false;
   bool preparingExtraReminder = false;
   bool extraReminderUnlocked = false;
 
-  Future<void> _sendReminder() async {
+  void _sendReminder() {
     if (sendingReminder || preparingExtraReminder) return;
 
     final currentUid = FirebaseAuth.instance.currentUser?.uid;
     if (currentUid == null || currentUid == widget.targetUid) return;
     if (!esDomingo() || widget.weekKey != obtenerWeekKeyActual()) return;
 
-    setState(() => sendingReminder = true);
+    setState(() {
+      sendingReminder = true;
+      reminderSentOptimistically = true;
+    });
 
+    unawaited(_sendReminderInBackground());
+  }
+
+  Future<void> _sendReminderInBackground() async {
     try {
       await enviarZumbidoSelfie(
         groupId: widget.groupId,
         targetUid: widget.targetUid,
         rewardedAdWatched: extraReminderUnlocked,
       );
-
-      if (!mounted) return;
-      showSundaySnack(context, 'Zumbido enviado');
     } catch (error) {
       if (!mounted) return;
-      showSundaySnack(context, 'Error: $error');
+      setState(() => reminderSentOptimistically = false);
+      showSundaySnack(context, 'Error enviando el zumbido: $error');
     } finally {
       if (mounted) setState(() => sendingReminder = false);
     }
@@ -23071,19 +23763,19 @@ class _MissingSelfieTileState extends State<MissingSelfieTile> {
       );
 
       if (!mounted || foto == null) return;
-      final validPhoto = await validarFotoSelfieParaSubida(context, foto);
-      if (!mounted || !validPhoto) return;
-
-      await publicarSelfieReal(
+      final result = await subirSelfieEnSegundoPlano(
         groupId: widget.groupId,
         user: user,
         foto: foto,
         weekKey: widget.weekKey,
         rewardedAdWatched: isLateMondayUpload,
       );
-    } on SelfiePhotoValidationException catch (error) {
-      if (!mounted) return;
-      showSundaySnack(context, error.message);
+      if (!result.succeeded && mounted) {
+        showSundaySnack(
+          context,
+          result.errorMessage ?? 'No se pudo publicar la selfie',
+        );
+      }
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'Error: $error');
@@ -23262,6 +23954,7 @@ class _MissingSelfieTileState extends State<MissingSelfieTile> {
             weekKey: widget.weekKey,
             targetUid: widget.targetUid,
             sending: sendingReminder,
+            sentOptimistically: reminderSentOptimistically,
             preparingExtraReminder: preparingExtraReminder,
             extraReminderUnlocked: extraReminderUnlocked,
             onTap: _sendReminder,
@@ -23306,6 +23999,7 @@ class MissingSelfieReminderButton extends StatelessWidget {
   final String weekKey;
   final String targetUid;
   final bool sending;
+  final bool sentOptimistically;
   final bool preparingExtraReminder;
   final bool extraReminderUnlocked;
   final VoidCallback onTap;
@@ -23317,6 +24011,7 @@ class MissingSelfieReminderButton extends StatelessWidget {
     required this.weekKey,
     required this.targetUid,
     required this.sending,
+    required this.sentOptimistically,
     required this.preparingExtraReminder,
     required this.extraReminderUnlocked,
     required this.onTap,
@@ -23342,15 +24037,17 @@ class MissingSelfieReminderButton extends StatelessWidget {
     return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
       stream: targetRemindersRef.snapshots(),
       builder: (context, snapshot) {
-        final sent = snapshot.data?.docs.isNotEmpty ?? false;
+        final sent =
+            (snapshot.data?.docs.isNotEmpty ?? false) || sentOptimistically;
         final needsAd = sent && !extraReminderUnlocked;
-        final busy = sending || preparingExtraReminder;
+        final interactionLocked = sending || preparingExtraReminder;
+        final waitingForAd = preparingExtraReminder;
 
         return Material(
           color: Colors.transparent,
           child: InkWell(
             borderRadius: BorderRadius.circular(999),
-            onTap: busy
+            onTap: interactionLocked
                 ? null
                 : needsAd
                 ? onPrepareExtraReminder
@@ -23364,7 +24061,7 @@ class MissingSelfieReminderButton extends StatelessWidget {
                 color: Colors.white,
                 borderRadius: BorderRadius.circular(999),
                 border: Border.all(
-                  color: busy ? ssBorder : ssOrangeMid,
+                  color: waitingForAd ? ssBorder : ssOrangeMid,
                   width: 1.2,
                 ),
                 boxShadow: [
@@ -23384,14 +24081,12 @@ class MissingSelfieReminderButton extends StatelessWidget {
                       needsAd
                           ? Icons.check_rounded
                           : Icons.notifications_none_rounded,
-                      color: busy ? ssText3 : ssOrangeDark,
+                      color: waitingForAd ? ssText3 : ssOrangeDark,
                       size: 13,
                     ),
                     const SizedBox(width: 4),
                     Text(
-                      sending
-                          ? 'Enviando...'
-                          : preparingExtraReminder
+                      preparingExtraReminder
                           ? 'Anuncio...'
                           : needsAd
                           ? 'Zumbido enviado'
@@ -23399,7 +24094,7 @@ class MissingSelfieReminderButton extends StatelessWidget {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        color: busy ? ssText3 : ssOrangeDark,
+                        color: waitingForAd ? ssText3 : ssOrangeDark,
                         fontSize: 9.4,
                         fontWeight: FontWeight.w900,
                       ),
@@ -23422,6 +24117,7 @@ class SelfieTile extends StatelessWidget {
   final String weekKey;
   final String postUid;
   final Map<String, dynamic> post;
+  final String? localImagePath;
   final VoidCallback onTap;
 
   const SelfieTile({
@@ -23432,6 +24128,7 @@ class SelfieTile extends StatelessWidget {
     required this.weekKey,
     required this.postUid,
     required this.post,
+    this.localImagePath,
     required this.onTap,
   });
 
@@ -23440,6 +24137,9 @@ class SelfieTile extends StatelessWidget {
     final authorName = formatUserDisplayName(post['authorName'] ?? 'Usuario');
     final postAuthorPhotoUrl = post['authorPhotoUrl'] as String?;
     final imageUrl = (post['thumbUrl'] ?? post['imageUrl'] ?? '').toString();
+    final cleanLocalImagePath = localImagePath?.trim();
+    final hasLocalImage =
+        cleanLocalImagePath != null && cleanLocalImagePath.isNotEmpty;
 
     final memberRef = FirebaseFirestore.instance
         .collection('groups')
@@ -23541,7 +24241,25 @@ class SelfieTile extends StatelessWidget {
                 child: Container(
                   width: double.infinity,
                   color: ssOrangeLight,
-                  child: imageUrl.isNotEmpty
+                  child: hasLocalImage
+                      ? Image.file(
+                          File(cleanLocalImagePath),
+                          fit: BoxFit.cover,
+                          alignment: Alignment.center,
+                          filterQuality: FilterQuality.high,
+                          gaplessPlayback: true,
+                          errorBuilder: (_, _, _) => Center(
+                            child: Text(
+                              initialsFromName(authorName),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 38,
+                                fontWeight: FontWeight.w800,
+                              ),
+                            ),
+                          ),
+                        )
+                      : imageUrl.isNotEmpty
                       ? CachedRemoteImage(
                           imageUrl: imageUrl,
                           cacheVariant: 'thumbnail',
@@ -23708,6 +24426,18 @@ class SelfieViewerEntry {
   });
 }
 
+class _PendingSelfieReaction {
+  final String emoji;
+  final String authorName;
+  final String? authorPhotoUrl;
+
+  const _PendingSelfieReaction({
+    required this.emoji,
+    required this.authorName,
+    required this.authorPhotoUrl,
+  });
+}
+
 enum _SelfieViewerAction {
   downloadSelfie,
   replaceProfilePhoto,
@@ -23724,6 +24454,7 @@ class SelfieFullScreen extends StatefulWidget {
   final Map<String, dynamic> post;
   final List<SelfieViewerEntry>? galleryEntries;
   final int initialIndex;
+  final String? localImagePath;
 
   const SelfieFullScreen({
     super.key,
@@ -23735,6 +24466,7 @@ class SelfieFullScreen extends StatefulWidget {
     required this.post,
     this.galleryEntries,
     this.initialIndex = 0,
+    this.localImagePath,
   });
 
   @override
@@ -23747,8 +24479,13 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
   bool replacingProfilePhoto = false;
   bool downloadingSelfie = false;
   bool deletingSelfie = false;
+  final Map<String, _PendingSelfieReaction> _pendingReactions = {};
   late int currentIndex;
   late PageController pageController;
+
+  String _reactionKey(SelfieViewerEntry entry) {
+    return '${entry.groupId}/${entry.weekKey}/${entry.postUid}';
+  }
 
   List<SelfieViewerEntry> get entries {
     final provided = widget.galleryEntries;
@@ -23830,15 +24567,33 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
   Future<void> _sendReaction(SelfieViewerEntry entry, String emoji) async {
     if (sendingReaction) return;
 
-    setState(() => sendingReaction = true);
+    final cleanEmoji = normalizarEmojiReaccion(emoji);
+    if (cleanEmoji.isEmpty) return;
+
+    final currentUser = FirebaseAuth.instance.currentUser;
+    final reactionKey = _reactionKey(entry);
+    final pendingReaction = _PendingSelfieReaction(
+      emoji: cleanEmoji,
+      authorName: formatUserDisplayName(currentUser?.displayName ?? 'Tú'),
+      authorPhotoUrl: currentUser?.photoURL,
+    );
+
+    setState(() {
+      sendingReaction = true;
+      _pendingReactions[reactionKey] = pendingReaction;
+    });
     try {
       await reaccionarASelfie(
         groupId: entry.groupId,
         weekKey: entry.weekKey,
         postUid: entry.postUid,
-        emoji: emoji,
+        emoji: cleanEmoji,
       );
     } catch (error) {
+      if (mounted &&
+          identical(_pendingReactions[reactionKey], pendingReaction)) {
+        setState(() => _pendingReactions.remove(reactionKey));
+      }
       final isOwnReactionError = error.toString().contains(
         'No puedes reaccionar a tu propio selfie',
       );
@@ -24201,6 +24956,11 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
   Widget build(BuildContext context) {
     final list = entries;
     final currentUser = FirebaseAuth.instance.currentUser;
+    final cleanLocalImagePath = widget.localImagePath?.trim();
+    final hasLocalImage =
+        list.length == 1 &&
+        cleanLocalImagePath != null &&
+        cleanLocalImagePath.isNotEmpty;
 
     return Scaffold(
       backgroundColor: ssBg,
@@ -24224,6 +24984,7 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
           final isOwnSelfie = currentUser?.uid == postUid;
           final imageUrl = (post['imageUrl'] ?? post['thumbUrl'] ?? '')
               .toString();
+          final localImagePath = hasLocalImage ? cleanLocalImagePath : null;
 
           final postRef = FirebaseFirestore.instance
               .collection('groups')
@@ -24251,7 +25012,8 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
             stream: reactionsRef.snapshots(),
             builder: (context, reactionsSnapshot) {
               final reactions = reactionsSnapshot.data?.docs ?? [];
-              final myReaction = currentUser == null
+              final reactionKey = _reactionKey(entry);
+              final serverMyReaction = currentUser == null
                   ? null
                   : reactions
                         .where((doc) => doc.id == currentUser.uid)
@@ -24259,6 +25021,21 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
                         .where((emoji) => emoji != null && emoji.isNotEmpty)
                         .cast<String>()
                         .firstOrNull;
+              final pendingReaction = _pendingReactions[reactionKey];
+              if (pendingReaction != null &&
+                  serverMyReaction == pendingReaction.emoji) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (!mounted ||
+                      !identical(
+                        _pendingReactions[reactionKey],
+                        pendingReaction,
+                      )) {
+                    return;
+                  }
+                  setState(() => _pendingReactions.remove(reactionKey));
+                });
+              }
+              final myReaction = pendingReaction?.emoji ?? serverMyReaction;
 
               Widget reactionPanel({
                 required bool canReact,
@@ -24266,9 +25043,10 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
                 required String actionDisabledMessage,
                 bool reserveEmptySpace = false,
               }) {
-                return FullScreenReactionPanel(
+                return _FullScreenReactionPanel(
                   reactions: reactions,
                   myReaction: myReaction,
+                  pendingReaction: pendingReaction,
                   canReact: canReact,
                   isSending: sendingReaction,
                   disabledMessage: disabledMessage,
@@ -24339,7 +25117,7 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
                             downloadingSelfie ||
                             sendingReport ||
                             deletingSelfie,
-                        showOptions: currentUser != null,
+                        showOptions: currentUser != null && !hasLocalImage,
                         canReplaceProfilePhoto:
                             isOwnSelfie &&
                             puedeUsarSelfieComoFotoPerfil(weekKey),
@@ -24361,6 +25139,7 @@ class _SelfieFullScreenState extends State<SelfieFullScreen> {
                         child: FullScreenSelfieImage(
                           imageUrl: imageUrl,
                           thumbnailUrl: (post['thumbUrl'] ?? '').toString(),
+                          localImagePath: localImagePath,
                           fallbackText: initialsFromName(authorName),
                           onReactionHold: () => _handleImageReactionHold(
                             entry,
@@ -24689,6 +25468,7 @@ class _SelfieOptionsMenuButton extends StatelessWidget {
 class FullScreenSelfieImage extends StatelessWidget {
   final String imageUrl;
   final String thumbnailUrl;
+  final String? localImagePath;
   final String fallbackText;
   final VoidCallback? onReactionHold;
 
@@ -24696,6 +25476,7 @@ class FullScreenSelfieImage extends StatelessWidget {
     super.key,
     required this.imageUrl,
     this.thumbnailUrl = '',
+    this.localImagePath,
     required this.fallbackText,
     this.onReactionHold,
   });
@@ -24703,6 +25484,9 @@ class FullScreenSelfieImage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final borderRadius = BorderRadius.circular(36);
+    final cleanLocalImagePath = localImagePath?.trim();
+    final hasLocalImage =
+        cleanLocalImagePath != null && cleanLocalImagePath.isNotEmpty;
     final cleanThumbnailUrl = thumbnailUrl.trim();
     final loadingPreview =
         cleanThumbnailUrl.isEmpty || cleanThumbnailUrl == imageUrl.trim()
@@ -24744,7 +25528,19 @@ class FullScreenSelfieImage extends StatelessWidget {
         child: SizedBox(
           width: double.infinity,
           height: double.infinity,
-          child: imageUrl.isEmpty
+          child: hasLocalImage
+              ? Image.file(
+                  File(cleanLocalImagePath),
+                  fit: BoxFit.cover,
+                  width: double.infinity,
+                  height: double.infinity,
+                  alignment: Alignment.center,
+                  filterQuality: FilterQuality.high,
+                  gaplessPlayback: true,
+                  errorBuilder: (_, _, _) =>
+                      _SelfieImageFallback(fallbackText: fallbackText),
+                )
+              : imageUrl.isEmpty
               ? _SelfieImageFallback(fallbackText: fallbackText)
               : CachedRemoteImage(
                   imageUrl: imageUrl,
@@ -24863,9 +25659,10 @@ class _SelfieImageFallback extends StatelessWidget {
   }
 }
 
-class FullScreenReactionPanel extends StatelessWidget {
+class _FullScreenReactionPanel extends StatelessWidget {
   final List<QueryDocumentSnapshot<Map<String, dynamic>>> reactions;
   final String? myReaction;
+  final _PendingSelfieReaction? pendingReaction;
   final bool canReact;
   final bool isSending;
   final String disabledMessage;
@@ -24873,10 +25670,10 @@ class FullScreenReactionPanel extends StatelessWidget {
   final bool reserveEmptySpace;
   final VoidCallback onAddReactionTap;
 
-  const FullScreenReactionPanel({
-    super.key,
+  const _FullScreenReactionPanel({
     required this.reactions,
     required this.myReaction,
+    required this.pendingReaction,
     required this.canReact,
     required this.isSending,
     required this.disabledMessage,
@@ -24891,23 +25688,53 @@ class FullScreenReactionPanel extends StatelessWidget {
     final cleanActionDisabledMessage = actionDisabledMessage.trim();
     final showReactionButton =
         canReact || cleanActionDisabledMessage.isNotEmpty;
+    final currentUid = FirebaseAuth.instance.currentUser?.uid;
+    final localPendingReaction = pendingReaction;
     final visibleReactions = reactions
         .where((reaction) {
           final emoji = normalizarEmojiReaccion(
             (reaction.data()['emoji'] ?? '').toString(),
           );
-          return emoji.isNotEmpty;
+          return emoji.isNotEmpty &&
+              (localPendingReaction == null || reaction.id != currentUid);
         })
         .toList(growable: false);
+    final reactionPills = <Widget>[
+      if (localPendingReaction != null)
+        Padding(
+          padding: const EdgeInsets.only(right: 12),
+          child: _SelfieReactionAvatarPill(
+            name: localPendingReaction.authorName,
+            photoUrl: localPendingReaction.authorPhotoUrl,
+            emoji: localPendingReaction.emoji,
+            selected: true,
+          ),
+        ),
+      ...visibleReactions.map((reaction) {
+        final data = reaction.data();
+        final emoji = normalizarEmojiReaccion((data['emoji'] ?? '').toString());
+        final name = formatUserDisplayName(data['authorName'] ?? 'Usuario');
+        final photoUrl = data['authorPhotoUrl'] as String?;
 
-    if (visibleReactions.isEmpty &&
+        return Padding(
+          padding: const EdgeInsets.only(right: 12),
+          child: _SelfieReactionAvatarPill(
+            name: name,
+            photoUrl: photoUrl,
+            emoji: emoji,
+            selected: reaction.id == currentUid && myReaction == emoji,
+          ),
+        );
+      }),
+    ];
+
+    if (reactionPills.isEmpty &&
         !showReactionButton &&
         cleanDisabledMessage.isEmpty &&
         !reserveEmptySpace) {
       return const SizedBox.shrink();
     }
 
-    final currentUid = FirebaseAuth.instance.currentUser?.uid;
     final bottomInset = MediaQuery.paddingOf(context).bottom;
 
     return Padding(
@@ -24929,37 +25756,14 @@ class FullScreenReactionPanel extends StatelessWidget {
         child: Row(
           children: [
             Expanded(
-              child: visibleReactions.isEmpty
+              child: reactionPills.isEmpty
                   ? _SelfieReactionDisabledMessage(
                       message: cleanDisabledMessage,
                     )
                   : SingleChildScrollView(
                       scrollDirection: Axis.horizontal,
                       physics: const BouncingScrollPhysics(),
-                      child: Row(
-                        children: visibleReactions.map((reaction) {
-                          final data = reaction.data();
-                          final emoji = normalizarEmojiReaccion(
-                            (data['emoji'] ?? '').toString(),
-                          );
-                          final name = formatUserDisplayName(
-                            data['authorName'] ?? 'Usuario',
-                          );
-                          final photoUrl = data['authorPhotoUrl'] as String?;
-
-                          return Padding(
-                            padding: const EdgeInsets.only(right: 12),
-                            child: _SelfieReactionAvatarPill(
-                              name: name,
-                              photoUrl: photoUrl,
-                              emoji: emoji,
-                              selected:
-                                  reaction.id == currentUid &&
-                                  myReaction == emoji,
-                            ),
-                          );
-                        }).toList(),
-                      ),
+                      child: Row(children: reactionPills),
                     ),
             ),
             if (showReactionButton) ...[
@@ -25075,20 +25879,11 @@ class _SelfieAddReactionButton extends StatelessWidget {
               ],
             ),
             child: Center(
-              child: isSending
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(
-                        color: Colors.white,
-                        strokeWidth: 2.3,
-                      ),
-                    )
-                  : const Icon(
-                      Icons.add_rounded,
-                      color: Colors.white,
-                      size: 28,
-                    ),
+              child: const Icon(
+                Icons.add_rounded,
+                color: Colors.white,
+                size: 28,
+              ),
             ),
           ),
         ),
@@ -25336,100 +26131,149 @@ class _EmojiReactionPickerSheetState extends State<EmojiReactionPickerSheet> {
 
 class CameraTabScreen extends StatefulWidget {
   final User user;
+  final ValueListenable<int> cameraTabVisitNotifier;
 
-  const CameraTabScreen({super.key, required this.user});
+  const CameraTabScreen({
+    super.key,
+    required this.user,
+    required this.cameraTabVisitNotifier,
+  });
 
   @override
   State<CameraTabScreen> createState() => _CameraTabScreenState();
 }
 
+int compareCameraGroupsByCurrentWeekSelfie(bool aHasSelfie, bool bHasSelfie) {
+  if (aHasSelfie == bHasSelfie) return 0;
+  return aHasSelfie ? 1 : -1;
+}
+
 class _CameraTabScreenState extends State<CameraTabScreen> {
   bool uploading = false;
   String? uploadingGroupId;
-  final math.Random _cameraGroupRandom = math.Random();
-  final Map<String, double> _cameraGroupTieBreakers = {};
-  String? _cameraSelfieCountsKey;
-  Future<Map<String, int>>? _cameraSelfieCountsFuture;
+  int _cameraGroupOrderVersion = 0;
+  String? _cameraSelfieStatusKey;
+  Future<Map<String, bool>>? _cameraSelfieStatusFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.cameraTabVisitNotifier.addListener(_refreshCameraGroupOrder);
+  }
+
+  @override
+  void didUpdateWidget(covariant CameraTabScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.user.uid != widget.user.uid) {
+      _cameraSelfieStatusKey = null;
+      _cameraSelfieStatusFuture = null;
+      _cameraGroupOrderVersion++;
+    }
+    if (oldWidget.cameraTabVisitNotifier == widget.cameraTabVisitNotifier) {
+      return;
+    }
+
+    oldWidget.cameraTabVisitNotifier.removeListener(_refreshCameraGroupOrder);
+    widget.cameraTabVisitNotifier.addListener(_refreshCameraGroupOrder);
+    _refreshCameraGroupOrder();
+  }
+
+  @override
+  void dispose() {
+    widget.cameraTabVisitNotifier.removeListener(_refreshCameraGroupOrder);
+    super.dispose();
+  }
 
   String _cameraGroupId(QueryDocumentSnapshot<Map<String, dynamic>> doc) {
     final data = doc.data();
     return (data['groupId'] ?? doc.id).toString();
   }
 
-  double _cameraGroupTieBreaker(String groupId) {
-    return _cameraGroupTieBreakers.putIfAbsent(
-      groupId,
-      _cameraGroupRandom.nextDouble,
-    );
-  }
-
-  String _cameraSelfieCountsCacheKey(
+  String _cameraSelfieStatusCacheKey(
     List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
   ) {
-    return groupDocs.map(_cameraGroupId).join('|');
+    final groupIds = groupDocs.map(_cameraGroupId).join('|');
+    return '${obtenerWeekKeyActual()}|$groupIds';
   }
 
-  void _invalidateCameraSelfieCounts() {
-    _cameraSelfieCountsKey = null;
-    _cameraSelfieCountsFuture = null;
+  void _refreshCameraGroupOrder() {
+    _cameraSelfieStatusKey = null;
+    _cameraSelfieStatusFuture = null;
+    _cameraGroupOrderVersion++;
+    if (mounted) setState(() {});
   }
 
-  Future<Map<String, int>> _cameraSelfieCountsFor(
+  Future<Map<String, bool>> _cameraSelfieStatusFor(
     List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
   ) {
-    final key = _cameraSelfieCountsCacheKey(groupDocs);
-    final cachedFuture = _cameraSelfieCountsFuture;
-    if (_cameraSelfieCountsKey == key && cachedFuture != null) {
+    final key = _cameraSelfieStatusCacheKey(groupDocs);
+    final cachedFuture = _cameraSelfieStatusFuture;
+    if (_cameraSelfieStatusKey == key && cachedFuture != null) {
       return cachedFuture;
     }
 
-    _cameraSelfieCountsKey = key;
-    _cameraSelfieCountsFuture = _loadCameraSelfieCounts(groupDocs);
-    return _cameraSelfieCountsFuture!;
+    _cameraSelfieStatusKey = key;
+    _cameraSelfieStatusFuture = _loadCameraSelfieStatus(groupDocs);
+    return _cameraSelfieStatusFuture!;
   }
 
-  Future<Map<String, int>> _loadCameraSelfieCounts(
+  Future<Map<String, bool>> _loadCameraSelfieStatus(
     List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
   ) async {
+    final weekKey = obtenerWeekKeyActual();
     final entries = await Future.wait(
       groupDocs.map((doc) async {
         final groupId = _cameraGroupId(doc);
+        final pending = PendingSelfieUploads.instance.find(
+          groupId: groupId,
+          weekKey: weekKey,
+          userId: widget.user.uid,
+        );
         try {
-          final count = await countUserSelfiesInGroup(
-            userUid: widget.user.uid,
-            groupId: groupId,
+          final post = await FirebaseFirestore.instance
+              .collection('groups')
+              .doc(groupId)
+              .collection('weeks')
+              .doc(weekKey)
+              .collection('posts')
+              .doc(widget.user.uid)
+              .get();
+          return MapEntry(
+            groupId,
+            post.exists || pending?.shouldShowLocalPhoto == true,
           );
-          return MapEntry(groupId, count);
         } catch (error) {
-          logDebug('No se pudieron contar selfies de $groupId: $error');
-          return MapEntry(groupId, 0);
+          logDebug('No se pudo comprobar el selfie de $groupId: $error');
+          return MapEntry(groupId, pending?.shouldShowLocalPhoto == true);
         }
       }),
     );
 
-    return Map<String, int>.fromEntries(entries);
+    return Map<String, bool>.fromEntries(entries);
   }
 
   List<QueryDocumentSnapshot<Map<String, dynamic>>> _orderedCameraGroups(
     List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
-    Map<String, int> selfieCounts,
+    Map<String, bool> selfieStatus,
   ) {
     final ordered = [...groupDocs];
+    final positions = <String, int>{
+      for (var index = 0; index < groupDocs.length; index++)
+        _cameraGroupId(groupDocs[index]): index,
+    };
 
     ordered.sort((a, b) {
       final aGroupId = _cameraGroupId(a);
       final bGroupId = _cameraGroupId(b);
-      final aCount = selfieCounts[aGroupId] ?? 0;
-      final bCount = selfieCounts[bGroupId] ?? 0;
-      final countComparison = bCount.compareTo(aCount);
-      if (countComparison != 0) return countComparison;
+      final aHasSelfie = selfieStatus[aGroupId] ?? false;
+      final bHasSelfie = selfieStatus[bGroupId] ?? false;
+      final selfieComparison = compareCameraGroupsByCurrentWeekSelfie(
+        aHasSelfie,
+        bHasSelfie,
+      );
+      if (selfieComparison != 0) return selfieComparison;
 
-      final tieComparison = _cameraGroupTieBreaker(
-        aGroupId,
-      ).compareTo(_cameraGroupTieBreaker(bGroupId));
-      if (tieComparison != 0) return tieComparison;
-
-      return aGroupId.compareTo(bGroupId);
+      return (positions[aGroupId] ?? 0).compareTo(positions[bGroupId] ?? 0);
     });
 
     return ordered;
@@ -25496,22 +26340,19 @@ class _CameraTabScreenState extends State<CameraTabScreen> {
     });
 
     try {
-      final validPhoto = await validarFotoSelfieParaSubida(context, foto);
-      if (!mounted || !validPhoto) return;
-
-      await publicarSelfieReal(
+      final result = await subirSelfieEnSegundoPlano(
         groupId: groupId,
         user: widget.user,
         foto: foto,
         rewardedAdWatched: rewardedAdWatched,
         replaceExisting: replaceExisting,
       );
-      if (!replaceExisting) {
-        _invalidateCameraSelfieCounts();
+      if (!result.succeeded && mounted) {
+        showSundaySnack(
+          context,
+          result.errorMessage ?? 'No se pudo publicar la selfie',
+        );
       }
-    } on SelfiePhotoValidationException catch (error) {
-      if (!mounted) return;
-      showSundaySnack(context, error.message);
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'Error: $error');
@@ -25562,8 +26403,9 @@ class _CameraTabScreenState extends State<CameraTabScreen> {
                     return const CameraEmptyGroupsContent();
                   }
 
-                  return FutureBuilder<Map<String, int>>(
-                    future: _cameraSelfieCountsFor(groupDocs),
+                  return FutureBuilder<Map<String, bool>>(
+                    key: ValueKey(_cameraGroupOrderVersion),
+                    future: _cameraSelfieStatusFor(groupDocs),
                     builder: (context, countsSnapshot) {
                       if (countsSnapshot.connectionState ==
                               ConnectionState.waiting &&
@@ -25834,147 +26676,237 @@ class CameraGroupUploadCard extends StatelessWidget {
         .collection('posts')
         .doc(FirebaseAuth.instance.currentUser?.uid);
 
-    return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
-      stream: postRef.snapshots(),
-      builder: (context, snapshot) {
-        final postData = snapshot.data?.data();
-        final hasSelfie = snapshot.data?.exists ?? false;
-        final selfieImageUrl =
-            (postData?['imageUrl'] ?? postData?['thumbUrl'] ?? '').toString();
-        final selfieThumbnailUrl = (postData?['thumbUrl'] ?? selfieImageUrl)
-            .toString();
-        final selfiePublishedAt =
-            timestampToDate(postData?['updatedAt']) ??
-            timestampToDate(postData?['createdAt']);
-        final enabled = !locked && !uploading;
+    return ListenableBuilder(
+      listenable: PendingSelfieUploads.instance,
+      builder: (context, _) =>
+          StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
+            stream: postRef.snapshots(),
+            builder: (context, snapshot) {
+              final postData = snapshot.data?.data();
+              final hasRemoteSelfie = snapshot.data?.exists ?? false;
+              final currentUserId = FirebaseAuth.instance.currentUser?.uid;
+              final pending = currentUserId == null
+                  ? null
+                  : PendingSelfieUploads.instance.find(
+                      groupId: groupId,
+                      weekKey: weekKey,
+                      userId: currentUserId,
+                    );
+              final hasPendingSelfie =
+                  !hasRemoteSelfie && pending?.shouldShowLocalPhoto == true;
+              final hasLocalPendingPhoto =
+                  pending?.shouldShowLocalPhoto == true;
+              final hasSelfie = hasRemoteSelfie || hasPendingSelfie;
+              final selfieImageUrl =
+                  (postData?['imageUrl'] ?? postData?['thumbUrl'] ?? '')
+                      .toString();
+              final selfieThumbnailUrl =
+                  (postData?['thumbUrl'] ?? selfieImageUrl).toString();
+              final selfiePublishedAt =
+                  timestampToDate(postData?['updatedAt']) ??
+                  timestampToDate(postData?['createdAt']);
+              final enabled = !locked && !uploading && !hasPendingSelfie;
 
-        return Container(
-          margin: const EdgeInsets.only(bottom: 12),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(18),
-            border: Border.all(color: ssBorder),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(alpha: 0.04),
-                blurRadius: 8,
-                offset: const Offset(0, 2),
-              ),
-            ],
-          ),
-          child: Material(
-            color: Colors.transparent,
-            child: InkWell(
-              borderRadius: BorderRadius.circular(18),
-              onTap: enabled
-                  ? hasSelfie
-                        ? () => onReplaceRequested(
-                            selfieImageUrl: selfieImageUrl,
-                            selfieThumbnailUrl: selfieThumbnailUrl,
-                            weekKey: weekKey,
-                            publishedAt: selfiePublishedAt,
-                          )
-                        : onTap
-                  : null,
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Row(
-                  children: [
-                    GroupIcon(name: groupName, photoUrl: groupPhotoUrl),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            formatGroupDisplayName(groupName),
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: ssTitle,
-                              fontSize: 15,
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(
-                            hasSelfie
-                                ? '✓ Selfie publicado'
-                                : uploading
-                                ? 'Publicando selfie...'
-                                : 'Toca para abrir la cámara',
-                            style: TextStyle(
-                              color: hasSelfie ? ssOrangeDark : ssText3,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Container(
-                      width: 42,
-                      height: 42,
-                      decoration: BoxDecoration(
-                        color: hasSelfie ? Colors.white : ssOrange,
-                        borderRadius: BorderRadius.circular(14),
-                        border: hasSelfie
-                            ? Border.all(color: ssOrangeMid, width: 1.5)
-                            : null,
-                        boxShadow: hasSelfie
-                            ? [
-                                BoxShadow(
-                                  color: ssOrangeDark.withValues(alpha: 0.10),
-                                  blurRadius: 10,
-                                  offset: const Offset(0, 3),
-                                ),
-                              ]
-                            : null,
-                      ),
-                      child: uploading
-                          ? const Padding(
-                              padding: EdgeInsets.all(11),
-                              child: CircularProgressIndicator(
-                                color: Colors.white,
-                                strokeWidth: 2.3,
-                              ),
-                            )
-                          : hasSelfie
-                          ? const Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  Icons.photo_camera_rounded,
-                                  color: ssOrangeDark,
-                                  size: 15,
-                                ),
-                                SizedBox(height: 1),
-                                Text(
-                                  'Rehacer',
-                                  maxLines: 1,
-                                  style: TextStyle(
-                                    color: ssOrangeDark,
-                                    fontSize: 7.2,
-                                    fontWeight: FontWeight.w900,
-                                    height: 1,
-                                  ),
-                                ),
-                              ],
-                            )
-                          : const Icon(
-                              Icons.photo_camera_rounded,
-                              color: Colors.white,
-                              size: 22,
-                            ),
+              return Container(
+                margin: const EdgeInsets.only(bottom: 12),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(18),
+                  border: Border.all(color: ssBorder),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.04),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
                     ),
                   ],
                 ),
-              ),
+                child: Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(18),
+                    onTap: enabled
+                        ? hasSelfie
+                              ? () => onReplaceRequested(
+                                  selfieImageUrl: selfieImageUrl,
+                                  selfieThumbnailUrl: selfieThumbnailUrl,
+                                  weekKey: weekKey,
+                                  publishedAt: selfiePublishedAt,
+                                )
+                              : onTap
+                        : null,
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Row(
+                        children: [
+                          GroupIcon(name: groupName, photoUrl: groupPhotoUrl),
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  formatGroupDisplayName(groupName),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: ssTitle,
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  hasSelfie
+                                      ? '✓ Selfie publicado'
+                                      : 'Toca para abrir la cámara',
+                                  style: TextStyle(
+                                    color: hasSelfie ? ssOrangeDark : ssText3,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          hasRemoteSelfie
+                              ? CameraSelfieRetakeThumbnail(
+                                  thumbnailUrl: selfieThumbnailUrl,
+                                )
+                              : CameraGroupUploadAction(
+                                  localPhotoPath: hasLocalPendingPhoto
+                                      ? pending!.foto.path
+                                      : null,
+                                ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+    );
+  }
+}
+
+class CameraSelfieRetakeThumbnail extends StatelessWidget {
+  final String thumbnailUrl;
+
+  const CameraSelfieRetakeThumbnail({super.key, required this.thumbnailUrl});
+
+  @override
+  Widget build(BuildContext context) {
+    final hasThumbnail = thumbnailUrl.trim().isNotEmpty;
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          key: const ValueKey('camera-published-selfie-thumbnail-frame'),
+          width: 42,
+          height: 42,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(14),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.08),
+                  blurRadius: 7,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+            child: ClipRRect(
+              key: const ValueKey('camera-published-selfie-thumbnail-clip'),
+              borderRadius: BorderRadius.circular(14),
+              clipBehavior: Clip.antiAlias,
+              child: hasThumbnail
+                  ? SizedBox.expand(
+                      child: CachedRemoteImage(
+                        imageUrl: thumbnailUrl,
+                        cacheVariant: 'thumbnail',
+                        fit: BoxFit.cover,
+                        filterQuality: FilterQuality.medium,
+                        errorWidget: const Icon(
+                          Icons.photo_camera_rounded,
+                          color: ssOrangeDark,
+                          size: 15,
+                        ),
+                      ),
+                    )
+                  : const Center(
+                      child: Icon(
+                        Icons.photo_camera_rounded,
+                        color: ssOrangeDark,
+                        size: 15,
+                      ),
+                    ),
             ),
           ),
-        );
-      },
+        ),
+        const SizedBox(height: 3),
+        const Text(
+          'Rehacer',
+          maxLines: 1,
+          style: TextStyle(
+            color: ssText3,
+            fontSize: 10,
+            fontWeight: FontWeight.w800,
+            height: 1,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class CameraGroupUploadAction extends StatelessWidget {
+  final String? localPhotoPath;
+
+  const CameraGroupUploadAction({super.key, this.localPhotoPath});
+
+  @override
+  Widget build(BuildContext context) {
+    final hasLocalPhoto = localPhotoPath?.trim().isNotEmpty ?? false;
+
+    return Container(
+      width: 42,
+      height: 42,
+      decoration: BoxDecoration(
+        color: hasLocalPhoto ? Colors.white : ssOrange,
+        borderRadius: BorderRadius.circular(14),
+        border: hasLocalPhoto
+            ? Border.all(color: ssOrangeMid, width: 1.5)
+            : null,
+        boxShadow: hasLocalPhoto
+            ? [
+                BoxShadow(
+                  color: ssOrangeDark.withValues(alpha: 0.10),
+                  blurRadius: 10,
+                  offset: const Offset(0, 3),
+                ),
+              ]
+            : null,
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: hasLocalPhoto
+          ? Image.file(
+              File(localPhotoPath!),
+              fit: BoxFit.cover,
+              filterQuality: FilterQuality.medium,
+              errorBuilder: (_, _, _) => const Icon(
+                Icons.photo_camera_rounded,
+                color: ssOrangeDark,
+                size: 15,
+              ),
+            )
+          : const Icon(
+              Icons.photo_camera_rounded,
+              color: Colors.white,
+              size: 22,
+            ),
     );
   }
 }
@@ -26046,104 +26978,131 @@ class _SelfieReplacementInfoScreenState
             Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  final compact = constraints.maxHeight < 690;
-                  final veryCompact = constraints.maxHeight < 620;
-                  final preferredPolaroidMaxWidth = veryCompact
-                      ? 198.0
-                      : compact
-                      ? 232.0
-                      : 300.0;
-                  final buttonHeight = compact ? 62.0 : 68.0;
-                  final estimatedNonPolaroidHeight =
-                      (veryCompact ? 10.0 : 16.0) +
-                      36.0 +
-                      (veryCompact ? 16.0 : 22.0) +
-                      (veryCompact ? 56.0 : 62.0) +
-                      (veryCompact ? 8.0 : 10.0) +
-                      (veryCompact ? 42.0 : 48.0) +
+                  final compact = constraints.maxHeight < 640;
+                  final veryCompact = constraints.maxHeight < 560;
+                  final horizontalPadding = veryCompact ? 20.0 : 24.0;
+                  final verticalPadding = veryCompact ? 8.0 : 20.0;
+                  final compactLayoutSafetySpace = veryCompact ? 36.0 : 0.0;
+                  final contentWidth = math.max(
+                    0.0,
+                    constraints.maxWidth - horizontalPadding * 2,
+                  );
+                  final buttonHeight = veryCompact ? 56.0 : 64.0;
+
+                  // La altura de una Polaroid es la de la foto más su marco.
+                  // Reservamos el resto del contenido para que la foto crezca
+                  // en móviles altos y se reduzca sin dejar huecos en bajos.
+                  final fixedContentHeight =
+                      (veryCompact ? 8.0 : 12.0) +
+                      35.0 +
+                      (veryCompact ? 14.0 : 18.0) +
+                      (veryCompact ? 28.0 : 31.0) +
+                      (veryCompact ? 6.0 : 8.0) +
+                      (veryCompact ? 38.0 : 46.0) +
+                      (veryCompact ? 16.0 : 20.0) +
                       buttonHeight +
-                      (compact ? 8.0 : 12.0) +
-                      48.0 +
-                      (compact ? 16.0 : 24.0);
-                  final availablePolaroidHeight =
-                      (constraints.maxHeight - estimatedNonPolaroidHeight - 71)
-                          .clamp(178.0, 360.0)
-                          .toDouble();
-                  final heightCappedPolaroidWidth =
-                      availablePolaroidHeight * 0.82 + 24;
-                  final polaroidMaxWidth = math.min(
-                    preferredPolaroidMaxWidth,
-                    heightCappedPolaroidWidth,
+                      (veryCompact ? 4.0 : 8.0) +
+                      48.0;
+                  const polaroidChromeHeight = 71.0;
+                  final availablePolaroidHeight = math.max(
+                    210.0,
+                    constraints.maxHeight -
+                        fixedContentHeight -
+                        verticalPadding -
+                        compactLayoutSafetySpace,
+                  );
+                  final heightLimitedPolaroidWidth =
+                      (availablePolaroidHeight - polaroidChromeHeight) * 0.82 +
+                      24;
+                  final polaroidWidth = math.min(
+                    math.min(320.0, contentWidth),
+                    math.max(
+                      math.min(veryCompact ? 144.0 : 164.0, contentWidth),
+                      heightLimitedPolaroidWidth,
+                    ),
                   );
 
-                  return Padding(
-                    padding: EdgeInsets.fromLTRB(
-                      24,
-                      veryCompact ? 0 : 4,
-                      24,
-                      compact ? 16 : 24,
-                    ),
-                    child: Column(
-                      children: [
-                        _SelfieReplacementPolaroid(
-                          imageUrl: widget.selfieImageUrl,
-                          thumbnailUrl: widget.selfieThumbnailUrl,
-                          dateLabel: localizedSelfieDateLabel(
-                            context,
-                            _polaroidDate,
-                          ),
-                          maxWidth: polaroidMaxWidth,
+                  return SingleChildScrollView(
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        minHeight: constraints.maxHeight,
+                      ),
+                      child: Padding(
+                        padding: EdgeInsets.fromLTRB(
+                          horizontalPadding,
+                          veryCompact ? 0 : 4,
+                          horizontalPadding,
+                          veryCompact ? 8 : 16,
                         ),
-                        SizedBox(height: veryCompact ? 10 : 16),
-                        const _SelfiePublishedTodayChip(),
-                        SizedBox(height: veryCompact ? 16 : 22),
-                        Text(
-                          context.tr('Una selfie por domingo'),
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            color: ssTitle,
-                            fontSize: veryCompact ? 25 : 28,
-                            height: 1.08,
-                            fontWeight: FontWeight.w900,
+                        child: Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              _SelfieReplacementPolaroid(
+                                imageUrl: widget.selfieImageUrl,
+                                thumbnailUrl: widget.selfieThumbnailUrl,
+                                dateLabel: localizedSelfieDateLabel(
+                                  context,
+                                  _polaroidDate,
+                                ),
+                                width: polaroidWidth,
+                              ),
+                              SizedBox(height: veryCompact ? 8 : 12),
+                              const _SelfiePublishedTodayChip(),
+                              SizedBox(height: veryCompact ? 14 : 18),
+                              Text(
+                                context.tr('Una selfie por domingo'),
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: ssTitle,
+                                  fontSize: veryCompact ? 24 : 28,
+                                  height: 1.08,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                              SizedBox(height: veryCompact ? 6 : 8),
+                              Text(
+                                context.tr(
+                                  'Puedes rehacerla una sola vez viendo un anuncio.',
+                                ),
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                  color: ssText2,
+                                  fontSize: veryCompact ? 15 : 17,
+                                  height: 1.35,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                              SizedBox(height: veryCompact ? 16 : 20),
+                              _SelfieReplacementPrimaryButton(
+                                loading: loadingAd,
+                                height: buttonHeight,
+                                onPressed: loadingAd
+                                    ? null
+                                    : _watchAdAndOpenCamera,
+                              ),
+                              SizedBox(height: veryCompact ? 4 : 8),
+                              TextButton(
+                                onPressed: loadingAd
+                                    ? null
+                                    : () => Navigator.pop(context),
+                                style: TextButton.styleFrom(
+                                  foregroundColor: ssOrangeDark,
+                                  disabledForegroundColor: ssOrangeDark
+                                      .withValues(alpha: 0.42),
+                                  textStyle: TextStyle(
+                                    fontSize: compact ? 16 : 18,
+                                    fontWeight: FontWeight.w800,
+                                  ),
+                                ),
+                                child: Text(
+                                  context.tr('Conservar mi selfie actual'),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
-                        SizedBox(height: veryCompact ? 8 : 10),
-                        Text(
-                          context.tr(
-                            'Puedes rehacerla una sola vez viendo un anuncio.',
-                          ),
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            color: ssText2,
-                            fontSize: veryCompact ? 15.5 : 17,
-                            height: 1.35,
-                            fontWeight: FontWeight.w500,
-                          ),
-                        ),
-                        const Spacer(),
-                        _SelfieReplacementPrimaryButton(
-                          loading: loadingAd,
-                          height: buttonHeight,
-                          onPressed: loadingAd ? null : _watchAdAndOpenCamera,
-                        ),
-                        SizedBox(height: compact ? 8 : 12),
-                        TextButton(
-                          onPressed: loadingAd
-                              ? null
-                              : () => Navigator.pop(context),
-                          style: TextButton.styleFrom(
-                            foregroundColor: ssOrangeDark,
-                            disabledForegroundColor: ssOrangeDark.withValues(
-                              alpha: 0.42,
-                            ),
-                            textStyle: TextStyle(
-                              fontSize: compact ? 16 : 18,
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                          child: Text(context.tr('Conservar mi selfie actual')),
-                        ),
-                      ],
+                      ),
                     ),
                   );
                 },
@@ -26160,20 +27119,17 @@ class _SelfieReplacementPolaroid extends StatelessWidget {
   final String imageUrl;
   final String thumbnailUrl;
   final String dateLabel;
-  final double maxWidth;
+  final double width;
 
   const _SelfieReplacementPolaroid({
     required this.imageUrl,
     required this.thumbnailUrl,
     required this.dateLabel,
-    required this.maxWidth,
+    required this.width,
   });
 
   @override
   Widget build(BuildContext context) {
-    final screenWidth = MediaQuery.sizeOf(context).width;
-    final minWidth = math.min(188.0, maxWidth);
-    final width = math.min(maxWidth, math.max(minWidth, screenWidth * 0.56));
     final cleanImageUrl = imageUrl.trim();
     final cleanThumbnailUrl = thumbnailUrl.trim();
     final loadingPreview =
@@ -26193,6 +27149,7 @@ class _SelfieReplacementPolaroid extends StatelessWidget {
       child: Transform.rotate(
         angle: -0.035,
         child: Container(
+          key: const ValueKey('selfie-replacement-polaroid'),
           width: width,
           padding: const EdgeInsets.fromLTRB(12, 12, 12, 20),
           decoration: BoxDecoration(
@@ -26463,6 +27420,8 @@ class MySelfiesScreen extends StatefulWidget {
 class _MySelfiesScreenState extends State<MySelfiesScreen> {
   MySelfiesSortMode sortMode = MySelfiesSortMode.newest;
   String filterGroup = 'all';
+  Future<List<MySelfieHistoryItem>>? _selfiesFuture;
+  String? _selfiesGroupsSignature;
 
   bool _isDateSortMode(MySelfiesSortMode mode) {
     return mode == MySelfiesSortMode.newest || mode == MySelfiesSortMode.oldest;
@@ -26471,68 +27430,110 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
   Future<List<MySelfieHistoryItem>> _loadMySelfies(
     List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
   ) async {
-    final firestore = FirebaseFirestore.instance;
-    final List<MySelfieHistoryItem> items = [];
-
-    for (final groupDoc in groupDocs) {
-      final relationData = groupDoc.data();
-      final groupId = (relationData['groupId'] ?? groupDoc.id).toString();
-      final groupName = (relationData['displayNameSnapshot'] ?? 'Grupo')
-          .toString();
-      final groupPhotoUrl = nonEmptyStringOrNull(
-        relationData['groupPhotoUrlSnapshot'],
-      );
-
-      try {
-        final weeksSnapshot = await firestore
-            .collection('groups')
-            .doc(groupId)
-            .collection('weeks')
-            .orderBy('createdAt', descending: true)
-            .limit(30)
-            .get();
-
-        for (final weekDoc in weeksSnapshot.docs) {
-          final postDoc = await weekDoc.reference
-              .collection('posts')
-              .doc(widget.user.uid)
-              .get();
-
-          if (!postDoc.exists) continue;
-
-          final postData = postDoc.data();
-          if (postData == null) continue;
-
-          final imageUrl = (postData['imageUrl'] ?? '') as String;
-          if (imageUrl.isEmpty) continue;
-
-          final weekData = weekDoc.data();
-          prefetchPostPhotoCache(postData, includeOriginal: true);
-
-          items.add(
-            MySelfieHistoryItem(
-              groupId: groupId,
-              groupName: groupName,
-              groupPhotoUrl: groupPhotoUrl,
-              weekKey: weekDoc.id,
-              isoYear: weekData['isoYear'] as int?,
-              isoWeek: weekData['isoWeek'] as int?,
-              postUid: postDoc.id,
-              post: postData,
-              imageUrl: imageUrl,
-              thumbUrl: (postData['thumbUrl'] ?? imageUrl) as String,
-              createdAt: timestampToDate(postData['createdAt']),
-              updatedAt: timestampToDate(postData['updatedAt']),
-            ),
-          );
-        }
-      } catch (_) {
-        // Si un grupo concreto falla por permisos/datos antiguos, no bloqueamos toda la pantalla.
-      }
-    }
+    final itemsByGroup = await Future.wait(
+      groupDocs.map(_loadMySelfiesForGroup),
+    );
+    final items = itemsByGroup.expand((groupItems) => groupItems).toList();
 
     items.sort((a, b) => _compareByNewest(a, b));
     return items;
+  }
+
+  Future<List<MySelfieHistoryItem>> _loadMySelfiesForGroup(
+    QueryDocumentSnapshot<Map<String, dynamic>> groupDoc,
+  ) async {
+    final relationData = groupDoc.data();
+    final groupId = (relationData['groupId'] ?? groupDoc.id).toString();
+    final groupName = (relationData['displayNameSnapshot'] ?? 'Grupo')
+        .toString();
+    final groupPhotoUrl = nonEmptyStringOrNull(
+      relationData['groupPhotoUrlSnapshot'],
+    );
+
+    try {
+      final weeksSnapshot = await FirebaseFirestore.instance
+          .collection('groups')
+          .doc(groupId)
+          .collection('weeks')
+          .orderBy('createdAt', descending: true)
+          .limit(30)
+          .get();
+      final postDocs = await Future.wait(
+        weeksSnapshot.docs.map(
+          (weekDoc) =>
+              weekDoc.reference.collection('posts').doc(widget.user.uid).get(),
+        ),
+      );
+      final items = <MySelfieHistoryItem>[];
+
+      for (var index = 0; index < weeksSnapshot.docs.length; index += 1) {
+        final weekDoc = weeksSnapshot.docs[index];
+        final postDoc = postDocs[index];
+        if (!postDoc.exists) continue;
+
+        final postData = postDoc.data();
+        if (postData == null) continue;
+
+        final imageUrl = (postData['imageUrl'] ?? '').toString().trim();
+        if (imageUrl.isEmpty) continue;
+
+        final weekData = weekDoc.data();
+        prefetchPostPhotoCache(postData, includeOriginal: true);
+        items.add(
+          MySelfieHistoryItem(
+            groupId: groupId,
+            groupName: groupName,
+            groupPhotoUrl: groupPhotoUrl,
+            weekKey: weekDoc.id,
+            isoYear: weekData['isoYear'] as int?,
+            isoWeek: weekData['isoWeek'] as int?,
+            postUid: postDoc.id,
+            post: postData,
+            imageUrl: imageUrl,
+            thumbUrl: (postData['thumbUrl'] ?? imageUrl).toString(),
+            createdAt: timestampToDate(postData['createdAt']),
+            updatedAt: timestampToDate(postData['updatedAt']),
+          ),
+        );
+      }
+
+      return items;
+    } catch (_) {
+      // Si un grupo concreto falla por permisos/datos antiguos, no bloqueamos toda la pantalla.
+      return const [];
+    }
+  }
+
+  String _signatureForGroups(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
+  ) {
+    return groupDocs
+        .map((groupDoc) {
+          final data = groupDoc.data();
+          return [
+            groupDoc.id,
+            data['groupId'],
+            data['displayNameSnapshot'],
+            data['groupPhotoUrlSnapshot'],
+            data['lastSelfieOrChatActivityAt'],
+          ].join('\u0000');
+        })
+        .join('\u0001');
+  }
+
+  Future<List<MySelfieHistoryItem>> _futureForGroups(
+    List<QueryDocumentSnapshot<Map<String, dynamic>>> groupDocs,
+  ) {
+    final signature = _signatureForGroups(groupDocs);
+    final existingFuture = _selfiesFuture;
+    if (existingFuture != null && signature == _selfiesGroupsSignature) {
+      return existingFuture;
+    }
+
+    final future = _loadMySelfies(groupDocs);
+    _selfiesGroupsSignature = signature;
+    _selfiesFuture = future;
+    return future;
   }
 
   int _compareByNewest(MySelfieHistoryItem a, MySelfieHistoryItem b) {
@@ -26640,8 +27641,9 @@ class _MySelfiesScreenState extends State<MySelfiesScreen> {
                     );
                   }
 
+                  final selfiesFuture = _futureForGroups(groupDocs);
                   return FutureBuilder<List<MySelfieHistoryItem>>(
-                    future: _loadMySelfies(groupDocs),
+                    future: selfiesFuture,
                     builder: (context, selfiesSnapshot) {
                       final loading =
                           selfiesSnapshot.connectionState ==
@@ -27589,6 +28591,8 @@ class MySelfieHeroCard extends StatelessWidget {
               CachedRemoteImage(
                 imageUrl: item.thumbUrl,
                 cacheVariant: 'thumbnail',
+                localFallbackImageUrl: item.imageUrl,
+                localFallbackCacheVariant: 'original',
                 fit: BoxFit.cover,
                 loadingWidget: const _ImageLoadingFill(),
                 errorWidget: const _ImageErrorFill(),
@@ -27696,6 +28700,8 @@ class MySelfieHistoryCard extends StatelessWidget {
             CachedRemoteImage(
               imageUrl: item.thumbUrl,
               cacheVariant: 'thumbnail',
+              localFallbackImageUrl: item.imageUrl,
+              localFallbackCacheVariant: 'original',
               fit: BoxFit.cover,
               loadingWidget: const _ImageLoadingFill(),
               errorWidget: const _ImageErrorFill(),
@@ -28185,8 +29191,6 @@ class _MontageScreenState extends State<MontageScreen> {
       );
       if (!mounted || !unlocked) return;
 
-      showSundaySnack(context, 'Guardando montaje...');
-
       final file = await _captureMontageFile(
         groupName: groupName,
         weekKey: weekKey,
@@ -28203,7 +29207,7 @@ class _MontageScreenState extends State<MontageScreen> {
         context,
         savedCount == 0
             ? 'No se pudo guardar el montaje'
-            : 'Montaje guardado en Fotos · Sunday Selfie',
+            : 'Montaje guardado en el teléfono',
       );
     } catch (error) {
       if (!mounted) return;
@@ -29017,13 +30021,82 @@ extension _MontageResizeEdgeDirection on _MontageResizeEdge {
 const double _montageTileGap = 8;
 const double _classicFullWidthThreshold = 2 / 3;
 
+/// Devuelve si una imagen con [BoxFit.cover] puede desplazarse dentro de su
+/// marco sin dejar zonas vacías.
+bool montagePhotoCanBeReframed({
+  required Size imageSize,
+  required Size frameSize,
+}) {
+  if (imageSize.width <= 0 ||
+      imageSize.height <= 0 ||
+      frameSize.width <= 0 ||
+      frameSize.height <= 0) {
+    return false;
+  }
+
+  final coverScale = math.max(
+    frameSize.width / imageSize.width,
+    frameSize.height / imageSize.height,
+  );
+  final extraWidth = imageSize.width * coverScale - frameSize.width;
+  final extraHeight = imageSize.height * coverScale - frameSize.height;
+  return extraWidth > 0.5 || extraHeight > 0.5;
+}
+
+/// Calcula una nueva alineación para una imagen cubierta por [BoxFit.cover].
+/// El resultado queda limitado al área real de la foto, por lo que nunca
+/// muestra huecos fuera de ella.
+Alignment montagePhotoAlignmentAfterDrag({
+  required Size imageSize,
+  required Size frameSize,
+  required Alignment startAlignment,
+  required Offset offsetFromOrigin,
+}) {
+  if (imageSize.width <= 0 ||
+      imageSize.height <= 0 ||
+      frameSize.width <= 0 ||
+      frameSize.height <= 0) {
+    return Alignment.center;
+  }
+
+  final coverScale = math.max(
+    frameSize.width / imageSize.width,
+    frameSize.height / imageSize.height,
+  );
+  final extraWidth = math.max(
+    0.0,
+    imageSize.width * coverScale - frameSize.width,
+  );
+  final extraHeight = math.max(
+    0.0,
+    imageSize.height * coverScale - frameSize.height,
+  );
+  final x = extraWidth > 0.5
+      ? (startAlignment.x - offsetFromOrigin.dx * 2 / extraWidth)
+            .clamp(-1.0, 1.0)
+            .toDouble()
+      : 0.0;
+  final y = extraHeight > 0.5
+      ? (startAlignment.y - offsetFromOrigin.dy * 2 / extraHeight)
+            .clamp(-1.0, 1.0)
+            .toDouble()
+      : 0.0;
+
+  return Alignment(x, y);
+}
+
 class _MontagePosterState extends State<MontagePoster> {
   late List<QueryDocumentSnapshot<Map<String, dynamic>>> orderedPosts;
   final Map<String, double> customHeights = {};
   final Map<String, double> customWidthFractions = {};
+  final Map<String, Alignment> photoAlignments = {};
+  final Map<String, Size> photoSizes = {};
   String? draggingPostId;
   String? resizingPostId;
   _MontageResizeEdge? activeResizeEdge;
+  String? reframingPostId;
+  Alignment reframeStartAlignment = Alignment.center;
+  Offset reframeDragOffset = Offset.zero;
   double resizeStartHeight = 0;
   double resizeStartWidthFraction = 0.5;
 
@@ -29044,6 +30117,28 @@ class _MontagePosterState extends State<MontagePoster> {
       return;
     }
 
+    final oldImageUrlByPostId = <String, String>{
+      for (final post in oldWidget.posts) post.id: _imageUrlFor(post),
+    };
+    for (final post in widget.posts) {
+      if (oldImageUrlByPostId[post.id] != _imageUrlFor(post)) {
+        photoAlignments.remove(post.id);
+        photoSizes.remove(post.id);
+        if (reframingPostId == post.id) {
+          reframingPostId = null;
+          reframeStartAlignment = Alignment.center;
+          reframeDragOffset = Offset.zero;
+        }
+      }
+    }
+
+    if (oldWidget.style != widget.style &&
+        widget.style != MontageStyle.classic) {
+      reframingPostId = null;
+      reframeStartAlignment = Alignment.center;
+      reframeDragOffset = Offset.zero;
+    }
+
     if (oldWidget.shuffleSeed != widget.shuffleSeed) {
       orderedPosts.shuffle(math.Random(widget.shuffleSeed));
     }
@@ -29054,6 +30149,20 @@ class _MontagePosterState extends State<MontagePoster> {
     if (widget.shuffleSeed != 0) {
       orderedPosts.shuffle(math.Random(widget.shuffleSeed));
     }
+
+    final postIds = widget.posts.map((post) => post.id).toSet();
+    photoAlignments.removeWhere((postId, _) => !postIds.contains(postId));
+    photoSizes.removeWhere((postId, _) => !postIds.contains(postId));
+    if (reframingPostId != null && !postIds.contains(reframingPostId)) {
+      reframingPostId = null;
+      reframeStartAlignment = Alignment.center;
+      reframeDragOffset = Offset.zero;
+    }
+  }
+
+  String _imageUrlFor(QueryDocumentSnapshot<Map<String, dynamic>> post) {
+    final data = post.data();
+    return (data['thumbUrl'] ?? data['imageUrl'] ?? '').toString();
   }
 
   double _heightFor(String postId, int index) {
@@ -29166,6 +30275,77 @@ class _MontagePosterState extends State<MontagePoster> {
     setState(() => draggingPostId = postId);
   }
 
+  Alignment _photoAlignmentFor(String postId) {
+    return photoAlignments[postId] ?? Alignment.center;
+  }
+
+  void _setPhotoSize(String postId, Size size) {
+    if (size.width <= 0 || size.height <= 0 || photoSizes[postId] == size) {
+      return;
+    }
+    setState(() => photoSizes[postId] = size);
+  }
+
+  void _togglePhotoReframing(String postId, Size frameSize) {
+    if (widget.style != MontageStyle.classic || !widget.showEditingControls) {
+      return;
+    }
+
+    if (reframingPostId == postId) {
+      HapticFeedback.selectionClick();
+      setState(() {
+        reframingPostId = null;
+        reframeStartAlignment = Alignment.center;
+        reframeDragOffset = Offset.zero;
+      });
+      return;
+    }
+
+    final photoSize = photoSizes[postId];
+    if (photoSize == null ||
+        !montagePhotoCanBeReframed(
+          imageSize: photoSize,
+          frameSize: frameSize,
+        )) {
+      return;
+    }
+
+    HapticFeedback.selectionClick();
+    setState(() {
+      resizingPostId = null;
+      activeResizeEdge = null;
+      reframingPostId = postId;
+      reframeStartAlignment = _photoAlignmentFor(postId);
+      reframeDragOffset = Offset.zero;
+    });
+  }
+
+  void _startPhotoReframeDrag(String postId) {
+    if (reframingPostId != postId) return;
+    reframeStartAlignment = _photoAlignmentFor(postId);
+    reframeDragOffset = Offset.zero;
+  }
+
+  void _updatePhotoReframeDrag(
+    String postId,
+    Offset dragDelta,
+    Size frameSize,
+  ) {
+    if (reframingPostId != postId) return;
+    final photoSize = photoSizes[postId];
+    if (photoSize == null) return;
+
+    reframeDragOffset += dragDelta;
+    final nextAlignment = montagePhotoAlignmentAfterDrag(
+      imageSize: photoSize,
+      frameSize: frameSize,
+      startAlignment: reframeStartAlignment,
+      offsetFromOrigin: reframeDragOffset,
+    );
+    if (nextAlignment == _photoAlignmentFor(postId)) return;
+    setState(() => photoAlignments[postId] = nextAlignment);
+  }
+
   List<_MontageEntry> _buildEntries() {
     return [
       for (var i = 0; i < orderedPosts.length; i += 1)
@@ -29192,6 +30372,13 @@ class _MontagePosterState extends State<MontagePoster> {
       onResizeStart: _startResize,
       onResizeUpdate: _updateResize,
       onResizeEnd: _endResize,
+      photoAlignments: photoAlignments,
+      photoSizes: photoSizes,
+      reframingPostId: reframingPostId,
+      onPhotoSizeResolved: _setPhotoSize,
+      onTogglePhotoReframe: _togglePhotoReframing,
+      onPhotoReframeDragStart: _startPhotoReframeDrag,
+      onPhotoReframeDragUpdate: _updatePhotoReframeDrag,
     );
   }
 
@@ -29246,6 +30433,15 @@ class _MontagePosterState extends State<MontagePoster> {
         onResizeStart: _startResize,
         onResizeUpdate: _updateResize,
         onResizeEnd: _endResize,
+        imageAlignment: _photoAlignmentFor(entry.post.id),
+        imageSize: photoSizes[entry.post.id],
+        isReframing: reframingPostId == entry.post.id,
+        onImageSizeResolved: (size) => _setPhotoSize(entry.post.id, size),
+        onTogglePhotoReframe: (frameSize) =>
+            _togglePhotoReframing(entry.post.id, frameSize),
+        onReframeDragStart: () => _startPhotoReframeDrag(entry.post.id),
+        onReframeDragUpdate: (delta, frameSize) =>
+            _updatePhotoReframeDrag(entry.post.id, delta, frameSize),
       ),
     );
   }
@@ -30366,6 +31562,14 @@ class _MontageColumn extends StatelessWidget {
   )
   onResizeUpdate;
   final VoidCallback onResizeEnd;
+  final Map<String, Alignment> photoAlignments;
+  final Map<String, Size> photoSizes;
+  final String? reframingPostId;
+  final void Function(String postId, Size size) onPhotoSizeResolved;
+  final void Function(String postId, Size frameSize) onTogglePhotoReframe;
+  final ValueChanged<String> onPhotoReframeDragStart;
+  final void Function(String postId, Offset delta, Size frameSize)
+  onPhotoReframeDragUpdate;
 
   const _MontageColumn({
     required this.entries,
@@ -30381,6 +31585,13 @@ class _MontageColumn extends StatelessWidget {
     required this.onResizeStart,
     required this.onResizeUpdate,
     required this.onResizeEnd,
+    required this.photoAlignments,
+    required this.photoSizes,
+    required this.reframingPostId,
+    required this.onPhotoSizeResolved,
+    required this.onTogglePhotoReframe,
+    required this.onPhotoReframeDragStart,
+    required this.onPhotoReframeDragUpdate,
   });
 
   @override
@@ -30408,6 +31619,16 @@ class _MontageColumn extends StatelessWidget {
           onResizeStart: onResizeStart,
           onResizeUpdate: onResizeUpdate,
           onResizeEnd: onResizeEnd,
+          imageAlignment: photoAlignments[entry.post.id] ?? Alignment.center,
+          imageSize: photoSizes[entry.post.id],
+          isReframing: reframingPostId == entry.post.id,
+          onImageSizeResolved: (size) =>
+              onPhotoSizeResolved(entry.post.id, size),
+          onTogglePhotoReframe: (frameSize) =>
+              onTogglePhotoReframe(entry.post.id, frameSize),
+          onReframeDragStart: () => onPhotoReframeDragStart(entry.post.id),
+          onReframeDragUpdate: (delta, frameSize) =>
+              onPhotoReframeDragUpdate(entry.post.id, delta, frameSize),
         );
       }).toList(),
     );
@@ -30438,6 +31659,13 @@ class _MontageSelfieTile extends StatelessWidget {
   final VoidCallback onResizeEnd;
   final bool allowHorizontalResize;
   final double horizontalResizeBasis;
+  final Alignment imageAlignment;
+  final Size? imageSize;
+  final bool isReframing;
+  final ValueChanged<Size> onImageSizeResolved;
+  final ValueChanged<Size> onTogglePhotoReframe;
+  final VoidCallback onReframeDragStart;
+  final void Function(Offset delta, Size frameSize) onReframeDragUpdate;
 
   const _MontageSelfieTile({
     required this.post,
@@ -30451,6 +31679,13 @@ class _MontageSelfieTile extends StatelessWidget {
     required this.showEditingControls,
     required this.allowHorizontalResize,
     required this.horizontalResizeBasis,
+    required this.imageAlignment,
+    required this.imageSize,
+    required this.isReframing,
+    required this.onImageSizeResolved,
+    required this.onTogglePhotoReframe,
+    required this.onReframeDragStart,
+    required this.onReframeDragUpdate,
     required this.onDrop,
     required this.onDragStarted,
     required this.onDragEnded,
@@ -30497,8 +31732,10 @@ class _MontageSelfieTile extends StatelessWidget {
               imageUrl: imageUrl,
               cacheVariant: 'thumbnail',
               fit: BoxFit.cover,
+              alignment: imageAlignment,
               loadingWidget: const _ImageLoadingFill(),
               errorWidget: const _ImageErrorFill(),
+              onImageSizeResolved: onImageSizeResolved,
             )
           else
             Container(
@@ -30563,12 +31800,12 @@ class _MontageSelfieTile extends StatelessWidget {
           color: isPolaroid ? Colors.white : ssOrangeLight,
           borderRadius: BorderRadius.circular(outerRadius),
           border: Border.all(
-            color: highlighted || isResizing
+            color: highlighted || isResizing || isReframing
                 ? accent
                 : isPolaroid
                 ? const Color(0xFFF2ECE4)
                 : Colors.white.withValues(alpha: 0),
-            width: highlighted || isResizing
+            width: highlighted || isResizing || isReframing
                 ? 2
                 : isPolaroid
                 ? 1
@@ -30702,11 +31939,49 @@ class _MontageSelfieTile extends StatelessWidget {
             showReactions: showReactions,
           ),
           if (showEditingControls) ...[
-            _buildResizeHandle(_MontageResizeEdge.top, resizeWidthBasis),
-            _buildResizeHandle(_MontageResizeEdge.bottom, resizeWidthBasis),
-            if (allowHorizontalResize) ...[
-              _buildResizeHandle(_MontageResizeEdge.left, resizeWidthBasis),
-              _buildResizeHandle(_MontageResizeEdge.right, resizeWidthBasis),
+            if (isReframing)
+              Positioned(
+                top: 8,
+                right: 8,
+                child: IgnorePointer(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 5,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.56),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.open_with_rounded,
+                          color: Colors.white,
+                          size: 14,
+                        ),
+                        SizedBox(width: 4),
+                        Text(
+                          'Mover foto',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            if (!isReframing) ...[
+              _buildResizeHandle(_MontageResizeEdge.top, resizeWidthBasis),
+              _buildResizeHandle(_MontageResizeEdge.bottom, resizeWidthBasis),
+              if (allowHorizontalResize) ...[
+                _buildResizeHandle(_MontageResizeEdge.left, resizeWidthBasis),
+                _buildResizeHandle(_MontageResizeEdge.right, resizeWidthBasis),
+              ],
             ],
           ],
         ],
@@ -30714,10 +31989,36 @@ class _MontageSelfieTile extends StatelessWidget {
     );
   }
 
+  Widget _buildReframeGesture({
+    required Widget child,
+    required Size frameSize,
+  }) {
+    final canReframe =
+        imageSize != null &&
+        montagePhotoCanBeReframed(imageSize: imageSize!, frameSize: frameSize);
+    final canHandleGesture =
+        style == MontageStyle.classic &&
+        showEditingControls &&
+        (canReframe || isReframing);
+
+    if (!canHandleGesture) return child;
+
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onDoubleTap: () => onTogglePhotoReframe(frameSize),
+      onPanStart: isReframing ? (_) => onReframeDragStart() : null,
+      onPanUpdate: isReframing
+          ? (details) => onReframeDragUpdate(details.delta, frameSize)
+          : null,
+      child: child,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return DragTarget<_MontageDragPayload>(
-      onWillAcceptWithDetails: (details) => details.data.postId != post.id,
+      onWillAcceptWithDetails: (details) =>
+          !isReframing && details.data.postId != post.id,
       onAcceptWithDetails: (details) => onDrop(details.data, index),
       builder: (context, candidateData, rejectedData) {
         final highlighted = candidateData.isNotEmpty;
@@ -30728,13 +32029,15 @@ class _MontageSelfieTile extends StatelessWidget {
                 ? horizontalResizeBasis
                 : constraints.maxWidth;
 
-            return LongPressDraggable<_MontageDragPayload>(
+            final photoFrameSize = Size(constraints.maxWidth, height);
+            final draggable = LongPressDraggable<_MontageDragPayload>(
               data: _MontageDragPayload(postId: post.id, fromIndex: index),
               delay: style == MontageStyle.polaroid
                   ? const Duration(milliseconds: 380)
                   : const Duration(seconds: 1),
               rootOverlay: true,
-              maxSimultaneousDrags: isResizing || !showEditingControls ? 0 : 1,
+              maxSimultaneousDrags:
+                  isResizing || isReframing || !showEditingControls ? 0 : 1,
               onDragStarted: () => onDragStarted(post.id),
               onDragEnd: (_) => onDragEnded(),
               feedback: SizedBox(
@@ -30762,6 +32065,10 @@ class _MontageSelfieTile extends StatelessWidget {
                 resizeWidthBasis: resizeWidthBasis,
               ),
             );
+            return _buildReframeGesture(
+              child: draggable,
+              frameSize: photoFrameSize,
+            );
           },
         );
       },
@@ -30771,8 +32078,13 @@ class _MontageSelfieTile extends StatelessWidget {
 
 class ProfileScreen extends StatefulWidget {
   final User user;
+  final VoidCallback onOpenMySelfies;
 
-  const ProfileScreen({super.key, required this.user});
+  const ProfileScreen({
+    super.key,
+    required this.user,
+    required this.onOpenMySelfies,
+  });
 
   @override
   State<ProfileScreen> createState() => _ProfileScreenState();
@@ -30928,13 +32240,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                               SizedBox(height: profileMainGap),
                               ProfileSelfiesShortcut(
                                 selfiesCount: selfiesCount,
-                                onTap: () {
-                                  unawaited(
-                                    pushAndResetScrollOnReturn(
-                                      (_) => MySelfiesScreen(user: widget.user),
-                                    ),
-                                  );
-                                },
+                                onTap: widget.onOpenMySelfies,
                               ),
                               SizedBox(height: profileMenuGap),
                               ProfileMenuRow(
@@ -32447,7 +33753,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
 
     try {
       await borrarCuentaSundaySelfie();
-      await FirebaseAuth.instance.signOut();
+      await cerrarSesionYMostrarAcceso();
     } catch (error) {
       if (!mounted) return;
       showSundaySnack(context, 'Error borrando la cuenta: $error');
@@ -32490,7 +33796,18 @@ class _AppSettingsScreenState extends State<AppSettingsScreen> {
     );
 
     if (shouldSignOut == true) {
-      await FirebaseAuth.instance.signOut();
+      try {
+        await cerrarSesionYMostrarAcceso();
+      } catch (error) {
+        logDebug('No se pudo cerrar sesión: $error');
+        final rootContext = sundayNavigatorKey.currentContext;
+        if (rootContext != null && rootContext.mounted) {
+          showSundaySnack(
+            rootContext,
+            'No se pudo cerrar sesión. Inténtalo de nuevo.',
+          );
+        }
+      }
     }
   }
 
@@ -34552,8 +35869,8 @@ class SundaySelfieLogoMark extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Image.memory(
-      base64Decode(kSundaySelfieLogoMarkBase64),
+    return Image(
+      image: sundaySelfieLogoMarkImage,
       width: size,
       height: size,
       fit: BoxFit.contain,
@@ -35812,7 +37129,7 @@ class SmallPillButton extends StatelessWidget {
           ),
           child: Center(
             child: Text(
-              text,
+              context.tr(text),
               maxLines: 1,
               style: const TextStyle(
                 color: Colors.white,
@@ -37248,6 +38565,40 @@ String? extractLastEmoji(String value) {
   return null;
 }
 
+class _SundaySnackNavigationObserver extends NavigatorObserver {
+  void _dismissForPageRoute(Route<dynamic>? route) {
+    if (route is PageRoute<dynamic>) _dismissActiveSundaySnack();
+  }
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _dismissForPageRoute(route);
+  }
+
+  @override
+  void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _dismissForPageRoute(route);
+  }
+
+  @override
+  void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) {
+    _dismissForPageRoute(route);
+  }
+
+  @override
+  void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) {
+    _dismissForPageRoute(newRoute ?? oldRoute);
+  }
+
+  @override
+  void didStartUserGesture(
+    Route<dynamic> route,
+    Route<dynamic>? previousRoute,
+  ) {
+    _dismissForPageRoute(route);
+  }
+}
+
 OverlayEntry? _activeSundaySnackEntry;
 Timer? _activeSundaySnackTimer;
 
@@ -37263,13 +38614,14 @@ void showSundaySnack(BuildContext context, String message) {
       message: _cleanSundaySnackMessage(localizedMessage),
       isError:
           _isSundaySnackError(message) || _isSundaySnackError(localizedMessage),
+      isPhotoDownload: _isSundaySnackPhotoDownload(message),
     ),
   );
 
   _activeSundaySnackEntry = entry;
   overlay.insert(entry);
   _activeSundaySnackTimer = Timer(
-    const Duration(seconds: 3),
+    const Duration(milliseconds: 1500),
     _dismissActiveSundaySnack,
   );
 }
@@ -37384,8 +38736,22 @@ bool _isSundaySnackError(String message) {
       lower.contains('fall');
 }
 
-IconData _sundaySnackIconForMessage(String message, bool isError) {
+bool _isSundaySnackPhotoDownload(String message) {
+  final lower = message.trim().toLowerCase();
+  return RegExp(
+        r'^(?:\d+\s+)?selfies?\s+guardadas?\s+en\s+el\s+teléfono$',
+      ).hasMatch(lower) ||
+      lower == 'montaje guardado en el teléfono' ||
+      lower.startsWith('montaje guardado en fotos');
+}
+
+IconData _sundaySnackIconForMessage(
+  String message,
+  bool isError, {
+  required bool isPhotoDownload,
+}) {
   if (isError) return Icons.error_outline_rounded;
+  if (isPhotoDownload) return Icons.download_rounded;
 
   final lower = message.toLowerCase();
   if (lower.contains('cargando') ||
@@ -37414,19 +38780,30 @@ IconData _sundaySnackIconForMessage(String message, bool isError) {
 class _SundaySnackNotice extends StatelessWidget {
   final String message;
   final bool isError;
+  final bool isPhotoDownload;
 
-  const _SundaySnackNotice({required this.message, required this.isError});
+  const _SundaySnackNotice({
+    required this.message,
+    required this.isError,
+    required this.isPhotoDownload,
+  });
 
   @override
   Widget build(BuildContext context) {
     final media = MediaQuery.of(context);
     final maxWidth = math.min(media.size.width - 48, 380.0);
     final accent = isError ? const Color(0xFFD96558) : ssOrange;
-    final icon = _sundaySnackIconForMessage(message, isError);
+    final icon = _sundaySnackIconForMessage(
+      message,
+      isError,
+      isPhotoDownload: isPhotoDownload,
+    );
 
-    return IgnorePointer(
-      child: SafeArea(
-        child: Center(
+    return SafeArea(
+      child: Center(
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: _dismissActiveSundaySnack,
           child: TweenAnimationBuilder<double>(
             duration: const Duration(milliseconds: 180),
             curve: Curves.easeOutCubic,

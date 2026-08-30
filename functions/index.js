@@ -1472,7 +1472,11 @@ exports.solicitarEntradaGrupo = callable(async (data, context) => {
   return {success: true};
 });
 
-exports.reaccionarASelfie = callable(async (data, context) => {
+// Las reacciones siguen requiriendo Firebase Auth y comprueban en la
+// transacción que el usuario es miembro del grupo. No exigimos App Check aquí:
+// Play Integrity está rechazando instalaciones válidas antes de llegar a esas
+// comprobaciones, por lo que impedía reaccionar a usuarios autenticados.
+exports.reaccionarASelfie = callable({enforceAppCheck: false}, async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError(
       "unauthenticated",
@@ -1698,7 +1702,10 @@ exports.reaccionarASelfie = callable(async (data, context) => {
   };
 });
 
-exports.enviarZumbidoSelfie = callable(async (data, context) => {
+// El zumbido comprueba Auth y la pertenencia al grupo dentro de la transacción.
+// No imponemos App Check: Play Integrity puede rechazar instalaciones válidas
+// antes de que lleguen a esas comprobaciones, igual que ocurría con reacciones.
+exports.enviarZumbidoSelfie = callable({enforceAppCheck: false}, async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError(
       "unauthenticated",

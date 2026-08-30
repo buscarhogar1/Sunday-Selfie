@@ -13,6 +13,9 @@
 
          This Theme is only used starting with V2 of Flutter's Android embedding. -->
     <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
-        <item name="android:windowBackground">@color/sunday_splash_background</item>
+        <!-- Keep the launch artwork below Flutter until its first frame is ready.
+             This prevents a blank white frame between the native splash and
+             the Flutter loading screen. -->
+        <item name="android:windowBackground">@drawable/launch_background</item>
     </style>
 </resources>
