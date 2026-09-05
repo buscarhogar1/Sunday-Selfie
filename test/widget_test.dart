@@ -1058,7 +1058,10 @@ void main() {
     );
 
     final zone = find.byType(WeeklyChatExpandedDragZone);
-    expect(tester.getSize(zone).height, lessThanOrEqualTo(60));
+    expect(
+      tester.getSize(zone).height,
+      lessThanOrEqualTo(kWeeklyChatExpandedDragZoneMinHeight),
+    );
 
     final zoneTopLeft = tester.getTopLeft(zone);
     final zoneHeight = tester.getSize(zone).height;

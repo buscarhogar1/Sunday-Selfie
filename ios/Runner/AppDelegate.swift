@@ -3,12 +3,14 @@ import AVKit
 import Flutter
 import MediaPlayer
 import Photos
+import PhotosUI
 import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   private var mediaSaverChannel: FlutterMethodChannel?
   private var volumeButtonsChannel: FlutterMethodChannel?
+  private var profilePhotoPickerChannel: FlutterMethodChannel?
   private var deepLinksChannel: FlutterMethodChannel?
   private var deepLinksEventChannel: FlutterEventChannel?
   private let deepLinksStreamHandler = SundayDeepLinksStreamHandler()
@@ -24,6 +26,7 @@ import UIKit
   private var ignoringProgrammaticVolumeChange = false
   private var lastObservedOutputVolume = AVAudioSession.sharedInstance().outputVolume
   private let fallbackCaptureVolume: Float = 0.5
+  private var pendingProfilePhotoPickerResult: FlutterResult?
 
   override func application(
     _ application: UIApplication,
@@ -86,6 +89,19 @@ import UIKit
       let enabled = args?["enabled"] as? Bool ?? false
       self?.setVolumeButtonCaptureEnabled(enabled)
       result(nil)
+    }
+
+    profilePhotoPickerChannel = FlutterMethodChannel(
+      name: "sunday_selfie/profile_photo_picker",
+      binaryMessenger: messenger
+    )
+    profilePhotoPickerChannel?.setMethodCallHandler { [weak self] call, result in
+      guard call.method == "pickProfilePhoto" else {
+        result(FlutterMethodNotImplemented)
+        return
+      }
+
+      self?.presentProfilePhotoPicker(result: result)
     }
   }
 
@@ -171,6 +187,93 @@ import UIKit
     }
 
     return window?.rootViewController?.view
+  }
+
+  private var flutterRootViewController: UIViewController? {
+    let windowScenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    for scene in windowScenes {
+      if let viewController = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController {
+        return viewController
+      }
+    }
+
+    return window?.rootViewController
+  }
+
+  private func presentProfilePhotoPicker(result: @escaping FlutterResult) {
+    guard pendingProfilePhotoPickerResult == nil else {
+      result(
+        FlutterError(
+          code: "picker_in_progress",
+          message: "Ya se está eligiendo una foto de perfil.",
+          details: nil
+        )
+      )
+      return
+    }
+
+    guard #available(iOS 14, *), let presenter = flutterRootViewController else {
+      result(
+        FlutterError(
+          code: "picker_unavailable",
+          message: "No se pudo abrir el selector de fotos.",
+          details: nil
+        )
+      )
+      return
+    }
+
+    var configuration = PHPickerConfiguration(photoLibrary: .shared())
+    configuration.filter = .images
+    configuration.selectionLimit = 1
+    // Ask iOS for a broadly compatible representation. The Flutter plugin's
+    // data-representation path can fail for some HEIC assets from Photos.
+    configuration.preferredAssetRepresentationMode = .compatible
+
+    let picker = PHPickerViewController(configuration: configuration)
+    picker.delegate = self
+    pendingProfilePhotoPickerResult = result
+    presenter.present(picker, animated: true)
+  }
+
+  private func completeProfilePhotoPicker(with value: Any?) {
+    let result = pendingProfilePhotoPickerResult
+    pendingProfilePhotoPickerResult = nil
+    result?(value)
+  }
+
+  private func saveProfilePhotoPickerImage(_ image: UIImage) -> String? {
+    guard image.size.width > 0, image.size.height > 0 else { return nil }
+
+    let maxDimension: CGFloat = 1600
+    let originalMaxDimension = max(image.size.width, image.size.height)
+    let scale = min(1, maxDimension / originalMaxDimension)
+    let outputSize = CGSize(
+      width: max(1, floor(image.size.width * scale)),
+      height: max(1, floor(image.size.height * scale))
+    )
+
+    let format = UIGraphicsImageRendererFormat.default()
+    format.scale = 1
+    format.opaque = true
+    let normalizedImage = UIGraphicsImageRenderer(size: outputSize, format: format).image { _ in
+      UIColor.white.setFill()
+      UIRectFill(CGRect(origin: .zero, size: outputSize))
+      image.draw(in: CGRect(origin: .zero, size: outputSize))
+    }
+
+    guard let jpegData = normalizedImage.jpegData(compressionQuality: 0.88) else {
+      return nil
+    }
+
+    let destinationURL = URL(fileURLWithPath: NSTemporaryDirectory())
+      .appendingPathComponent("sunday_profile_\(UUID().uuidString).jpg")
+    do {
+      try jpegData.write(to: destinationURL, options: .atomic)
+      return destinationURL.path
+    } catch {
+      return nil
+    }
   }
 
   private func setVolumeButtonCaptureEnabled(_ enabled: Bool) {
@@ -417,6 +520,49 @@ import UIKit
             message: error?.localizedDescription ?? "No images were saved",
             details: nil
           ))
+        }
+      }
+    }
+  }
+}
+
+@available(iOS 14, *)
+extension AppDelegate: PHPickerViewControllerDelegate {
+  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true) { [weak self] in
+      guard let self else { return }
+      guard let selection = results.first else {
+        self.completeProfilePhotoPicker(with: nil)
+        return
+      }
+
+      let itemProvider = selection.itemProvider
+      guard itemProvider.canLoadObject(ofClass: UIImage.self) else {
+        self.completeProfilePhotoPicker(
+          with: FlutterError(
+            code: "unsupported_image",
+            message: "No se pudo leer la imagen seleccionada.",
+            details: nil
+          )
+        )
+        return
+      }
+
+      itemProvider.loadObject(ofClass: UIImage.self) { [weak self] object, error in
+        DispatchQueue.main.async {
+          guard let self else { return }
+          guard let image = object as? UIImage, let path = self.saveProfilePhotoPickerImage(image) else {
+            self.completeProfilePhotoPicker(
+              with: FlutterError(
+                code: "invalid_image",
+                message: error?.localizedDescription ?? "No se pudo preparar la imagen seleccionada.",
+                details: nil
+              )
+            )
+            return
+          }
+
+          self.completeProfilePhotoPicker(with: path)
         }
       }
     }

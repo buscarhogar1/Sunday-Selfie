@@ -43,6 +43,9 @@ const MethodChannel mediaSaverChannel = MethodChannel(
 const MethodChannel volumeButtonsChannel = MethodChannel(
   'sunday_selfie/volume_buttons',
 );
+const MethodChannel profilePhotoPickerChannel = MethodChannel(
+  'sunday_selfie/profile_photo_picker',
+);
 const MethodChannel deepLinksMethodChannel = MethodChannel(
   'sunday_selfie/deep_links',
 );
@@ -4564,6 +4567,58 @@ Uint8List? _createSelfieUploadBytes(Uint8List bytes) {
   return smallestBytes;
 }
 
+/// Creates an upright JPEG for ML Kit before face detection. iOS camera files
+/// can carry a mirrored/rotated EXIF orientation that ML Kit does not always
+/// interpret consistently when it reads the file directly.
+Uint8List? _createFaceDetectionBytes(Uint8List bytes) {
+  final decodedImage = image_lib.decodeImage(bytes);
+  if (decodedImage == null) return null;
+
+  final orientedImage = image_lib.bakeOrientation(decodedImage);
+  final width = orientedImage.width;
+  final height = orientedImage.height;
+  final longestEdge = math.max(width, height);
+  if (width <= 0 || height <= 0 || longestEdge <= 0) return null;
+
+  final image_lib.Image normalizedImage;
+  if (longestEdge <= kSelfieUploadMaxLongEdge) {
+    normalizedImage = orientedImage;
+  } else if (height >= width) {
+    normalizedImage = image_lib.copyResize(
+      orientedImage,
+      height: kSelfieUploadMaxLongEdge,
+      interpolation: image_lib.Interpolation.average,
+    );
+  } else {
+    normalizedImage = image_lib.copyResize(
+      orientedImage,
+      width: kSelfieUploadMaxLongEdge,
+      interpolation: image_lib.Interpolation.average,
+    );
+  }
+
+  return Uint8List.fromList(image_lib.encodeJpg(normalizedImage, quality: 92));
+}
+
+Future<File> _crearArchivoParaDeteccionFacial(XFile foto) async {
+  final bytes = await foto.readAsBytes();
+  final normalizedBytes = await compute<Uint8List, Uint8List?>(
+    _createFaceDetectionBytes,
+    bytes,
+  );
+
+  if (normalizedBytes == null || normalizedBytes.isEmpty) {
+    throw const SelfiePhotoValidationException(kSelfieValidationFailedMessage);
+  }
+
+  final timestamp = DateTime.now().microsecondsSinceEpoch;
+  final file = File(
+    '${Directory.systemTemp.path}/sunday_face_detection_$timestamp.jpg',
+  );
+  await file.writeAsBytes(normalizedBytes, flush: true);
+  return file;
+}
+
 String _safeTempFilePart(String value) {
   return value
       .replaceAll(RegExp(r'[^A-Za-z0-9_\-]+'), '_')
@@ -4745,20 +4800,26 @@ Future<void> _validarFotoTieneCara(
     return;
   }
 
-  final detector = FaceDetector(
-    options: FaceDetectorOptions(
-      performanceMode: FaceDetectorMode.fast,
-      enableClassification: false,
-      enableContours: false,
-      enableLandmarks: false,
-      enableTracking: false,
-      minFaceSize: 0.08,
-    ),
-  );
+  File? detectionFile;
+  FaceDetector? detector;
 
   try {
+    detectionFile = await _crearArchivoParaDeteccionFacial(foto);
+    detector = FaceDetector(
+      options: FaceDetectorOptions(
+        // This runs only after the user selects or takes a picture. Accuracy
+        // matters more here than the small speed gain of the realtime mode,
+        // particularly for front-camera photos on iOS.
+        performanceMode: FaceDetectorMode.accurate,
+        enableClassification: false,
+        enableContours: false,
+        enableLandmarks: false,
+        enableTracking: false,
+        minFaceSize: 0.03,
+      ),
+    );
     final faces = await detector.processImage(
-      InputImage.fromFilePath(foto.path),
+      InputImage.fromFilePath(detectionFile.path),
     );
     if (faces.isEmpty) {
       throw const SelfiePhotoValidationException(kSelfieNoFaceMessage);
@@ -4776,8 +4837,34 @@ Future<void> _validarFotoTieneCara(
     logDebug('No se pudo validar la foto con ML Kit: $error');
     throw const SelfiePhotoValidationException(kSelfieValidationFailedMessage);
   } finally {
-    await detector.close();
+    await detector?.close();
+    if (detectionFile != null) {
+      try {
+        await detectionFile.delete();
+      } catch (error) {
+        logDebug('No se pudo borrar la foto temporal de validación: $error');
+      }
+    }
   }
+}
+
+Future<XFile?> elegirFotoPerfilDesdeGaleria() async {
+  if (Platform.isIOS) {
+    final selectedPath = await profilePhotoPickerChannel.invokeMethod<String>(
+      'pickProfilePhoto',
+    );
+    if (selectedPath == null || selectedPath.trim().isEmpty) return null;
+
+    final path = selectedPath.trim();
+    return XFile(path, mimeType: 'image/jpeg', name: path.split('/').last);
+  }
+
+  final picker = image_picker.ImagePicker();
+  return picker.pickImage(
+    source: image_picker.ImageSource.gallery,
+    imageQuality: 88,
+    maxWidth: 1600,
+  );
 }
 
 Future<bool> validarFotoSelfieParaSubida(
@@ -13273,12 +13360,7 @@ class _OnboardingPhotoScreenState extends State<OnboardingPhotoScreen> {
     }
 
     try {
-      final picker = image_picker.ImagePicker();
-      final photo = await picker.pickImage(
-        source: image_picker.ImageSource.gallery,
-        imageQuality: 88,
-        maxWidth: 1600,
-      );
+      final photo = await elegirFotoPerfilDesdeGaleria();
 
       if (!mounted || photo == null) return;
       await _setSelectedProfilePhoto(photo);
@@ -21400,7 +21482,7 @@ class _GroupAllPostsGridState extends State<GroupAllPostsGrid> {
 
 const double kGroupWeekSelectorKeyboardReserveHeight = 33.0;
 const double kWeeklyChatCollapsedSlotHeight = 60.0;
-const double kWeeklyChatExpandedDragZoneMinHeight = 76.0;
+const double kWeeklyChatExpandedDragZoneMinHeight = 66.0;
 const Duration kWeeklyChatPanelAnimationDuration = Duration(milliseconds: 240);
 const Curve kWeeklyChatPanelAnimationCurve = Curves.easeOutCubic;
 const double kWeeklyChatDragDismissDistance = 24.0;
@@ -21458,6 +21540,8 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
   DateTime? optimisticReadAt;
   String? lastReadWriteMarker;
   String? lastAutoScrolledMessageMarker;
+  String? lastGifLayoutScrollMarker;
+  bool jumpToLatestMessageOnOpen = false;
   bool messagesAtTop = true;
   double dragOffset = 0;
   double dragAnimationStartOffset = 0;
@@ -21488,6 +21572,7 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
       optimisticReadAt = null;
       lastReadWriteMarker = null;
       lastAutoScrolledMessageMarker = null;
+      lastGifLayoutScrollMarker = null;
       gifPickerWarmupStarted = false;
       _warmGifPicker();
     }
@@ -21497,6 +21582,8 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
       dragOffset = 0;
       if (widget.expanded) {
         lastAutoScrolledMessageMarker = null;
+        jumpToLatestMessageOnOpen = true;
+        _scheduleScrollAfterPanelOpens();
       }
       _warmGifPicker();
     }
@@ -21731,6 +21818,35 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
     if (lastAutoScrolledMessageMarker == marker) return;
     lastAutoScrolledMessageMarker = marker;
 
+    final shouldJump = jumpToLatestMessageOnOpen;
+    jumpToLatestMessageOnOpen = false;
+    _scrollToLatestMessage(animated: !shouldJump);
+  }
+
+  void _scheduleScrollAfterLatestGifLayout(String messageId) {
+    if (!widget.expanded) return;
+
+    final marker = '${widget.groupId}:${widget.weekKey}:$messageId';
+    if (lastGifLayoutScrollMarker == marker) return;
+    lastGifLayoutScrollMarker = marker;
+
+    _scrollToLatestMessage();
+  }
+
+  void _scheduleScrollAfterPanelOpens() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !widget.expanded) return;
+
+      unawaited(
+        Future<void>.delayed(kWeeklyChatPanelAnimationDuration, () {
+          if (!mounted || !widget.expanded) return;
+          _scrollToLatestMessage(animated: false);
+        }),
+      );
+    });
+  }
+
+  void _scrollToLatestMessage({bool animated = true}) {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted ||
           !widget.expanded ||
@@ -21739,6 +21855,10 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
       }
 
       final position = messagesScrollController.position;
+      if (!animated) {
+        position.jumpTo(position.maxScrollExtent);
+        return;
+      }
       messagesScrollController.animateTo(
         position.maxScrollExtent,
         duration: const Duration(milliseconds: 180),
@@ -21990,6 +22110,13 @@ class _WeeklyChatPanelState extends State<WeeklyChatPanel>
                                             return WeeklyChatMessageBubble(
                                               message: doc.data(),
                                               fallbackSeed: doc.id,
+                                              onGifLoaded:
+                                                  doc.id == messages.last.id
+                                                  ? () =>
+                                                        _scheduleScrollAfterLatestGifLayout(
+                                                          doc.id,
+                                                        )
+                                                  : null,
                                             );
                                           },
                                         ),
@@ -22491,11 +22618,13 @@ class WeeklyChatEmptyState extends StatelessWidget {
 class WeeklyChatMessageBubble extends StatelessWidget {
   final Map<String, dynamic> message;
   final String fallbackSeed;
+  final VoidCallback? onGifLoaded;
 
   const WeeklyChatMessageBubble({
     super.key,
     required this.message,
     required this.fallbackSeed,
+    this.onGifLoaded,
   });
 
   @override
@@ -22593,7 +22722,10 @@ class WeeklyChatMessageBubble extends StatelessWidget {
                           gaplessPlayback: true,
                           semanticLabel: gifLabel,
                           loadingBuilder: (context, child, loadingProgress) {
-                            if (loadingProgress == null) return child;
+                            if (loadingProgress == null) {
+                              onGifLoaded?.call();
+                              return child;
+                            }
                             return const SizedBox(
                               width: 190,
                               height: 132,
@@ -32398,12 +32530,7 @@ class _EditProfileScreenState extends State<EditProfileScreen> {
     }
 
     try {
-      final picker = image_picker.ImagePicker();
-      final photo = await picker.pickImage(
-        source: image_picker.ImageSource.gallery,
-        imageQuality: 88,
-        maxWidth: 1600,
-      );
+      final photo = await elegirFotoPerfilDesdeGaleria();
 
       if (!mounted || photo == null) return;
       await _setSelectedProfilePhoto(photo);
